@@ -1,56 +1,50 @@
 #ifndef CODEGEN_HPP
 #define CODEGEN_HPP
 
-#include <stack>
-#include <map>
-#include <memory>
-#include <llvm/IR/Module.h>
-#include <llvm/IR/Function.h>
-#include <llvm/IR/Type.h>
-#include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/IRBuilder.h>
-#include <llvm/IR/BasicBlock.h>
+#include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/Module.h>
+#include <llvm/IR/LegacyPassManager.h>
+#include <llvm/Target/TargetMachine.h>
+#include <llvm/MC/TargetRegistry.h>
+#include <llvm/Support/Host.h>
+#include "ast.hpp"
+#include <map>
+#include <string>
+#include <vector>
+#include <memory>
 
-class BlockAST;
-class AST;
-
-class CodeGenContext {
-    std::unique_ptr<llvm::LLVMContext> context;
-    std::unique_ptr<llvm::IRBuilder<>> builder;
-    std::unique_ptr<llvm::Module> module;
-    std::map<std::string, llvm::Value*> namedValues;
-    std::stack<llvm::BasicBlock*> blocks;
-    llvm::Function* mainFunc;
-    
+class CodeGenBlock {
 public:
-    CodeGenContext();
-    
-    llvm::Module* getModule() { return module.get(); }
-    llvm::LLVMContext& getContext() { return *context; }
-    llvm::IRBuilder<>& getBuilder() { return *builder; }
-    llvm::Function* getCurrentFunction() { return mainFunc; }
-    
-    void setCurrentBlock(llvm::BasicBlock *block) { blocks.push(block); }
-    void popBlock() { blocks.pop(); }
-    llvm::BasicBlock* currentBlock() { return blocks.empty() ? nullptr : blocks.top(); }
-    
-    void setNamedValue(const std::string& name, llvm::Value* value) {
-        namedValues[name] = value;
-    }
-    
-    llvm::Value* getNamedValue(const std::string& name) {
-        auto it = namedValues.find(name);
-        if (it != namedValues.end()) {
-            return it->second;
-        }
-        return nullptr;
-    }
-    
-    llvm::Type* getDoubleType() { return llvm::Type::getDoubleTy(*context); }
-    llvm::Type* getInt32Type() { return llvm::Type::getInt32Ty(*context); }
-    llvm::Type* getVoidType() { return llvm::Type::getVoidTy(*context); }
-    
-    void generateCode(BlockAST& root);
+    std::map<std::string, llvm::Value*> locals;
 };
 
-#endif
+class CodeGenContext {
+    std::vector<CodeGenBlock*> blocks;
+    llvm::LLVMContext context;
+    std::unique_ptr<llvm::Module> module;
+    llvm::IRBuilder<> builder;
+    std::unique_ptr<llvm::legacy::FunctionPassManager> fpm;
+    std::unique_ptr<llvm::TargetMachine> targetMachine;
+    std::string targetTriple;
+
+public:
+    CodeGenContext();
+
+    llvm::LLVMContext& getContext();
+    llvm::Module* getModule();
+    llvm::IRBuilder<>& getBuilder();
+    llvm::Type* getDoubleType();
+    llvm::Function* currentFunction();
+    llvm::TargetMachine* getTargetMachine();
+
+    void generateCode(BlockAST& root);
+    void pushBlock();
+    void popBlock();
+    void setSymbolValue(const std::string& name, llvm::Value* value);
+    llvm::Value* getSymbolValue(const std::string& name);
+    llvm::Type* getVectorType(unsigned width);
+    llvm::Type* getCurrentFunctionType(const std::string& name);
+};
+
+#endif // CODEGEN_HPP

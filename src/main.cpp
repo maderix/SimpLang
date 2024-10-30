@@ -1,17 +1,25 @@
+// main.cpp
+
 #include <iostream>
 #include <fstream>
-#include "codegen.hpp"
-#include "ast.hpp"
-#include <llvm/Support/TargetSelect.h>
-#include <llvm/Support/raw_ostream.h>
+#include <cstdio>
 #include <cstring>
 
-extern int yyparse();
-extern BlockAST* programBlock;
-extern FILE* yyin;
-extern int yydebug;
+#include "ast.hpp"
+#include "codegen.hpp"
+#include "parser.hpp"
 
-int main(int argc, char **argv) {
+#include <llvm/Support/TargetSelect.h>
+#include <llvm/Support/FileSystem.h>
+#include <llvm/Support/Host.h>
+#include <llvm/IR/LegacyPassManager.h>
+#include <llvm/Target/TargetMachine.h>
+
+extern BlockAST* programBlock;
+extern int yyparse();
+extern FILE* yyin;
+
+int main(int argc, char** argv) {
     bool debug = false;
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " source.sl [-d]" << std::endl;
@@ -28,8 +36,8 @@ int main(int argc, char **argv) {
 
     // Initialize LLVM
     llvm::InitializeNativeTarget();
-    llvm::InitializeNativeTargetAsmParser();
     llvm::InitializeNativeTargetAsmPrinter();
+    llvm::InitializeNativeTargetAsmParser();
 
     // Set input file
     std::cout << "Opening " << argv[1] << std::endl;
@@ -54,6 +62,37 @@ int main(int argc, char **argv) {
     std::cout << "==================" << std::endl;
     context.getModule()->print(llvm::outs(), nullptr);
     std::cout << "==================" << std::endl;
+
+    // Write LLVM IR to file
+    std::error_code EC;
+    llvm::raw_fd_ostream dest("output.ll", EC);
+    if (EC) {
+        llvm::errs() << "Could not open file: " << EC.message() << "\n";
+        return 1;
+    }
+    context.getModule()->print(dest, nullptr);
+    dest.flush();
+
+    // Generate object code
+    llvm::legacy::PassManager pass;
+    llvm::raw_fd_ostream destObj("output.o", EC);
+    if (EC) {
+        llvm::errs() << "Could not open file: " << EC.message() << "\n";
+        return 1;
+    }
+
+    llvm::TargetMachine* targetMachine = context.getTargetMachine();
+    auto FileType = llvm::CGFT_ObjectFile;
+
+    if (targetMachine->addPassesToEmitFile(pass, destObj, nullptr, FileType)) {
+        llvm::errs() << "TargetMachine can't emit a file of this type\n";
+        return 1;
+    }
+
+    pass.run(*context.getModule());
+    destObj.flush();
+
+    std::cout << "Object code generated in 'output.o'" << std::endl;
 
     return 0;
 }

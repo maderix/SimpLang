@@ -159,4 +159,28 @@ public:
     virtual llvm::Value* codeGen(CodeGenContext& context);
 };
 
+
+class SIMDIntrinsicExprAST : public ExprAST {
+    std::string intrinsic;
+    std::vector<ExprAST*> args;
+public:
+    SIMDIntrinsicExprAST(const std::string& name, std::vector<ExprAST*>& arguments) 
+        : intrinsic(name), args(arguments) {}
+    virtual ~SIMDIntrinsicExprAST() {}
+    virtual llvm::Value* codeGen(CodeGenContext& context) override;
+};
+
+class SIMDTypeExprAST : public ExprAST {
+    std::string simdType;
+    std::vector<ExprAST*> elements;
+    unsigned getVectorWidth() const { 
+        return simdType == "sse" ? 4 : 8; 
+    }
+public:
+    SIMDTypeExprAST(const std::string& type, std::vector<ExprAST*>& elems)
+        : simdType(type), elements(elems) {}
+    virtual llvm::Value* codeGen(CodeGenContext& context) override;
+};
+
+
 #endif // AST_HPP

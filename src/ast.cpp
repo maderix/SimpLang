@@ -1,181 +1,24 @@
 #include "ast.hpp"
 #include "codegen.hpp"
 #include <llvm/IR/Value.h>
-#include <llvm/IR/LLVMContext.h>
-#include <llvm/IR/IRBuilder.h>
-#include <llvm/IR/Module.h>
+#include <llvm/IR/Verifier.h>
 #include <iostream>
 
-using namespace std;
-
-// Implementation of the Expression Statement code generation
-llvm::Value* ExpressionStmtAST::codeGen(CodeGenContext& context) {
-    return expression->codeGen(context);
-}
-
-// Implementation of the Block Statement code generation
-llvm::Value* BlockAST::codeGen(CodeGenContext& context) {
-    llvm::Value *last = nullptr;
-    for (StmtAST* statement : statements) {
-        last = statement->codeGen(context);
-    }
-    return last;
-}
-
-// Definition for AssignmentExprAST::codeGen
-llvm::Value* AssignmentExprAST::codeGen(CodeGenContext& context) {
-    if (!lhs) {
-        std::cerr << "Error: Left-hand side of assignment is not a variable." << std::endl;
-        return nullptr;
-    }
-
-    llvm::Value* rhsValue = rhs->codeGen(context);
-    if (!rhsValue) {
-        std::cerr << "Error: RHS of assignment could not be generated." << std::endl;
-        return nullptr;
-    }
-
-    llvm::Value* variable = context.getNamedValue(lhs->getName());
-    if (!variable) {
-        std::cerr << "Error: Undefined variable '" << lhs->getName() << "'." << std::endl;
-        return nullptr;
-    }
-
-    // Create a store instruction to assign the RHS value to the variable
-    context.getBuilder().CreateStore(rhsValue, variable);
-    return rhsValue;
-}
-
-// Definition for CallExprAST::codeGen
-llvm::Value* CallExprAST::codeGen(CodeGenContext& context) {
-    // Retrieve the function from the module
-    llvm::Function* calleeF = context.getModule()->getFunction(callee);
-    if (!calleeF) {
-        std::cerr << "Error: Unknown function referenced: " << callee << std::endl;
-        return nullptr;
-    }
-
-    // Check if the number of arguments matches
-    if (calleeF->arg_size() != arguments.size()) {
-        std::cerr << "Error: Incorrect number of arguments passed to function '" << callee << "'." << std::endl;
-        return nullptr;
-    }
-
-    std::vector<llvm::Value*> argsV;
-    for (unsigned i = 0, e = arguments.size(); i != e; ++i) {
-        argsV.push_back(arguments[i]->codeGen(context));
-        if (!argsV.back()) {
-            std::cerr << "Error: Argument " << i << " could not be generated." << std::endl;
-            return nullptr;
-        }
-    }
-
-    // Create a call instruction to invoke the function
-    return context.getBuilder().CreateCall(calleeF, argsV, "calltmp");
-}
-
-
-// Implementation of the Variable Declaration code generation
-llvm::Value* VariableDeclarationAST::codeGen(CodeGenContext& context) {
-    llvm::Type* type = context.getDoubleType();
-    llvm::Function* function = context.getBuilder().GetInsertBlock()->getParent();
-    
-    // Create an alloca instruction in the entry block of the function
-    llvm::IRBuilder<> TmpB(&function->getEntryBlock(), 
-                          function->getEntryBlock().begin());
-    llvm::AllocaInst* alloca = TmpB.CreateAlloca(type, nullptr, name);
-    
-    // Store the variable in our symbol table
-    context.setNamedValue(name, alloca);
-    
-    // Generate the initialization value
-    if (assignmentExpr != nullptr) {
-        llvm::Value* initVal = assignmentExpr->codeGen(context);
-        if (initVal == nullptr) return nullptr;
-        context.getBuilder().CreateStore(initVal, alloca);
-    }
-    
-    return alloca;
-}
-
-llvm::Value* FunctionAST::codeGen(CodeGenContext& context) {
-    std::vector<llvm::Type*> argTypes(arguments.size(), context.getDoubleType());
-    llvm::FunctionType* functionType = llvm::FunctionType::get(
-        context.getDoubleType(), argTypes, false);
-    
-    llvm::Function* function = llvm::Function::Create(
-        functionType, llvm::Function::ExternalLinkage, name, context.getModule());
-    
-    if (!function) return nullptr;
-    
-    // Create a new basic block to start insertion into
-    llvm::BasicBlock* BB = llvm::BasicBlock::Create(context.getContext(), 
-                                                   "entry", function);
-    context.getBuilder().SetInsertPoint(BB);
-    
-    // Record the function arguments in the NamedValues map
-    size_t idx = 0;
-    for (auto &Arg : function->args()) {
-        // Create an alloca for this variable
-        llvm::IRBuilder<> TmpB(&function->getEntryBlock(), 
-                              function->getEntryBlock().begin());
-        llvm::AllocaInst* alloca = TmpB.CreateAlloca(context.getDoubleType(), 
-                                                    nullptr, 
-                                                    arguments[idx]->getName());
-        
-        // Store the initial value into the alloca
-        context.getBuilder().CreateStore(&Arg, alloca);
-        
-        // Add to symbol table
-        context.setNamedValue(arguments[idx]->getName(), alloca);
-        idx++;
-    }
-    
-    if (!body->codeGen(context)) {
-        // Error generating body, remove function
-        function->eraseFromParent();
-        return nullptr;
-    }
-    
-    // Check if the current block is not terminated
-    if (!context.getBuilder().GetInsertBlock()->getTerminator()) {
-        if (function->getReturnType()->isVoidTy()) {
-            context.getBuilder().CreateRetVoid();
-        } else {
-            context.getBuilder().CreateRet(llvm::ConstantFP::get(context.getContext(), llvm::APFloat(0.0)));
-        }
-    }
-    
-    return function;
-}
-
-
-// Implementation of the Return Statement code generation
-llvm::Value* ReturnAST::codeGen(CodeGenContext& context) {
-    llvm::Value* returnValue = expression->codeGen(context);
-    if (!returnValue) return nullptr;
-    
-    return context.getBuilder().CreateRet(returnValue);
-}
-
-// Implementation of Number Expression code generation
 llvm::Value* NumberExprAST::codeGen(CodeGenContext& context) {
     return llvm::ConstantFP::get(context.getContext(), llvm::APFloat(value));
 }
 
-// Implementation of Variable Expression code generation
 llvm::Value* VariableExprAST::codeGen(CodeGenContext& context) {
-    llvm::Value* value = context.getNamedValue(name);
+    llvm::Value* value = context.getSymbolValue(name);
     if (!value) {
         std::cerr << "Unknown variable name: " << name << std::endl;
         return nullptr;
     }
-    
-    return context.getBuilder().CreateLoad(value->getType()->getPointerElementType(), 
-                                         value, name.c_str());
+    // Get the pointee type directly from the pointer value
+    llvm::Type* pointeeType = value->getType()->getPointerElementType();
+    return context.getBuilder().CreateLoad(pointeeType, value, name.c_str());
 }
 
-// Implementation of Binary Expression code generation
 llvm::Value* BinaryExprAST::codeGen(CodeGenContext& context) {
     llvm::Value* L = lhs->codeGen(context);
     llvm::Value* R = rhs->codeGen(context);
@@ -214,89 +57,248 @@ llvm::Value* BinaryExprAST::codeGen(CodeGenContext& context) {
     }
 }
 
+llvm::Value* AssignmentExprAST::codeGen(CodeGenContext& context) {
+    llvm::Value* value = rhs->codeGen(context);
+    if (!value) return nullptr;
 
-// Implementation of If Statement code generation
+    llvm::Value* var = context.getSymbolValue(lhs->getName());
+    if (!var) {
+        std::cerr << "Unknown variable name: " << lhs->getName() << std::endl;
+        return nullptr;
+    }
+    context.getBuilder().CreateStore(value, var);
+    return value;
+}
+
+llvm::Value* CallExprAST::codeGen(CodeGenContext& context) {
+    llvm::Function* calleeF = context.getModule()->getFunction(callee);
+    if (!calleeF) {
+        std::cerr << "Unknown function referenced: " << callee << std::endl;
+        return nullptr;
+    }
+    if (calleeF->arg_size() != arguments.size()) {
+        std::cerr << "Incorrect # arguments passed" << std::endl;
+        return nullptr;
+    }
+
+    std::vector<llvm::Value*> argsV;
+    for (unsigned i = 0; i < arguments.size(); ++i) {
+        argsV.push_back(arguments[i]->codeGen(context));
+        if (!argsV.back()) return nullptr;
+    }
+
+    return context.getBuilder().CreateCall(calleeF, argsV, "calltmp");
+}
+
+llvm::Value* ExpressionStmtAST::codeGen(CodeGenContext& context) {
+    return expression->codeGen(context);
+}
+
+llvm::Value* BlockAST::codeGen(CodeGenContext& context) {
+    llvm::Value* last = nullptr;
+    for (auto stmt : statements) {
+        last = stmt->codeGen(context);
+    }
+    return last;
+}
+
+llvm::Value* VariableDeclarationAST::codeGen(CodeGenContext& context) {
+    llvm::Value* initValue = nullptr;
+    llvm::Type* allocType = nullptr;
+    
+    // Get initial value if available
+    if (assignmentExpr) {
+        initValue = assignmentExpr->codeGen(context);
+        if (!initValue) return nullptr;
+        allocType = initValue->getType();
+    } else {
+        // Default to double if no initializer
+        allocType = context.getDoubleType();
+        initValue = llvm::ConstantFP::get(context.getContext(), llvm::APFloat(0.0));
+    }
+
+    // Create allocation with correct type
+    llvm::AllocaInst* alloc = context.getBuilder().CreateAlloca(
+        allocType, nullptr, name.c_str());
+        
+    // Create store with matching types
+    context.getBuilder().CreateStore(initValue, alloc);
+    context.setSymbolValue(name, alloc);
+    
+    return alloc;
+}
+
+// In ast.cpp modify FunctionAST::codeGen:
+llvm::Value* FunctionAST::codeGen(CodeGenContext& context) {
+    std::vector<llvm::Type*> argTypes(arguments.size(), context.getDoubleType());
+    llvm::Type* returnType;
+
+    if (name == "main") {
+        returnType = llvm::Type::getInt32Ty(context.getContext());
+    } else {
+        returnType = context.getCurrentFunctionType(name);
+    }
+
+    llvm::FunctionType* funcType = llvm::FunctionType::get(returnType, argTypes, false);
+
+    llvm::Function* function = llvm::Function::Create(
+        funcType, llvm::Function::ExternalLinkage, name, context.getModule());
+
+    // Set names for all arguments
+    unsigned idx = 0;
+    for (auto& arg : function->args()) {
+        arg.setName(arguments[idx++]->getName());
+    }
+
+    // Create a new basic block to start insertion into
+    llvm::BasicBlock* bb = llvm::BasicBlock::Create(context.getContext(), "entry", function);
+    context.getBuilder().SetInsertPoint(bb);
+
+    context.pushBlock();
+
+    // Record arguments in symbol table
+    for (auto& arg : function->args()) {
+        llvm::AllocaInst* alloc = context.getBuilder().CreateAlloca(
+            arg.getType(), 0, std::string(arg.getName()));
+        context.getBuilder().CreateStore(&arg, alloc);
+        context.setSymbolValue(std::string(arg.getName()), alloc);
+    }
+
+    body->codeGen(context);
+
+    if (llvm::verifyFunction(*function, &llvm::errs())) {
+        std::cerr << "Error constructing function: " << name << std::endl;
+        function->eraseFromParent();
+        context.popBlock();
+        return nullptr;
+    }
+
+    context.popBlock();
+    return function;
+}
+
 llvm::Value* IfAST::codeGen(CodeGenContext& context) {
-    llvm::Value* conditionValue = condition->codeGen(context);
-    if (!conditionValue) return nullptr;
-    
-    // Convert condition to a bool by comparing non-equal to 0.0
-    conditionValue = context.getBuilder().CreateFCmpONE(
-        conditionValue, 
-        llvm::ConstantFP::get(context.getContext(), llvm::APFloat(0.0)), 
-        "ifcond");
-    
+    llvm::Value* condV = condition->codeGen(context);
+    if (!condV) return nullptr;
+
+    condV = context.getBuilder().CreateFCmpONE(
+        condV, llvm::ConstantFP::get(context.getContext(), llvm::APFloat(0.0)), "ifcond");
+
     llvm::Function* function = context.getBuilder().GetInsertBlock()->getParent();
-    
-    // Create blocks for the then and else cases. Insert the 'then' block at the end of the function
+
     llvm::BasicBlock* thenBB = llvm::BasicBlock::Create(context.getContext(), "then", function);
     llvm::BasicBlock* elseBB = llvm::BasicBlock::Create(context.getContext(), "else");
     llvm::BasicBlock* mergeBB = llvm::BasicBlock::Create(context.getContext(), "ifcont");
-    
-    context.getBuilder().CreateCondBr(conditionValue, thenBB, elseBB);
-    
-    // Emit then value
-    context.getBuilder().SetInsertPoint(thenBB);
-    llvm::Value* thenValue = thenBlock->codeGen(context);
-    if (!thenValue) return nullptr;
-    
-    context.getBuilder().CreateBr(mergeBB);
-    
-    // Emit else block
-    function->getBasicBlockList().push_back(elseBB);
-    context.getBuilder().SetInsertPoint(elseBB);
-    
-    llvm::Value* elseValue = nullptr;
+
     if (elseBlock) {
-        elseValue = elseBlock->codeGen(context);
-        if (!elseValue) return nullptr;
+        context.getBuilder().CreateCondBr(condV, thenBB, elseBB);
+    } else {
+        context.getBuilder().CreateCondBr(condV, thenBB, mergeBB);
     }
-    
+
+    // Emit then block
+    context.getBuilder().SetInsertPoint(thenBB);
+    thenBlock->codeGen(context);
     context.getBuilder().CreateBr(mergeBB);
-    
+
+    // Emit else block
+    if (elseBlock) {
+        function->getBasicBlockList().push_back(elseBB);
+        context.getBuilder().SetInsertPoint(elseBB);
+        elseBlock->codeGen(context);
+        context.getBuilder().CreateBr(mergeBB);
+    }
+
     // Emit merge block
     function->getBasicBlockList().push_back(mergeBB);
     context.getBuilder().SetInsertPoint(mergeBB);
-    
-    return llvm::ConstantFP::get(context.getContext(), llvm::APFloat(0.0));
+
+    return nullptr;
 }
 
-// Implementation of While Statement code generation
 llvm::Value* WhileAST::codeGen(CodeGenContext& context) {
     llvm::Function* function = context.getBuilder().GetInsertBlock()->getParent();
-    
-    // Create basic blocks for the loop
-    llvm::BasicBlock* condBB = llvm::BasicBlock::Create(context.getContext(), "loopcond", function);
+
+    llvm::BasicBlock* condBB = llvm::BasicBlock::Create(context.getContext(), "cond", function);
     llvm::BasicBlock* loopBB = llvm::BasicBlock::Create(context.getContext(), "loop");
     llvm::BasicBlock* afterBB = llvm::BasicBlock::Create(context.getContext(), "afterloop");
-    
-    // Branch to condition block
+
     context.getBuilder().CreateBr(condBB);
+
+    // Condition block
     context.getBuilder().SetInsertPoint(condBB);
-    
-    // Generate condition value
-    llvm::Value* conditionValue = condition->codeGen(context);
-    if (!conditionValue) return nullptr;
-    
-    // Convert condition to a bool by comparing non-equal to 0.0
-    conditionValue = context.getBuilder().CreateFCmpONE(
-        conditionValue, 
-        llvm::ConstantFP::get(context.getContext(), llvm::APFloat(0.0)), 
-        "loopcond");
-    
-    context.getBuilder().CreateCondBr(conditionValue, loopBB, afterBB);
-    
-    // Emit loop block
+    llvm::Value* condV = condition->codeGen(context);
+    if (!condV) return nullptr;
+    condV = context.getBuilder().CreateFCmpONE(
+        condV, llvm::ConstantFP::get(context.getContext(), llvm::APFloat(0.0)), "loopcond");
+    context.getBuilder().CreateCondBr(condV, loopBB, afterBB);
+
+    // Loop block
     function->getBasicBlockList().push_back(loopBB);
     context.getBuilder().SetInsertPoint(loopBB);
-    
-    if (!body->codeGen(context)) return nullptr;
-    
+    body->codeGen(context);
     context.getBuilder().CreateBr(condBB);
-    
-    // Emit after loop block
+
+    // After loop block
     function->getBasicBlockList().push_back(afterBB);
     context.getBuilder().SetInsertPoint(afterBB);
+
+    return nullptr;
+}
+
+llvm::Value* ReturnAST::codeGen(CodeGenContext& context) {
+    llvm::Value* retVal = expression->codeGen(context);
+    if (!retVal) {
+        return nullptr;
+    }
+
+    if (context.currentFunction()->getName() == "main") {
+        // Convert return value to int32 for main function
+        retVal = context.getBuilder().CreateFPToSI(
+            retVal, llvm::Type::getInt32Ty(context.getContext()), "retint");
+        return context.getBuilder().CreateRet(retVal);
+    } else {
+        return context.getBuilder().CreateRet(retVal);
+    }
+}
+
+llvm::Value* SIMDTypeExprAST::codeGen(CodeGenContext& context) {
+    unsigned width = getVectorWidth();
+    auto& builder = context.getBuilder();
+    llvm::Type* vecType = context.getVectorType(width);
+
+    // Create vector constant
+    std::vector<llvm::Constant*> values;
+    for (auto elem : elements) {
+        llvm::Value* val = elem->codeGen(context);
+        if (llvm::ConstantFP* constVal = llvm::dyn_cast<llvm::ConstantFP>(val)) {
+            values.push_back(constVal);
+        }
+    }
+
+    // Create vector constant
+    llvm::Constant* vec = llvm::ConstantVector::get(values);
     
-    return llvm::Constant::getNullValue(context.getDoubleType());
+    // Allocate and store vector
+    llvm::AllocaInst* alloc = builder.CreateAlloca(vecType, nullptr, "vec.addr");
+    builder.CreateStore(vec, alloc);
+    
+    return builder.CreateLoad(vecType, alloc);
+}
+
+llvm::Value* SIMDIntrinsicExprAST::codeGen(CodeGenContext& context) {
+    llvm::Value* lhs = args[0]->codeGen(context);
+    llvm::Value* rhs = args[1]->codeGen(context);
+    auto& builder = context.getBuilder();
+
+    if (intrinsic == "add") {
+        return builder.CreateFAdd(lhs, rhs, "vec.add");
+    } else if (intrinsic == "mul") {
+        return builder.CreateFMul(lhs, rhs, "vec.mul");
+    } else if (intrinsic == "sub") {
+        return builder.CreateFSub(lhs, rhs, "vec.sub");
+    } else if (intrinsic == "div") {
+        return builder.CreateFDiv(lhs, rhs, "vec.div");
+    }
+    return nullptr;
 }

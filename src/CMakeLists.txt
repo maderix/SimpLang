@@ -20,6 +20,7 @@ add_executable(simplang
 target_include_directories(simplang PRIVATE
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_CURRENT_BINARY_DIR}
+    ${LLVM_INCLUDE_DIRS}
 )
 
 # Link against LLVM libraries
