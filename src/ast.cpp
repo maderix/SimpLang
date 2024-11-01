@@ -70,24 +70,54 @@ llvm::Value* AssignmentExprAST::codeGen(CodeGenContext& context) {
     return value;
 }
 
+
 llvm::Value* CallExprAST::codeGen(CodeGenContext& context) {
-    llvm::Function* calleeF = context.getModule()->getFunction(callee);
+    // Check for SIMD operations
+    std::string funcName = callee;
+    bool isSIMDOp = false;
+    
+    if (callee == "simd_add" || callee == "simd_mul") {
+        isSIMDOp = true;
+        llvm::Value* arg0 = arguments[0]->codeGen(context);
+        if (!arg0) return nullptr;
+        
+        // Determine vector type
+        if (auto vecTy = llvm::dyn_cast<llvm::FixedVectorType>(arg0->getType())) {
+            bool isAVX = vecTy->getNumElements() == 8;
+            funcName += isAVX ? "_avx" : "_sse";
+        } else {
+            std::cerr << "Expected vector type for SIMD operation" << std::endl;
+            return nullptr;
+        }
+    } else if (callee == "sse") {
+        funcName = "sse";  // Vector creation function
+    } else if (callee == "avx") {
+        funcName = "avx";  // Vector creation function
+    }
+    
+    llvm::Function* calleeF = context.getModule()->getFunction(funcName);
     if (!calleeF) {
         std::cerr << "Unknown function referenced: " << callee << std::endl;
         return nullptr;
     }
-    if (calleeF->arg_size() != arguments.size()) {
-        std::cerr << "Incorrect # arguments passed" << std::endl;
+    
+    // Validate argument count
+    if ((!isSIMDOp && calleeF->arg_size() != arguments.size()) ||
+        (isSIMDOp && arguments.size() != 2)) {
+        std::cerr << "Incorrect number of arguments passed to " << callee << std::endl;
         return nullptr;
     }
-
+    
+    // Generate argument code
     std::vector<llvm::Value*> argsV;
     for (unsigned i = 0; i < arguments.size(); ++i) {
         argsV.push_back(arguments[i]->codeGen(context));
         if (!argsV.back()) return nullptr;
     }
-
-    return context.getBuilder().CreateCall(calleeF, argsV, "calltmp");
+    
+    // Create function call
+    return context.getBuilder().CreateCall(calleeF, argsV, 
+        isSIMDOp ? "simd.op" : "vec.create");
 }
 
 llvm::Value* ExpressionStmtAST::codeGen(CodeGenContext& context) {
@@ -103,25 +133,42 @@ llvm::Value* BlockAST::codeGen(CodeGenContext& context) {
 }
 
 llvm::Value* VariableDeclarationAST::codeGen(CodeGenContext& context) {
-    llvm::Value* initValue = nullptr;
-    llvm::Type* allocType = nullptr;
-    
-    // Get initial value if available
-    if (assignmentExpr) {
-        initValue = assignmentExpr->codeGen(context);
-        if (!initValue) return nullptr;
-        allocType = initValue->getType();
+    llvm::Type* varType;
+    llvm::Value* initValue;
+
+    if (sliceType) {
+        // For slice types, use the slice struct type
+        varType = context.getSliceType(sliceType->getType());
+        if (!varType) {
+            std::cerr << "Invalid slice type" << std::endl;
+            return nullptr;
+        }
+        varType = llvm::PointerType::get(varType, 0);
+
+        if (assignmentExpr) {
+            initValue = assignmentExpr->codeGen(context);
+            if (!initValue) return nullptr;
+        } else {
+            initValue = llvm::ConstantPointerNull::get(
+                llvm::cast<llvm::PointerType>(varType));
+        }
     } else {
-        // Default to double if no initializer
-        allocType = context.getDoubleType();
-        initValue = llvm::ConstantFP::get(context.getContext(), llvm::APFloat(0.0));
+        // For non-slice types, use existing logic
+        if (assignmentExpr) {
+            initValue = assignmentExpr->codeGen(context);
+            if (!initValue) return nullptr;
+            varType = initValue->getType();
+        } else {
+            varType = context.getDoubleType();
+            initValue = llvm::ConstantFP::get(context.getContext(), llvm::APFloat(0.0));
+        }
     }
 
     // Create allocation with correct type
     llvm::AllocaInst* alloc = context.getBuilder().CreateAlloca(
-        allocType, nullptr, name.c_str());
+        varType, nullptr, name.c_str());
         
-    // Create store with matching types
+    // Store initial value
     context.getBuilder().CreateStore(initValue, alloc);
     context.setSymbolValue(name, alloc);
     
@@ -165,14 +212,19 @@ llvm::Value* FunctionAST::codeGen(CodeGenContext& context) {
     }
 
     body->codeGen(context);
-
+    
+    // Add return void if no return statement
+    if (!context.getBuilder().GetInsertBlock()->getTerminator()) {
+        context.getBuilder().CreateRetVoid();
+    }
+    
     if (llvm::verifyFunction(*function, &llvm::errs())) {
         std::cerr << "Error constructing function: " << name << std::endl;
         function->eraseFromParent();
         context.popBlock();
         return nullptr;
     }
-
+    
     context.popBlock();
     return function;
 }
@@ -263,11 +315,10 @@ llvm::Value* ReturnAST::codeGen(CodeGenContext& context) {
 }
 
 llvm::Value* SIMDTypeExprAST::codeGen(CodeGenContext& context) {
-    unsigned width = getVectorWidth();
     auto& builder = context.getBuilder();
+    unsigned width = isAVX ? 8 : 4;  // Replace getVectorWidth() with direct check
     llvm::Type* vecType = context.getVectorType(width);
 
-    // Create vector constant
     std::vector<llvm::Constant*> values;
     for (auto elem : elements) {
         llvm::Value* val = elem->codeGen(context);
@@ -276,15 +327,10 @@ llvm::Value* SIMDTypeExprAST::codeGen(CodeGenContext& context) {
         }
     }
 
-    // Create vector constant
     llvm::Constant* vec = llvm::ConstantVector::get(values);
-    
-    // Allocate and store vector
-    llvm::AllocaInst* alloc = builder.CreateAlloca(vecType, nullptr, "vec.addr");
-    builder.CreateStore(vec, alloc);
-    
-    return builder.CreateLoad(vecType, alloc);
+    return vec;
 }
+
 
 llvm::Value* SIMDIntrinsicExprAST::codeGen(CodeGenContext& context) {
     llvm::Value* lhs = args[0]->codeGen(context);
@@ -301,4 +347,125 @@ llvm::Value* SIMDIntrinsicExprAST::codeGen(CodeGenContext& context) {
         return builder.CreateFDiv(lhs, rhs, "vec.div");
     }
     return nullptr;
+}
+
+// Slice implementations
+llvm::Value* SliceTypeAST::codeGen(CodeGenContext& context) {
+    // Rather than returning the type directly, create a null pointer of the slice type
+    llvm::Type* sliceType = context.getSliceType(type);
+    return llvm::ConstantPointerNull::get(
+        llvm::PointerType::get(sliceType, 0)
+    );
+}
+
+llvm::Value* SliceExprAST::codeGen(CodeGenContext& context) {
+    std::cout << "Generating code for SliceExpr..." << std::endl;
+    
+    // Generate length value
+    llvm::Value* len = length->codeGen(context);
+    if (!len) {
+        std::cerr << "Failed to generate length code" << std::endl;
+        return nullptr;
+    }
+    
+    // Generate capacity value (use length if not specified)
+    llvm::Value* cap = capacity ? capacity->codeGen(context) : len;
+    if (!cap) {
+        std::cerr << "Failed to generate capacity code" << std::endl;
+        return nullptr;
+    }
+    
+    auto& builder = context.getBuilder();
+    std::cout << "Creating slice of type " << (type == SliceType::SSE_SLICE ? "SSE" : "AVX") << std::endl;
+    
+    // Call appropriate make function
+    llvm::Function* make_func = context.getModule()->getFunction(
+        type == SliceType::SSE_SLICE ? "make_sse_slice" : "make_avx_slice"
+    );
+    
+    if (!make_func) {
+        std::cerr << "Slice creation function not found" << std::endl;
+        return nullptr;
+    }
+    
+    return builder.CreateCall(make_func, {len}, "slice.create");
+}
+
+llvm::Value* SliceStoreExprAST::codeGen(CodeGenContext& context) {
+    std::cout << "Generating code for SliceStore..." << std::endl;
+    
+    // Get slice
+    llvm::Value* slice = context.getSymbolValue(slice_name);
+    if (!slice) {
+        std::cerr << "Unknown slice: " << slice_name << std::endl;
+        return nullptr;
+    }
+    
+    // Generate index code
+    llvm::Value* idx = index->codeGen(context);
+    if (!idx) {
+        std::cerr << "Failed to generate index code" << std::endl;
+        return nullptr;
+    }
+    
+    // Generate value code
+    llvm::Value* val = value->codeGen(context);
+    if (!val) {
+        std::cerr << "Failed to generate value code" << std::endl;
+        return nullptr;
+    }
+    
+    auto& builder = context.getBuilder();
+    llvm::Type* sliceType = slice->getType()->getPointerElementType();
+    
+    // Call appropriate set function
+    llvm::Function* set_func;
+    if (sliceType == context.getSliceType(SliceType::SSE_SLICE)) {
+        set_func = context.getModule()->getFunction("slice_set_sse");
+    } else {
+        set_func = context.getModule()->getFunction("slice_set_avx");
+    }
+    
+    if (!set_func) {
+        std::cerr << "Slice store function not found" << std::endl;
+        return nullptr;
+    }
+    
+    return builder.CreateCall(set_func, {slice, idx, val}, "slice.set");
+}
+
+llvm::Value* SliceAccessExprAST::codeGen(CodeGenContext& context) {
+    std::cout << "Generating code for SliceAccess..." << std::endl;
+    
+    // Get slice
+    llvm::Value* slice = context.getSymbolValue(slice_name);
+    if (!slice) {
+        std::cerr << "Unknown slice: " << slice_name << std::endl;
+        return nullptr;
+    }
+    
+    // Generate index code
+    llvm::Value* idx = index->codeGen(context);
+    if (!idx) {
+        std::cerr << "Failed to generate index code" << std::endl;
+        return nullptr;
+    }
+    
+    auto& builder = context.getBuilder();
+    llvm::Type* sliceType = slice->getType()->getPointerElementType();
+    
+    // Call appropriate get function
+    llvm::Function* get_func;
+    if (sliceType == context.getSliceType(SliceType::SSE_SLICE)) {
+        get_func = context.getModule()->getFunction("slice_get_sse");
+    } else {
+        get_func = context.getModule()->getFunction("slice_get_avx");
+    }
+    
+    if (!get_func) {
+        std::cerr << "Slice access function not found" << std::endl;
+        return nullptr;
+    }
+    
+    return builder.CreateCall(get_func, {slice, idx}, "slice.get");
 }

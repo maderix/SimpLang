@@ -42,4 +42,4 @@ llvm_map_components_to_libnames(llvm_libs
     BitWriter
 )
 
-target_link_libraries(simplang ${llvm_libs})
+target_link_libraries(simplang ${llvm_libs} simplang_runtime)

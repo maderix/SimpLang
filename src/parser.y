@@ -25,10 +25,12 @@
     BlockAST *block;
     StmtAST *stmt;
     ExprAST *expr;
+    VariableExprAST *var_expr;
     VariableDeclarationAST *var_decl;
     std::vector<ExprAST*> *exprvec;
     std::vector<VariableDeclarationAST*> *varvec;
     std::string *string;
+    SliceTypeAST *slice_type;
     int token;
 }
 
@@ -37,22 +39,21 @@
 %token TVAR TFUNC TIF TELSE TWHILE TRETURN
 %token TLPAREN TRPAREN TLBRACE TRBRACE
 %token TCOMMA TSEMICOLON
+/* Slice tokens */
+%token TMAKE TSSESLICE TAVXSLICE TLBRACKET TRBRACKET
 
-/* SIMD tokens */
-%token TSIMD_SSE TSIMD_AVX TSIMD_NEON
-%token TSIMD_ADD TSIMD_MUL TSIMD_SUB TSIMD_DIV
-%token TSIMD_SHUFFLE TSIMD_BROADCAST
-
+%left TLBRACKET    /* For array subscripting */
 %left '+' '-'
 %left '*' '/'
 
 %type <block> program stmts block
 %type <stmt> stmt func_decl if_stmt while_stmt return_stmt
-%type <expr> expr numeric ident call_expr simd_expr simd_intrinsic
-%type <exprvec> call_args vector_elements
+%type <expr> expr numeric slice_expr slice_access call_expr
+%type <var_expr> ident
+%type <exprvec> call_args expr_list
 %type <varvec> func_decl_args
 %type <var_decl> var_decl param_decl
-%type <string> simd_type
+%type <slice_type> slice_type
 
 %%
 
@@ -83,64 +84,53 @@ expr : expr '+' expr   { $$ = new BinaryExprAST(OpAdd, $1, $3); }
      | expr TCGE expr  { $$ = new BinaryExprAST(OpGE, $1, $3); }
      | TLPAREN expr TRPAREN { $$ = $2; }
      | ident '=' expr  { $$ = new AssignmentExprAST($1, $3); }
-     | call_expr
-     | simd_expr
-     | simd_intrinsic
-     | ident
-     | numeric
+     | slice_access '=' expr { $$ = new SliceStoreExprAST(((SliceAccessExprAST*)$1)->getName(), 
+                                                         ((SliceAccessExprAST*)$1)->getIndex(), $3); }
+     | call_expr       { $$ = $1; }
+     | slice_access    { $$ = $1; }
+     | ident           { $$ = $1; }
+     | numeric         { $$ = $1; }
+     | slice_expr      { $$ = $1; }
      ;
 
-/* SIMD rules */
-simd_type : TSIMD_SSE { $$ = new std::string("sse"); }
-         | TSIMD_AVX { $$ = new std::string("avx"); }
-         | TSIMD_NEON { $$ = new std::string("neon"); }
-         ;
-
-vector_elements : expr { $$ = new std::vector<ExprAST*>(); $$->push_back($1); }
-                | vector_elements TCOMMA expr { $1->push_back($3); $$ = $1; }
-                ;
-
-simd_expr : simd_type TLPAREN vector_elements TRPAREN {
-            $$ = new SIMDTypeExprAST(*$1, *$3);
-          }
-         ;
-
-simd_intrinsic : TSIMD_ADD TLPAREN expr TCOMMA expr TRPAREN {
-                 std::vector<ExprAST*> args = {$3, $5};
-                 $$ = new SIMDIntrinsicExprAST("add", args);
-               }
-               | TSIMD_MUL TLPAREN expr TCOMMA expr TRPAREN {
-                 std::vector<ExprAST*> args = {$3, $5};
-                 $$ = new SIMDIntrinsicExprAST("mul", args);
-               }
-               | TSIMD_SUB TLPAREN expr TCOMMA expr TRPAREN {
-                 std::vector<ExprAST*> args = {$3, $5};
-                 $$ = new SIMDIntrinsicExprAST("sub", args);
-               }
-               | TSIMD_DIV TLPAREN expr TCOMMA expr TRPAREN {
-                 std::vector<ExprAST*> args = {$3, $5};
-                 $$ = new SIMDIntrinsicExprAST("div", args);
-               }
-               | TSIMD_SHUFFLE TLPAREN expr TCOMMA expr TRPAREN {
-                 std::vector<ExprAST*> args = {$3, $5};
-                 $$ = new SIMDIntrinsicExprAST("shuffle", args);
-               }
-               | TSIMD_BROADCAST TLPAREN expr TRPAREN {
-                 std::vector<ExprAST*> args = {$3};
-                 $$ = new SIMDIntrinsicExprAST("broadcast", args);
-               }
-               ;
-
-/* Original grammar rules continue below */
 block : TLBRACE stmts TRBRACE { $$ = $2; }
       | TLBRACE TRBRACE { $$ = new BlockAST(); }
       ;
 
 var_decl : TVAR TIDENTIFIER { $$ = new VariableDeclarationAST(*$2, nullptr); }
          | TVAR TIDENTIFIER '=' expr { $$ = new VariableDeclarationAST(*$2, $4); }
+         | TVAR TIDENTIFIER slice_type { $$ = new VariableDeclarationAST(*$2, nullptr, $3); }
+         | TVAR TIDENTIFIER slice_type '=' slice_expr 
+           { $$ = new VariableDeclarationAST(*$2, $5, $3); }
          ;
 
+slice_type : TSSESLICE { $$ = new SliceTypeAST(SliceType::SSE_SLICE); }
+          | TAVXSLICE { $$ = new SliceTypeAST(SliceType::AVX_SLICE); }
+          ;
+
+expr_list : expr { $$ = new std::vector<ExprAST*>(); $$->push_back($1); }
+         | expr_list TCOMMA expr { $1->push_back($3); $$ = $1; }
+         ;
+
+slice_expr : TMAKE TLPAREN slice_type TCOMMA expr TRPAREN 
+            { $$ = new SliceExprAST($3->getType(), $5); }
+          | TMAKE TLPAREN slice_type TCOMMA expr TCOMMA expr TRPAREN 
+            { $$ = new SliceExprAST($3->getType(), $5, $7); }
+          ;
+
+slice_access : ident TLBRACKET expr TRBRACKET 
+             { $$ = new SliceAccessExprAST($1->getName(), $3); }
+          ;
+
+call_expr : ident TLPAREN call_args TRPAREN { 
+            $$ = new CallExprAST($1->getName(), *$3); 
+          }
+          ;
+
+/* Rest of the rules remain the same */
+
 param_decl : TVAR TIDENTIFIER { $$ = new VariableDeclarationAST(*$2, nullptr); }
+           | TVAR TIDENTIFIER slice_type { $$ = new VariableDeclarationAST(*$2, nullptr, $3); }
            ;
 
 func_decl : TFUNC TIDENTIFIER TLPAREN func_decl_args TRPAREN block 
@@ -161,11 +151,6 @@ while_stmt : TWHILE TLPAREN expr TRPAREN block { $$ = new WhileAST($3, $5); }
 
 return_stmt : TRETURN expr TSEMICOLON { $$ = new ReturnAST($2); }
             ;
-
-call_expr : ident TLPAREN call_args TRPAREN { 
-            $$ = new CallExprAST(((VariableExprAST*)$1)->getName(), *$3); 
-          }
-          ;
 
 call_args : /* empty */ { $$ = new std::vector<ExprAST*>(); }
           | expr { $$ = new std::vector<ExprAST*>(); $$->push_back($1); }

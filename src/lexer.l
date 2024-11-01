@@ -22,17 +22,18 @@ extern "C" int yywrap() { return 1; }
 "else"                { return TELSE; }
 "while"               { return TWHILE; }
 "var"                 { return TVAR; }
+"make"                { return TMAKE; }
 
-"sse"                 { return TSIMD_SSE; }
-"avx"                 { return TSIMD_AVX; }
-"neon"                { return TSIMD_NEON; }
+"SSESlice"           { return TSSESLICE; }
+"AVXSlice"           { return TAVXSLICE; }
 
-"simd_add"            { return TSIMD_ADD; }
-"simd_mul"            { return TSIMD_MUL; }
-"simd_sub"            { return TSIMD_SUB; }
-"simd_div"            { return TSIMD_DIV; }
-"simd_shuffle"        { return TSIMD_SHUFFLE; }
-"simd_broadcast"      { return TSIMD_BROADCAST; }
+"sse"                 { SAVE_TOKEN; return TIDENTIFIER; }  /* Handle as identifier */
+"avx"                 { SAVE_TOKEN; return TIDENTIFIER; }  /* Handle as identifier */
+
+"simd_add"            { SAVE_TOKEN; return TIDENTIFIER; }  /* Handle as identifier */
+"simd_mul"            { SAVE_TOKEN; return TIDENTIFIER; }  /* Handle as identifier */
+"simd_sub"            { SAVE_TOKEN; return TIDENTIFIER; }  /* Handle as identifier */
+"simd_div"            { SAVE_TOKEN; return TIDENTIFIER; }  /* Handle as identifier */
 
 [a-zA-Z_][a-zA-Z0-9_]* { SAVE_TOKEN; return TIDENTIFIER; }
 
@@ -45,6 +46,8 @@ extern "C" int yywrap() { return 1; }
 ")"                   { return TRPAREN; }
 "{"                   { return TLBRACE; }
 "}"                   { return TRBRACE; }
+"["                   { return TLBRACKET; }
+"]"                   { return TRBRACKET; }
 ";"                   { return TSEMICOLON; }
 ","                   { return TCOMMA; }
 
@@ -55,6 +58,7 @@ extern "C" int yywrap() { return 1; }
 "-"                   { return '-'; }
 "*"                   { return '*'; }
 "/"                   { return '/'; }
+
 .                     { printf("Unknown token: %s\n", yytext); yyterminate(); }
 
 %%
