@@ -11,6 +11,9 @@
 
 class CodeGenContext;
 
+enum UnaryOp {
+    OpNeg = '-'  // Unary minus
+};
 // Binary operators
 enum BinaryOp {
     OpAdd = '+',
@@ -65,6 +68,19 @@ class VariableExprAST : public ExprAST {
 public:
     VariableExprAST(const std::string& name) : name(name) {}
     const std::string& getName() const { return name; }
+    virtual llvm::Value* codeGen(CodeGenContext& context) override;
+};
+
+// Add this new AST class:
+class UnaryExprAST : public ExprAST {
+    UnaryOp op;
+    ExprAST* operand;
+public:
+    UnaryExprAST(UnaryOp op, ExprAST* operand) 
+        : op(op), operand(operand) {}
+    virtual ~UnaryExprAST() {
+        delete operand;
+    }
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
 };
 

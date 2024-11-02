@@ -1,4 +1,4 @@
-fn main() {
+fn kernel_main() {
     var x = 10.0;
     var y = 5.0;
     var sum = x + y;

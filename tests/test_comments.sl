@@ -3,7 +3,7 @@
    multi-line comment
 */
 
-fn main() {
+fn kernel_main() {
     // Initialize variables
     var x = 10.0;  // First number
     var y = 5.0;   // Second number

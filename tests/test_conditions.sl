@@ -1,17 +1,24 @@
-fn max(var a, var b, var c) {
-    var result = a;
-    if (b > result) {
-        result = b;
+fn max(var a, var b) {
+    if (a > b) {
+        return a;
     }
-    if (c > result) {
-        result = c;
-    }
-    return result;
+    return b;
 }
 
-fn main() {
-    var x = 10.0;
-    var y = 20.0;
-    var z = 15.0;
-    return max(x, y, z);  // Should return 20.0
+fn test_simple_if(var x) {
+    if (x > 10.0) {
+        return x;
+    }
+    return 10.0;
+}
+
+fn kernel_main() {
+    // Test basic max function
+    var result1 = max(15.0, 10.0);  // Should be 15.0
+    
+    // Test simple if
+    var result2 = test_simple_if(20.0);  // Should be 20.0
+    
+    // Return sum
+    return result1 + result2;  // Should be 35.0
 }

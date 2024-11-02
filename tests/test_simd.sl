@@ -112,4 +112,6 @@ fn kernel_main(var out_sse SSESlice, var out_avx AVXSlice) {
     slice_set_sse(out_sse, 3i, ref_sse[1i]);
     slice_set_avx(out_avx, 2i, ref_avx[0i]);
     slice_set_avx(out_avx, 3i, ref_avx[1i]);
+    
+    return 1.0;  // Return success value
 }

@@ -28,6 +28,20 @@ llvm::Value* VariableExprAST::codeGen(CodeGenContext& context) {
     return context.getBuilder().CreateLoad(pointeeType, value, name.c_str());
 }
 
+llvm::Value* UnaryExprAST::codeGen(CodeGenContext& context) {
+    llvm::Value* operandV = operand->codeGen(context);
+    if (!operandV) return nullptr;
+
+    switch (op) {
+        case OpNeg:
+            // Create negation by subtracting from zero
+            return context.getBuilder().CreateFNeg(operandV, "negtmp");
+        default:
+            std::cerr << "Invalid unary operator" << std::endl;
+            return nullptr;
+    }
+}
+
 llvm::Value* BinaryExprAST::codeGen(CodeGenContext& context) {
     llvm::Value* L = lhs->codeGen(context);
     llvm::Value* R = rhs->codeGen(context);
@@ -67,16 +81,51 @@ llvm::Value* BinaryExprAST::codeGen(CodeGenContext& context) {
 }
 
 llvm::Value* AssignmentExprAST::codeGen(CodeGenContext& context) {
-    llvm::Value* value = rhs->codeGen(context);
-    if (!value) return nullptr;
+    std::cout << "Generating assignment for " << lhs->getName() << std::endl;
 
-    llvm::Value* var = context.getSymbolValue(lhs->getName());
-    if (!var) {
-        std::cerr << "Unknown variable name: " << lhs->getName() << std::endl;
+    // First, generate the RHS
+    llvm::Value* rhsValue = rhs->codeGen(context);
+    if (!rhsValue) {
+        std::cerr << "Error: Invalid right-hand side in assignment" << std::endl;
         return nullptr;
     }
-    context.getBuilder().CreateStore(value, var);
-    return value;
+
+    // Get the variable from the symbol table
+    llvm::Value* variable = context.getSymbolValue(lhs->getName());
+    if (!variable) {
+        std::cerr << "Error: Undefined variable " << lhs->getName() << std::endl;
+        return nullptr;
+    }
+
+    // Check types match
+    llvm::Type* varType = variable->getType()->getPointerElementType();
+    llvm::Type* rhsType = rhsValue->getType();
+    
+    if (varType != rhsType) {
+        // Try to convert types if possible
+        if (varType->isDoubleTy() && rhsType->isIntegerTy()) {
+            rhsValue = context.getBuilder().CreateSIToFP(
+                rhsValue,
+                llvm::Type::getDoubleTy(context.getContext()),
+                "conv"
+            );
+        } else if (varType->isIntegerTy() && rhsType->isDoubleTy()) {
+            rhsValue = context.getBuilder().CreateFPToSI(
+                rhsValue,
+                llvm::Type::getInt64Ty(context.getContext()),
+                "conv"
+            );
+        } else {
+            std::cerr << "Error: Type mismatch in assignment to " << lhs->getName() << std::endl;
+            return nullptr;
+        }
+    }
+
+    // Create the store instruction
+    context.getBuilder().CreateStore(rhsValue, variable);
+    
+    // Return the assigned value
+    return rhsValue;
 }
 
 
@@ -223,11 +272,9 @@ llvm::Value* VariableDeclarationAST::codeGen(CodeGenContext& context) {
 llvm::Value* FunctionAST::codeGen(CodeGenContext& context) {
     std::cout << "Generating function: " << name << std::endl;
     
-    // Get function's return type
-    llvm::Type* returnType = name == "kernel_main" ? 
-        llvm::Type::getVoidTy(context.getContext()) : 
-        llvm::Type::getDoubleTy(context.getContext());
-
+    // All functions return double in our language
+    llvm::Type* returnType = llvm::Type::getDoubleTy(context.getContext());
+    
     // Create argument types
     std::vector<llvm::Type*> argTypes;
     for (auto& arg : arguments) {
@@ -239,13 +286,21 @@ llvm::Value* FunctionAST::codeGen(CodeGenContext& context) {
         }
     }
 
-    // Create function type and function
-    llvm::FunctionType* functionType = llvm::FunctionType::get(returnType, argTypes, false);
+    // Create function type
+    llvm::FunctionType* functionType = 
+        llvm::FunctionType::get(returnType, argTypes, false);
+
+    // Create function
     llvm::Function* function = llvm::Function::Create(
         functionType,
-        llvm::Function::ExternalLinkage,
+        name == "kernel_main" ? llvm::Function::ExternalLinkage : llvm::Function::InternalLinkage,
         name,
         context.getModule());
+
+    // Set C calling convention for kernel_main
+    if (name == "kernel_main") {
+        function->setCallingConv(llvm::CallingConv::C);
+    }
 
     // Set argument names
     unsigned idx = 0;
@@ -253,49 +308,47 @@ llvm::Value* FunctionAST::codeGen(CodeGenContext& context) {
         arg.setName(arguments[idx++]->getName());
     }
 
-    // Create basic block and set insert point
+    // Create entry block
     llvm::BasicBlock* bb = llvm::BasicBlock::Create(context.getContext(), "entry", function);
     context.getBuilder().SetInsertPoint(bb);
-
     context.pushBlock();
 
     // Add arguments to symbol table
-    idx = 0;
     for (auto& arg : function->args()) {
         llvm::AllocaInst* alloca = context.getBuilder().CreateAlloca(
-            arg.getType(),
-            nullptr,
-            arg.getName());
+            arg.getType(), nullptr, arg.getName());
         context.getBuilder().CreateStore(&arg, alloca);
-        context.setSymbolValue(arguments[idx++]->getName(), alloca);
+        context.setSymbolValue(std::string(arg.getName()), alloca);
     }
 
-    // Generate body
-    llvm::Value* bodyVal = body->codeGen(context);
-    
-    // Don't treat null return as error for void functions
-    if (!bodyVal && returnType->isVoidTy()) {
-        context.getBuilder().CreateRetVoid();
-        llvm::verifyFunction(*function);
-        context.popBlock();
-        return function;
-    }
-    
-    if (!bodyVal) {
+    // Generate function body
+    llvm::Value* lastValue = body->codeGen(context);
+    if (!lastValue) {
         function->eraseFromParent();
-        context.popBlock();
         return nullptr;
     }
 
-    // Create return instruction
-    if (returnType->isVoidTy()) {
-        context.getBuilder().CreateRetVoid();
-    } else {
-        context.getBuilder().CreateRet(bodyVal);
+    // If there's no terminator, add return
+    llvm::BasicBlock* currentBlock = context.getBuilder().GetInsertBlock();
+    if (!currentBlock->getTerminator()) {
+        // If the last value isn't a double, return 0.0
+        if (!lastValue->getType()->isDoubleTy()) {
+            lastValue = llvm::ConstantFP::get(context.getContext(), llvm::APFloat(0.0));
+        }
+        context.getBuilder().CreateRet(lastValue);
     }
 
-    llvm::verifyFunction(*function);
     context.popBlock();
+
+    // Verify function
+    std::string error;
+    llvm::raw_string_ostream errorStream(error);
+    if (llvm::verifyFunction(*function, &errorStream)) {
+        std::cerr << "Function verification failed: " << error << std::endl;
+        function->eraseFromParent();
+        return nullptr;
+    }
+
     return function;
 }
 
@@ -303,85 +356,173 @@ llvm::Value* IfAST::codeGen(CodeGenContext& context) {
     llvm::Value* condV = condition->codeGen(context);
     if (!condV) return nullptr;
 
-    condV = context.getBuilder().CreateFCmpONE(
-        condV, llvm::ConstantFP::get(context.getContext(), llvm::APFloat(0.0)), "ifcond");
-
-    llvm::Function* function = context.getBuilder().GetInsertBlock()->getParent();
-
-    llvm::BasicBlock* thenBB = llvm::BasicBlock::Create(context.getContext(), "then", function);
-    llvm::BasicBlock* elseBB = llvm::BasicBlock::Create(context.getContext(), "else");
-    llvm::BasicBlock* mergeBB = llvm::BasicBlock::Create(context.getContext(), "ifcont");
-
-    if (elseBlock) {
-        context.getBuilder().CreateCondBr(condV, thenBB, elseBB);
-    } else {
-        context.getBuilder().CreateCondBr(condV, thenBB, mergeBB);
+    // Convert condition to bool if it's a double
+    if (condV->getType()->isDoubleTy()) {
+        condV = context.getBuilder().CreateFCmpONE(
+            condV,
+            llvm::ConstantFP::get(context.getContext(), llvm::APFloat(0.0)),
+            "ifcond"
+        );
     }
 
-    // Emit then block
-    context.getBuilder().SetInsertPoint(thenBB);
-    thenBlock->codeGen(context);
-    context.getBuilder().CreateBr(mergeBB);
+    llvm::Function* theFunction = context.getBuilder().GetInsertBlock()->getParent();
+    llvm::BasicBlock* entryBlock = context.getBuilder().GetInsertBlock();
+    
+    // Create basic blocks
+    llvm::BasicBlock* thenBB = llvm::BasicBlock::Create(context.getContext(), "then", theFunction);
+    llvm::BasicBlock* elseBB = elseBlock ? 
+        llvm::BasicBlock::Create(context.getContext(), "else") : nullptr;
+    llvm::BasicBlock* mergeBB = llvm::BasicBlock::Create(context.getContext(), "merge");
 
-    // Emit else block
-    if (elseBlock) {
-        function->getBasicBlockList().push_back(elseBB);
-        context.getBuilder().SetInsertPoint(elseBB);
-        elseBlock->codeGen(context);
+    // Create conditional branch
+    context.getBuilder().CreateCondBr(condV, thenBB, elseBB ? elseBB : mergeBB);
+
+    // Generate then block
+    context.getBuilder().SetInsertPoint(thenBB);
+    llvm::Value* thenV = thenBlock->codeGen(context);
+    if (!thenV) return nullptr;
+
+    // If there's no terminator, create branch to merge
+    if (!context.getBuilder().GetInsertBlock()->getTerminator()) {
         context.getBuilder().CreateBr(mergeBB);
     }
+    
+    // Record the block where 'then' part ended
+    llvm::BasicBlock* thenEndBB = context.getBuilder().GetInsertBlock();
 
-    // Emit merge block
-    function->getBasicBlockList().push_back(mergeBB);
+    // Generate else block
+    llvm::BasicBlock* elseEndBB = nullptr;
+    llvm::Value* elseV = nullptr;
+    if (elseBlock) {
+        theFunction->getBasicBlockList().push_back(elseBB);
+        context.getBuilder().SetInsertPoint(elseBB);
+        elseV = elseBlock->codeGen(context);
+        if (!elseV) return nullptr;
+        if (!context.getBuilder().GetInsertBlock()->getTerminator()) {
+            context.getBuilder().CreateBr(mergeBB);
+        }
+        elseEndBB = context.getBuilder().GetInsertBlock();
+    }
+
+    // Add merge block
+    theFunction->getBasicBlockList().push_back(mergeBB);
     context.getBuilder().SetInsertPoint(mergeBB);
+
+    // If both then and else terminate (e.g., with return), no PHI needed
+    if (thenEndBB->getTerminator() &&
+        (!elseBlock || elseEndBB->getTerminator())) {
+        return llvm::Constant::getNullValue(llvm::Type::getDoubleTy(context.getContext()));
+    }
+
+    // If values are generated and the blocks don't terminate, create PHI
+    if (thenV->getType() != llvm::Type::getVoidTy(context.getContext())) {
+        llvm::PHINode* PN = context.getBuilder().CreatePHI(
+            thenV->getType(), 2, "iftmp");
+
+        // Only add incoming value from 'then' if it doesn't terminate
+        if (!thenEndBB->getTerminator()) {
+            PN->addIncoming(thenV, thenEndBB);
+        }
+
+        // Handle the else/default path
+        llvm::Value* elseVal = elseV ? elseV : 
+            llvm::Constant::getNullValue(thenV->getType());
+        
+        llvm::BasicBlock* incomingBlock = elseBlock ? elseEndBB : entryBlock;
+        if (incomingBlock && !incomingBlock->getTerminator()) {
+            PN->addIncoming(elseVal, incomingBlock);
+        }
+
+        return PN;
+    }
 
     return nullptr;
 }
 
 llvm::Value* WhileAST::codeGen(CodeGenContext& context) {
-    llvm::Function* function = context.getBuilder().GetInsertBlock()->getParent();
+    std::cout << "Generating while loop" << std::endl;
 
-    llvm::BasicBlock* condBB = llvm::BasicBlock::Create(context.getContext(), "cond", function);
-    llvm::BasicBlock* loopBB = llvm::BasicBlock::Create(context.getContext(), "loop");
-    llvm::BasicBlock* afterBB = llvm::BasicBlock::Create(context.getContext(), "afterloop");
+    llvm::Function* theFunction = context.getBuilder().GetInsertBlock()->getParent();
+    
+    // Create the required basic blocks
+    llvm::BasicBlock* condBB = llvm::BasicBlock::Create(context.getContext(), "cond", theFunction);
+    llvm::BasicBlock* loopBB = llvm::BasicBlock::Create(context.getContext(), "loop", theFunction);
+    llvm::BasicBlock* afterBB = llvm::BasicBlock::Create(context.getContext(), "afterloop", theFunction);
 
+    // Branch to condition block to start the loop
     context.getBuilder().CreateBr(condBB);
 
-    // Condition block
+    // Emit condition block
     context.getBuilder().SetInsertPoint(condBB);
     llvm::Value* condV = condition->codeGen(context);
     if (!condV) return nullptr;
-    condV = context.getBuilder().CreateFCmpONE(
-        condV, llvm::ConstantFP::get(context.getContext(), llvm::APFloat(0.0)), "loopcond");
+
+    // Convert condition to bool if it's a double
+    if (condV->getType()->isDoubleTy()) {
+        condV = context.getBuilder().CreateFCmpONE(
+            condV,
+            llvm::ConstantFP::get(context.getContext(), llvm::APFloat(0.0)),
+            "loopcond"
+        );
+    }
+
     context.getBuilder().CreateCondBr(condV, loopBB, afterBB);
 
-    // Loop block
-    function->getBasicBlockList().push_back(loopBB);
+    // Emit loop block
     context.getBuilder().SetInsertPoint(loopBB);
-    body->codeGen(context);
-    context.getBuilder().CreateBr(condBB);
+    context.pushBlock();
+    llvm::Value* bodyV = body->codeGen(context);
+    context.popBlock();
 
-    // After loop block
-    function->getBasicBlockList().push_back(afterBB);
+    if (!bodyV) return nullptr;
+
+    // Branch back to condition if there's no terminator
+    if (!context.getBuilder().GetInsertBlock()->getTerminator()) {
+        context.getBuilder().CreateBr(condBB);
+    }
+
+    // Move to after block
     context.getBuilder().SetInsertPoint(afterBB);
 
-    return nullptr;
+    // For consistency with other blocks, return a zero value
+    return llvm::ConstantFP::get(context.getContext(), llvm::APFloat(0.0));
 }
 
 llvm::Value* ReturnAST::codeGen(CodeGenContext& context) {
-    llvm::Value* retVal = expression->codeGen(context);
-    if (!retVal) {
-        return nullptr;
+    llvm::Function* currentFunc = context.getBuilder().GetInsertBlock()->getParent();
+    bool isKernelMain = currentFunc->getName() == "kernel_main";
+    bool isVoidReturn = currentFunc->getReturnType()->isVoidTy();
+    
+    // Generate the return value
+    llvm::Value* returnValue = nullptr;
+    if (expression) {
+        returnValue = expression->codeGen(context);
+        if (!returnValue) {
+            return nullptr;
+        }
     }
 
-    if (context.currentFunction()->getName() == "main") {
-        // Convert return value to int32 for main function
-        retVal = context.getBuilder().CreateFPToSI(
-            retVal, llvm::Type::getInt32Ty(context.getContext()), "retint");
-        return context.getBuilder().CreateRet(retVal);
+    // Handle different return types
+    if (isKernelMain) {
+        if (!returnValue || !returnValue->getType()->isDoubleTy()) {
+            std::cerr << "Error: kernel_main must return a double value" << std::endl;
+            return nullptr;
+        }
+        context.getBuilder().CreateRet(returnValue);
+    } else if (isVoidReturn) {
+        if (returnValue) {
+            std::cerr << "Warning: value returned from void function is ignored" << std::endl;
+        }
+        context.getBuilder().CreateRetVoid();
     } else {
-        return context.getBuilder().CreateRet(retVal);
+        if (!returnValue) {
+            std::cerr << "Error: non-void function must return a value" << std::endl;
+            return nullptr;
+        }
+        context.getBuilder().CreateRet(returnValue);
     }
+
+    return returnValue;
 }
 
 llvm::Value* SIMDTypeExprAST::codeGen(CodeGenContext& context) {

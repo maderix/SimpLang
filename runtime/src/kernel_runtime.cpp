@@ -18,58 +18,59 @@ extern "C" {
 // Vector creation operations
 __m256d sse(double a, double b, double c, double d) {
     __m256d result = _mm256_set_pd(d, c, b, a);  // Note: set_pd loads in reverse order
-    //DEBUG_VECTOR("SSE vector created", result);
+    print_debug_vector_sse("SSE vector created", result);
     return result;
 }
 
 __m512d avx(double a, double b, double c, double d,
             double e, double f, double g, double h) {
     __m512d result = _mm512_set_pd(h, g, f, e, d, c, b, a);  // Note: set_pd loads in reverse order
-    //DEBUG_VECTOR("AVX vector created", result);
+    print_debug_vector_avx("AVX vector created", result);
     return result;
 }
 
 // SIMD arithmetic operations
 __m256d simd_add(__m256d a, __m256d b) {
     DEBUG_PRINT("\nSSE Addition:\n");
-    //DEBUG_VECTOR("  Input a", a);
-    //DEBUG_VECTOR("  Input b", b);
+    print_debug_vector_sse("  Input a", a);
+    print_debug_vector_sse("  Input b", b);
     
     __m256d result = _mm256_add_pd(a, b);
-    //DEBUG_VECTOR("  Result", result);
+    print_debug_vector_sse("  Result", result);
     return result;
 }
 
 __m512d simd_add_avx(__m512d a, __m512d b) {
     DEBUG_PRINT("\nAVX Addition:\n");
-    //DEBUG_VECTOR("  Input a", a);
-    //DEBUG_VECTOR("  Input b", b);
+    print_debug_vector_avx("  Input a", a);
+    print_debug_vector_avx("  Input b", b);
     
     __m512d result = _mm512_add_pd(a, b);
-    //DEBUG_VECTOR("  Result", result);
+    print_debug_vector_avx("  Result", result);
     return result;
 }
 
 __m256d simd_mul(__m256d a, __m256d b) {
     DEBUG_PRINT("\nSSE Multiplication:\n");
-    //DEBUG_VECTOR("  Input a", a);
-    //DEBUG_VECTOR("  Input b", b);
+    print_debug_vector_sse("  Input a", a);
+    print_debug_vector_sse("  Input b", b);
     
     __m256d result = _mm256_mul_pd(a, b);
-    //DEBUG_VECTOR("  Result", result);
+    print_debug_vector_sse("  Result", result);
     return result;
 }
 
 __m512d simd_mul_avx(__m512d a, __m512d b) {
     DEBUG_PRINT("\nAVX Multiplication:\n");
-    //DEBUG_VECTOR("  Input a", a);
-    //DEBUG_VECTOR("  Input b", b);
+    print_debug_vector_avx("  Input a", a);
+    print_debug_vector_avx("  Input b", b);
     
     __m512d result = _mm512_mul_pd(a, b);
-    //DEBUG_VECTOR("  Result", result);
+    print_debug_vector_avx("  Result", result);
     return result;
 }
 
+// Rest of the functions remain the same...
 // Vector allocation functions
 __m256d* allocate_sse_vectors(size_t count) {
     void* ptr = aligned_alloc(32, count * sizeof(__m256d));
