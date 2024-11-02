@@ -10,6 +10,7 @@
 #include <llvm/Support/Host.h>
 #include "ast.hpp"
 #include <map>
+#include <iostream>
 #include <string>
 #include <vector>
 #include <memory>
@@ -42,6 +43,9 @@ private:
     // Initialize runtime functions
     void initializeRuntimeFunctions();
     void initializeSliceTypes();
+
+private:
+    bool integerContextFlag = false;
 
 public:
     CodeGenContext();
@@ -88,6 +92,9 @@ public:
     void generateCode(BlockAST& root);
     void pushBlock();
     void popBlock();
+    void dumpBlocks() const;
+    void dumpSymbols() const;
+
     void setSymbolValue(const std::string& name, llvm::Value* value);
     llvm::Value* getSymbolValue(const std::string& name);
     
@@ -107,6 +114,48 @@ public:
     unsigned getVectorWidth(llvm::Type* type) const;
     //debug function:
     void declareRuntimeFunctions();
+
+    void setIntegerContext(bool flag) { integerContextFlag = flag; }
+    bool isIntegerContext() const { return integerContextFlag; }
+
+    void createVoidCall(llvm::Function* func, std::vector<llvm::Value*> args) {
+        builder.CreateCall(func, args);
+    }
+
+    // Helper method for non-void calls
+    llvm::Value* createCall(llvm::Function* func, std::vector<llvm::Value*> args, const std::string& name = "") {
+        return builder.CreateCall(func, args, name);
+    }
+
+    // Helper for slice operations
+    void createSliceSet(llvm::Value* slice, llvm::Value* idx, llvm::Value* val, bool isSSE) {
+        // First, ensure we have a proper slice pointer, not a pointer to a pointer
+        if (slice->getType()->isPointerTy() && 
+            slice->getType()->getPointerElementType()->isPointerTy()) {
+            slice = builder.CreateLoad(slice->getType()->getPointerElementType(), slice);
+        }
+
+        llvm::Function* setFunc = module->getFunction(isSSE ? "slice_set_sse" : "slice_set_avx");
+        if (!setFunc) {
+            std::cerr << "Set function not found" << std::endl;
+            return;
+        }
+        createVoidCall(setFunc, {slice, idx, val});
+    }
+
+    // Helper for slice creation
+    llvm::Value* createMakeSlice(llvm::Value* len, bool isSSE) {
+        // Ensure len is i64
+        if (len->getType()->isDoubleTy()) {
+            len = builder.CreateFPToSI(len, builder.getInt64Ty());
+        }
+        llvm::Function* makeFunc = module->getFunction(isSSE ? "make_sse_slice" : "make_avx_slice");
+        if (!makeFunc) {
+            std::cerr << "Make function not found" << std::endl;
+            return nullptr;
+        }
+        return createCall(makeFunc, {len}, "slice.create");
+    }
 };
 
 // Slice runtime structure (matches LLVM struct type)

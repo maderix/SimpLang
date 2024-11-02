@@ -1,116 +1,86 @@
-#ifndef KERNEL_H
-#define KERNEL_H
-
+#pragma once
+#include <cstddef>
 #include <immintrin.h>
-#include <stddef.h>
-#include <stdio.h>
-#include <stdlib.h>
+
+// Debug printing macros
+#ifdef SIMD_DEBUG
+    #include <stdio.h>
+    #define DEBUG_PRINT(...) printf(__VA_ARGS__)
+    #define DEBUG_VECTOR(msg, vec) print_debug_vector(msg, vec)
+#else
+    #define DEBUG_PRINT(...)
+    #define DEBUG_VECTOR(msg, vec)
+#endif
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// Vector types
-typedef __m256d sse_vector_t;  // 4 x double for SSE
-typedef __m512d avx_vector_t;  // 8 x double for AVX
+// Debug helper functions
+#ifdef SIMD_DEBUG
+void print_debug_vector(const char* msg, __m256d vec) {
+    alignas(32) double values[4];
+    _mm256_store_pd(values, vec);
+    printf("%s: [%.2f, %.2f, %.2f, %.2f]\n", 
+           msg, values[0], values[1], values[2], values[3]);
+}
 
-// Slice types
+void print_debug_vector(const char* msg, __m512d vec) {
+    alignas(64) double values[8];
+    _mm512_store_pd(values, vec);
+    printf("%s: [%.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f]\n",
+           msg, values[0], values[1], values[2], values[3],
+           values[4], values[5], values[6], values[7]);
+}
+#endif
+
+// SSE slice type (4-wide double vectors)
 typedef struct {
-    sse_vector_t* data;
+    __m256d* data;  // Using AVX for SSE operations (4 doubles)
     size_t len;
     size_t cap;
 } sse_slice_t;
 
+// AVX slice type (8-wide double vectors)
 typedef struct {
-    avx_vector_t* data;
+    __m512d* data;  // Using AVX-512 for AVX operations (8 doubles)
     size_t len;
     size_t cap;
 } avx_slice_t;
 
-// Updated kernel prototype to match SimpleLang
-void kernel_main(sse_slice_t* out_sse, avx_slice_t* out_avx);
+// Vector creation
+__m256d sse(double a, double b, double c, double d);
+__m512d avx(double a, double b, double c, double d,
+            double e, double f, double g, double h);
 
-// Memory management
-sse_vector_t* allocate_sse_vectors(size_t count);
-avx_vector_t* allocate_avx_vectors(size_t count);
-void free_vectors(void* ptr);
+// SIMD operations
+__m256d simd_add(__m256d a, __m256d b);
+__m256d simd_mul(__m256d a, __m256d b);
+__m512d simd_add_avx(__m512d a, __m512d b);
+__m512d simd_mul_avx(__m512d a, __m512d b);
 
 // Slice operations
 sse_slice_t* make_sse_slice(size_t len);
+void slice_set_sse(sse_slice_t* slice, size_t idx, __m256d value);
+__m256d slice_get_sse(sse_slice_t* slice, size_t idx);
+
 avx_slice_t* make_avx_slice(size_t len);
+void slice_set_avx(avx_slice_t* slice, size_t idx, __m512d value);
+__m512d slice_get_avx(avx_slice_t* slice, size_t idx);
+
+// Memory management
+void free_vectors(void* ptr);
 void free_slice(void* slice);
 
-// Vector operations
-static inline sse_vector_t sse(double x0, double x1, double x2, double x3) {
-    double values[4] = {x0, x1, x2, x3};
-    return _mm256_loadu_pd(values);
-}
-
-static inline avx_vector_t avx(double x0, double x1, double x2, double x3,
-                             double x4, double x5, double x6, double x7) {
-    double values[8] = {x0, x1, x2, x3, x4, x5, x6, x7};
-    return _mm512_loadu_pd(values);
-}
-
-// SIMD operations
-static inline sse_vector_t simd_add_sse(sse_vector_t a, sse_vector_t b) {
-    return _mm256_add_pd(a, b);
-}
-
-static inline avx_vector_t simd_add_avx(avx_vector_t a, avx_vector_t b) {
-    return _mm512_add_pd(a, b);
-}
-
-static inline sse_vector_t simd_mul_sse(sse_vector_t a, sse_vector_t b) {
-    return _mm256_mul_pd(a, b);
-}
-
-static inline avx_vector_t simd_mul_avx(avx_vector_t a, avx_vector_t b) {
-    return _mm512_mul_pd(a, b);
-}
-
-// Slice access with bounds checking
-[[noreturn]] static inline void slice_bounds_error(const char* msg) {
-    fprintf(stderr, "Slice bounds error: %s\n", msg);
-    abort();
-}
-
-static inline sse_vector_t slice_get_sse(sse_slice_t* slice, size_t idx) {
-    if (idx >= slice->len) {
-        slice_bounds_error("SSE slice index out of bounds");
-    }
-    return slice->data[idx];
-}
-
-static inline void slice_set_sse(sse_slice_t* slice, size_t idx, sse_vector_t value) {
-    if (idx >= slice->len) {
-        slice_bounds_error("SSE slice index out of bounds");
-    }
-    slice->data[idx] = value;
-}
-
-static inline avx_vector_t slice_get_avx(avx_slice_t* slice, size_t idx) {
-    if (idx >= slice->len) {
-        slice_bounds_error("AVX slice index out of bounds");
-    }
-    return slice->data[idx];
-}
-
-static inline void slice_set_avx(avx_slice_t* slice, size_t idx, avx_vector_t value) {
-    if (idx >= slice->len) {
-        slice_bounds_error("AVX slice index out of bounds");
-    }
-    slice->data[idx] = value;
-}
-
-// Debug utilities
-void print_sse_vector(sse_vector_t vec);
-void print_avx_vector(avx_vector_t vec);
+// Printing functions
+void print_sse_vector(__m256d vec);
+void print_avx_vector(__m512d vec);
 void print_sse_slice(sse_slice_t* slice);
 void print_avx_slice(avx_slice_t* slice);
+
+// Main kernel function - implemented by the generated code
+void kernel_main(sse_slice_t* out_sse, avx_slice_t* out_avx);
 
 #ifdef __cplusplus
 }
 #endif
-
-#endif // KERNEL_H

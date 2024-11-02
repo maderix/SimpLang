@@ -34,7 +34,7 @@
     int token;
 }
 
-%token <string> TIDENTIFIER TINTEGER TFLOAT
+%token <string> TIDENTIFIER TINTEGER TFLOAT TINTLIT
 %token TCEQ TCNE TCLE TCGE
 %token TVAR TFUNC TIF TELSE TWHILE TRETURN
 %token TLPAREN TRPAREN TLBRACE TRBRACE
@@ -127,8 +127,6 @@ call_expr : ident TLPAREN call_args TRPAREN {
           }
           ;
 
-/* Rest of the rules remain the same */
-
 param_decl : TVAR TIDENTIFIER { $$ = new VariableDeclarationAST(*$2, nullptr); }
            | TVAR TIDENTIFIER slice_type { $$ = new VariableDeclarationAST(*$2, nullptr, $3); }
            ;
@@ -162,6 +160,11 @@ ident : TIDENTIFIER { $$ = new VariableExprAST(*$1); }
 
 numeric : TINTEGER { $$ = new NumberExprAST(atof($1->c_str())); }
         | TFLOAT { $$ = new NumberExprAST(atof($1->c_str())); }
+        | TINTLIT {
+            std::string val = *$1;
+            val.pop_back(); // Remove the 'i' suffix
+            $$ = new NumberExprAST(std::stod(val), true); 
+        }
         ;
 
 %%

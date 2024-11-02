@@ -93,18 +93,30 @@ llvm::Type* CodeGenContext::getSliceType(SliceType type) {
 }
 
 llvm::Value* CodeGenContext::createSlice(SliceType type, llvm::Value* len, llvm::Value* cap) {
-    llvm::Type* sliceType = getSliceType(type);
-    llvm::Value* slice = builder.CreateAlloca(sliceType, nullptr, "slice");
+    // Convert length to i64 if it's a double
+    if (len->getType()->isDoubleTy()) {
+        len = builder.CreateFPToSI(len, builder.getInt64Ty(), "len.conv");
+    }
     
-    // Initialize to zero
-    builder.CreateMemSet(slice, 
-        llvm::ConstantInt::get(llvm::Type::getInt8Ty(context), 0),
-        module->getDataLayout().getTypeAllocSize(sliceType),
-        llvm::MaybeAlign(),
-        false);
-    
-    return slice;
+    // Convert capacity to i64 if it's a double
+    if (cap && cap->getType()->isDoubleTy()) {
+        cap = builder.CreateFPToSI(cap, builder.getInt64Ty(), "cap.conv");
+    }
+
+    // Get the appropriate make function
+    llvm::Function* makeFunc = type == SliceType::SSE_SLICE ? 
+        module->getFunction("make_sse_slice") : 
+        module->getFunction("make_avx_slice");
+
+    if (!makeFunc) {
+        std::cerr << "Make function not found for slice type" << std::endl;
+        return nullptr;
+    }
+
+    // Create the slice
+    return builder.CreateCall(makeFunc, {len}, "slice.create");
 }
+
 llvm::Value* CodeGenContext::createSliceWithCap(SliceType type, llvm::Value* len, llvm::Value* cap) {
     auto& builder = getBuilder();
     llvm::Type* sliceTy = getSliceType(type);
@@ -220,27 +232,52 @@ void CodeGenContext::generateCode(BlockAST& root) {
 }
 
 void CodeGenContext::pushBlock() {
-    blocks.push_back(new CodeGenBlock());
-}
+        std::cout << "Pushing new block" << std::endl;
+        blocks.push_back(new CodeGenBlock());
+    }
 
 void CodeGenContext::popBlock() {
-    CodeGenBlock* top = blocks.back();
-    blocks.pop_back();
-    delete top;
-}
+        std::cout << "Popping block" << std::endl;
+        CodeGenBlock* top = blocks.back();
+        blocks.pop_back();
+        delete top;
+    }
 
 void CodeGenContext::setSymbolValue(const std::string& name, llvm::Value* value) {
-    blocks.back()->locals[name] = value;
+        std::cout << "Setting symbol: " << name << std::endl;
+        blocks.back()->locals[name] = value;
 }
 
 llvm::Value* CodeGenContext::getSymbolValue(const std::string& name) {
-    for (auto it = blocks.rbegin(); it != blocks.rend(); ++it) {
-        auto value = (*it)->locals.find(name);
-        if (value != (*it)->locals.end()) {
-            return value->second;
+        for (auto it = blocks.rbegin(); it != blocks.rend(); ++it) {
+            auto value = (*it)->locals.find(name);
+            if (value != (*it)->locals.end()) {
+                std::cout << "Found symbol: " << name << std::endl;
+                return value->second;
+            }
         }
+        std::cerr << "Symbol not found: " << name << std::endl;
+        return nullptr;
+}
+
+void CodeGenContext::dumpBlocks() const {
+    std::cout << "Current block stack (size=" << blocks.size() << "):" << std::endl;
+    int i = 0;
+    for (auto block : blocks) {
+        std::cout << "Block " << i++ << " has " << block->locals.size() << " symbols" << std::endl;
     }
-    return nullptr;
+}
+
+void CodeGenContext::dumpSymbols() const {
+    if (blocks.empty()) {
+        std::cout << "No active blocks" << std::endl;
+        return;
+    }
+    
+    std::cout << "Current scope symbols:" << std::endl;
+    for (const auto& pair : blocks.back()->locals) {
+        std::cout << "  " << pair.first << std::endl;
+    }
 }
 
 llvm::Type* CodeGenContext::getVectorType(unsigned width) {
@@ -273,12 +310,15 @@ void CodeGenContext::declareRuntimeFunctions() {
     auto i8PtrTy = llvm::Type::getInt8PtrTy(context);
     auto i64Ty = llvm::Type::getInt64Ty(context);
     auto voidTy = llvm::Type::getVoidTy(context);
+    auto doubleTy = llvm::Type::getDoubleTy(context);
+    auto sseVecTy = getVectorType(4);  // 4 x double
+    auto avxVecTy = getVectorType(8);  // 8 x double
     
     // Declare slice types if not already declared
     if (!sseSliceType) {
         sseSliceType = llvm::StructType::create(context, "sse_slice_t");
         sseSliceType->setBody({
-            getVectorType(4)->getPointerTo(),
+            sseVecTy->getPointerTo(),
             i64Ty,  // len
             i64Ty   // cap
         });
@@ -287,11 +327,32 @@ void CodeGenContext::declareRuntimeFunctions() {
     if (!avxSliceType) {
         avxSliceType = llvm::StructType::create(context, "avx_slice_t");
         avxSliceType->setBody({
-            getVectorType(8)->getPointerTo(),
+            avxVecTy->getPointerTo(),
             i64Ty,  // len
             i64Ty   // cap
         });
     }
+    
+    // Declare SIMD vector creation functions with 4 and 8 double arguments
+    std::vector<llvm::Type*> sseArgs(4, doubleTy);
+    std::vector<llvm::Type*> avxArgs(8, doubleTy);
+    
+    module->getOrInsertFunction("sse", 
+        llvm::FunctionType::get(sseVecTy, sseArgs, false));
+    
+    module->getOrInsertFunction("avx", 
+        llvm::FunctionType::get(avxVecTy, avxArgs, false));
+    
+    // Declare SIMD operations
+    module->getOrInsertFunction("simd_add", 
+        llvm::FunctionType::get(sseVecTy, {sseVecTy, sseVecTy}, false));
+    module->getOrInsertFunction("simd_add_avx", 
+        llvm::FunctionType::get(avxVecTy, {avxVecTy, avxVecTy}, false));
+    
+    module->getOrInsertFunction("simd_mul", 
+        llvm::FunctionType::get(sseVecTy, {sseVecTy, sseVecTy}, false));
+    module->getOrInsertFunction("simd_mul_avx", 
+        llvm::FunctionType::get(avxVecTy, {avxVecTy, avxVecTy}, false));
     
     // Declare slice functions
     llvm::FunctionType* make_slice_ty = llvm::FunctionType::get(
@@ -312,7 +373,7 @@ void CodeGenContext::declareRuntimeFunctions() {
     
     // Declare slice access functions
     llvm::FunctionType* get_sse_ty = llvm::FunctionType::get(
-        getVectorType(4),
+        sseVecTy,
         {sseSliceType->getPointerTo(), i64Ty},
         false
     );
@@ -320,7 +381,7 @@ void CodeGenContext::declareRuntimeFunctions() {
     module->getOrInsertFunction("slice_get_sse", get_sse_ty);
     
     llvm::FunctionType* get_avx_ty = llvm::FunctionType::get(
-        getVectorType(8),
+        avxVecTy,
         {avxSliceType->getPointerTo(), i64Ty},
         false
     );
@@ -328,16 +389,16 @@ void CodeGenContext::declareRuntimeFunctions() {
     module->getOrInsertFunction("slice_get_avx", get_avx_ty);
 
     llvm::FunctionType* set_sse_ty = llvm::FunctionType::get(
-    voidTy,
-    {sseSliceType->getPointerTo(), i64Ty, getVectorType(4)},
-    false
+        voidTy,
+        {sseSliceType->getPointerTo(), i64Ty, sseVecTy},
+        false
     );
 
     module->getOrInsertFunction("slice_set_sse", set_sse_ty);
 
     llvm::FunctionType* set_avx_ty = llvm::FunctionType::get(
         voidTy,
-        {avxSliceType->getPointerTo(), i64Ty, getVectorType(8)},
+        {avxSliceType->getPointerTo(), i64Ty, avxVecTy},
         false
     );
 

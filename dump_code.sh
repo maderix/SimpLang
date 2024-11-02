@@ -30,6 +30,12 @@ dump_file "tests/CMakeLists.txt"
 dump_file "src/parser.y"
 dump_file "src/lexer.l"
 
+#simplang files
+echo -e "\n\Simplang Files:" >> "$output_file"
+find . -name "*.sl" | while read -r file; do
+    dump_file "$file"
+done
+
 # Header files
 echo -e "\n\nHeader Files:" >> "$output_file"
 find . -name "*.hpp" | while read -r file; do

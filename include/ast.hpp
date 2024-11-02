@@ -49,12 +49,15 @@ public:
     virtual ~StmtAST() {}
 };
 
-// Basic expressions
 class NumberExprAST : public ExprAST {
     double value;
+    bool isInteger;
 public:
-    NumberExprAST(double value) : value(value) {}
+    NumberExprAST(double value, bool isInt = false) 
+        : value(value), isInteger(isInt) {}
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
+    bool isIntegerLiteral() const { return isInteger; }
+    double getValue() const { return value; }
 };
 
 class VariableExprAST : public ExprAST {
@@ -78,6 +81,7 @@ class ExpressionStmtAST : public StmtAST {
     ExprAST* expression;
 public:
     ExpressionStmtAST(ExprAST* expr) : expression(expr) {}
+    ExprAST* getExpression() { return expression; }  // Add this
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
 };
 

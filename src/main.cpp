@@ -19,16 +19,21 @@ extern FILE* yyin;
 
 int main(int argc, char** argv) {
     bool debug = false;
+    std::string outputPath;
+
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " source.sl [-d]" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " source.sl [-o output] [-d]" << std::endl;
         return 1;
     }
 
-    // Check for debug flag
+    // Parse command line arguments
     for (int i = 2; i < argc; ++i) {
         if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--debug") == 0) {
             debug = true;
             yydebug = 1;
+        }
+        else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
+            outputPath = argv[++i];
         }
     }
 
@@ -78,22 +83,37 @@ int main(int argc, char** argv) {
     context.getModule()->print(llvm::outs(), nullptr);
     std::cout << "==================" << std::endl;
 
+    // Determine output paths
+    std::string objFile, llFile;
+    if (!outputPath.empty()) {
+        // Use provided output path
+        size_t lastDot = outputPath.find_last_of('.');
+        std::string basePath = outputPath.substr(0, lastDot);
+        objFile = outputPath;
+        llFile = basePath + ".ll";
+    } else {
+        // Use input path as base
+        std::string inputPath = argv[1];
+        size_t lastDot = inputPath.find_last_of('.');
+        std::string basePath = inputPath.substr(0, lastDot);
+        objFile = basePath + ".o";
+        llFile = basePath + ".ll";
+    }
+
     // Write LLVM IR to file
-    std::string outFile = std::string(argv[1]) + ".ll";
     std::error_code EC;
-    llvm::raw_fd_ostream dest(outFile, EC);
+    llvm::raw_fd_ostream dest(llFile, EC, llvm::sys::fs::OF_None);
     if (EC) {
         llvm::errs() << "Could not open file: " << EC.message() << "\n";
         return 1;
     }
     context.getModule()->print(dest, nullptr);
     dest.flush();
-    std::cout << "LLVM IR written to: " << outFile << std::endl;
+    std::cout << "LLVM IR written to: " << llFile << std::endl;
 
     // Generate object code
-    std::string objFile = std::string(argv[1]) + ".o";
     llvm::legacy::PassManager pass;
-    llvm::raw_fd_ostream destObj(objFile, EC);
+    llvm::raw_fd_ostream destObj(objFile, EC, llvm::sys::fs::OF_None);
     if (EC) {
         llvm::errs() << "Could not open file: " << EC.message() << "\n";
         return 1;

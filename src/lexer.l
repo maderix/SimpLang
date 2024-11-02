@@ -15,6 +15,7 @@ extern "C" int yywrap() { return 1; }
 
 [0-9]+\.[0-9]*        { SAVE_TOKEN; return TFLOAT; }
 [0-9]+                { SAVE_TOKEN; return TINTEGER; }
+[0-9]+"i"             { SAVE_TOKEN; return TINTLIT; }  /* Add integer literal token */
 
 "fn"                  { return TFUNC; }
 "return"              { return TRETURN; }
@@ -26,14 +27,18 @@ extern "C" int yywrap() { return 1; }
 
 "SSESlice"           { return TSSESLICE; }
 "AVXSlice"           { return TAVXSLICE; }
+"slice_get_sse"      { SAVE_TOKEN; return TIDENTIFIER; }
+"slice_get_avx"      { SAVE_TOKEN; return TIDENTIFIER; }
+"slice_set_sse"      { SAVE_TOKEN; return TIDENTIFIER; }
+"slice_set_avx"      { SAVE_TOKEN; return TIDENTIFIER; }
 
-"sse"                 { SAVE_TOKEN; return TIDENTIFIER; }  /* Handle as identifier */
-"avx"                 { SAVE_TOKEN; return TIDENTIFIER; }  /* Handle as identifier */
+"sse"                 { SAVE_TOKEN; return TIDENTIFIER; }
+"avx"                 { SAVE_TOKEN; return TIDENTIFIER; }
 
-"simd_add"            { SAVE_TOKEN; return TIDENTIFIER; }  /* Handle as identifier */
-"simd_mul"            { SAVE_TOKEN; return TIDENTIFIER; }  /* Handle as identifier */
-"simd_sub"            { SAVE_TOKEN; return TIDENTIFIER; }  /* Handle as identifier */
-"simd_div"            { SAVE_TOKEN; return TIDENTIFIER; }  /* Handle as identifier */
+"simd_add"            { SAVE_TOKEN; return TIDENTIFIER; }
+"simd_mul"            { SAVE_TOKEN; return TIDENTIFIER; }
+"simd_sub"            { SAVE_TOKEN; return TIDENTIFIER; }
+"simd_div"            { SAVE_TOKEN; return TIDENTIFIER; }
 
 [a-zA-Z_][a-zA-Z0-9_]* { SAVE_TOKEN; return TIDENTIFIER; }
 
