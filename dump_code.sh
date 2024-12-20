@@ -25,6 +25,7 @@ echo "==================================================================" >> "$o
 dump_file "CMakeLists.txt"
 dump_file "src/CMakeLists.txt"
 dump_file "tests/CMakeLists.txt"
+dump_file "runtime/CMakeLists.txt"
 
 # Parser and Lexer files
 dump_file "src/parser.y"

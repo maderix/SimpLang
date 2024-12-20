@@ -22,11 +22,11 @@ enum BinaryOp {
     OpDiv = '/',
     OpLT  = '<',
     OpGT  = '>',
-    OpAssign = '=',
     OpLE  = 256,
-    OpGE,
-    OpEQ,
-    OpNE
+    OpGE  = 257,
+    OpEQ  = 258,
+    OpNE  = 259,
+    OpMod = '%'  // Add modulo operator
 };
 
 // SIMD Slice types
@@ -65,31 +65,41 @@ public:
 
 class VariableExprAST : public ExprAST {
     std::string name;
+    bool isWrite;  // Tracks if this is a write access
+    unsigned lineNo;  // Source line number for debugging
+
 public:
-    VariableExprAST(const std::string& name) : name(name) {}
+    VariableExprAST(const std::string& name, bool write = false, unsigned line = 0) 
+        : name(name), isWrite(write), lineNo(line) {}
+        
     const std::string& getName() const { return name; }
+    bool isWriteAccess() const { return isWrite; }
+    unsigned getLine() const { return lineNo; }
+    
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
 };
 
+
 // Add this new AST class:
 class UnaryExprAST : public ExprAST {
-    UnaryOp op;
-    ExprAST* operand;
+    UnaryOp op_;
+    std::unique_ptr<ExprAST> operand_;
 public:
-    UnaryExprAST(UnaryOp op, ExprAST* operand) 
-        : op(op), operand(operand) {}
-    virtual ~UnaryExprAST() {
-        delete operand;
-    }
+    UnaryExprAST(UnaryOp op, std::unique_ptr<ExprAST> operand) 
+        : op_(op), operand_(std::move(operand)) {}
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
 };
 
 class BinaryExprAST : public ExprAST {
-    BinaryOp op;
-    ExprAST *lhs, *rhs;
+    BinaryOp op_;
+    std::unique_ptr<ExprAST> left_;
+    std::unique_ptr<ExprAST> right_;
+    
 public:
-    BinaryExprAST(BinaryOp op, ExprAST* lhs, ExprAST* rhs) 
-        : op(op), lhs(lhs), rhs(rhs) {}
+    BinaryExprAST(BinaryOp op, std::unique_ptr<ExprAST> left,
+                  std::unique_ptr<ExprAST> right)
+        : op_(op), left_(std::move(left)), right_(std::move(right)) {}
+        
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
 };
 
@@ -132,9 +142,10 @@ public:
 };
 
 class SliceExprAST : public ExprAST {
-    SliceType type;
+    SliceType type;  // This holds the actual SliceType enum value
     ExprAST* length;
     ExprAST* capacity;  // Optional
+
 public:
     SliceExprAST(SliceType t, ExprAST* len, ExprAST* cap = nullptr)
         : type(t), length(len), capacity(cap) {}
@@ -170,12 +181,45 @@ public:
 };
 
 class SliceStoreExprAST : public ExprAST {
-    std::string slice_name;
-    ExprAST* index;
-    ExprAST* value;
+    std::string slice_name_;
+    std::unique_ptr<ExprAST> index_;
+    std::unique_ptr<ExprAST> value_;
 public:
-    SliceStoreExprAST(const std::string& name, ExprAST* idx, ExprAST* val)
-        : slice_name(name), index(idx), value(val) {}
+    SliceStoreExprAST(const std::string& name, ExprAST* idx, std::unique_ptr<ExprAST> val)
+        : slice_name_(name), index_(idx), value_(std::move(val)) {}
+    virtual llvm::Value* codeGen(CodeGenContext& context) override;
+};
+
+class VariableDeclarationAST : public StmtAST {
+    std::string name;
+    ExprAST* assignmentExpr;
+    SliceTypeAST* sliceType;
+    unsigned lineNo;
+    bool isGlobal;
+    std::string typeName;  // For debug info
+
+public:
+    VariableDeclarationAST(const std::string& name, 
+                          ExprAST* expr = nullptr,
+                          SliceTypeAST* slice = nullptr,
+                          unsigned line = 0,
+                          bool global = false,
+                          const std::string& type = "double")
+        : name(name), assignmentExpr(expr), sliceType(slice), 
+          lineNo(line), isGlobal(global), typeName(type) {}
+          
+    virtual ~VariableDeclarationAST() {
+        delete assignmentExpr;
+        delete sliceType;
+    }
+
+    const std::string& getName() const { return name; }
+    bool isSlice() const { return sliceType != nullptr; }
+    SliceType getSliceType() const { return sliceType ? sliceType->getType() : SSE_SLICE; }
+    unsigned getLine() const { return lineNo; }
+    bool isGlobalVariable() const { return isGlobal; }
+    const std::string& getTypeName() const { return typeName; }
+    
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
 };
 
@@ -186,27 +230,13 @@ public:
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
 };
 
-class VariableDeclarationAST : public StmtAST {
-    std::string name;
-    ExprAST* assignmentExpr;
-    SliceTypeAST* sliceType;
-public:
-    VariableDeclarationAST(const std::string& name, 
-                          ExprAST* expr = nullptr,
-                          SliceTypeAST* slice = nullptr)
-        : name(name), assignmentExpr(expr), sliceType(slice) {}
-    const std::string& getName() const { return name; }
-    bool isSlice() const { return sliceType != nullptr; }
-    SliceType getSliceType() const { return sliceType ? sliceType->getType() : SSE_SLICE; }
-    virtual llvm::Value* codeGen(CodeGenContext& context) override;
-};
 
 class AssignmentExprAST : public ExprAST {
-    VariableExprAST* lhs;
-    ExprAST* rhs;
+    VariableExprAST* lhs_;  // Keep as raw pointer since we don't own it
+    std::unique_ptr<ExprAST> rhs_;
 public:
-    AssignmentExprAST(ExprAST* lhs, ExprAST* rhs)
-        : lhs(dynamic_cast<VariableExprAST*>(lhs)), rhs(rhs) {}
+    AssignmentExprAST(VariableExprAST* lhs, std::unique_ptr<ExprAST> rhs)
+        : lhs_(lhs), rhs_(std::move(rhs)) {}
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
 };
 
@@ -253,6 +283,17 @@ class ReturnAST : public StmtAST {
     ExprAST* expression;
 public:
     ReturnAST(ExprAST* expr) : expression(expr) {}
+    virtual llvm::Value* codeGen(CodeGenContext& context) override;
+};
+
+class VectorCreationExprAST : public ExprAST {
+    std::vector<std::unique_ptr<ExprAST>> elements_;
+    bool isAVX_;
+    
+public:
+    VectorCreationExprAST(std::vector<std::unique_ptr<ExprAST>> elements, bool isAVX)
+        : elements_(std::move(elements)), isAVX_(isAVX) {}
+        
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
 };
 

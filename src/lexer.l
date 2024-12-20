@@ -32,8 +32,8 @@ extern "C" int yywrap() { return 1; }
 "slice_set_sse"      { SAVE_TOKEN; return TIDENTIFIER; }
 "slice_set_avx"      { SAVE_TOKEN; return TIDENTIFIER; }
 
-"sse"                 { SAVE_TOKEN; return TIDENTIFIER; }
-"avx"                 { SAVE_TOKEN; return TIDENTIFIER; }
+"sse"                 { SAVE_TOKEN; return TSSE; }
+"avx"                 { SAVE_TOKEN; return TAVX; }
 
 "simd_add"            { SAVE_TOKEN; return TIDENTIFIER; }
 "simd_mul"            { SAVE_TOKEN; return TIDENTIFIER; }
@@ -63,6 +63,8 @@ extern "C" int yywrap() { return 1; }
 "-"                   { return '-'; }
 "*"                   { return '*'; }
 "/"                   { return '/'; }
+
+"%"                   { return TOK_MOD; }
 
 .                     { printf("Unknown token: %s\n", yytext); yyterminate(); }
 

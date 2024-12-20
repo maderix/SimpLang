@@ -1,297 +1,712 @@
 #include "kernel_debugger/debugger.hpp"
+#include "kernel_debugger/debug_events.hpp"
 #include <iostream>
 #include <iomanip>
 #include <sstream>
+#include <chrono>
 
-// Initialize static members
-KernelDebugger* KernelDebugger::instance = nullptr;
-std::mutex KernelDebugger::mutex;
-
-// Constructor
-KernelDebugger::KernelDebugger()
-    : breakpointMgr(std::make_unique<BreakpointManager>())
-    , eventLogger(std::make_unique<EventLogger>())
-    , memoryTracker(std::make_unique<MemoryTracker>())
-    , currentMode(Mode::RUN)
-    , isRunning(false)
-    , stepCount(0)
-{}
-
-KernelDebugger* KernelDebugger::getInstance() {
-    std::lock_guard<std::mutex> lock(mutex);
-    if (instance == nullptr) {
-        instance = new KernelDebugger();
-    }
+KernelDebugger& KernelDebugger::getInstance() {
+    static KernelDebugger instance;
     return instance;
 }
 
-void KernelDebugger::start() {
-    std::lock_guard<std::mutex> lock(mutex);
-    
-    if (isRunning) {
-        std::cout << "Debugger is already running" << std::endl;
-        return;
+KernelDebugger::KernelDebugger() 
+    : sourceManager(this)
+    , currentFile("")      // Initialize currentFile to empty string
+    , currentFunction("") // Initialize currentFunction to empty string
+    , isRunning(false)
+    , pauseFlag(false)
+    , stepCount(0)
+    , stepStopDepth(-1)
+{
+    initializeComponents();
+}
+void KernelDebugger::initializeComponents() {
+        // Initialize configuration
+        config = DebuggerConfig::getInstance();
+
+        // Initialize UI Helper
+        uiHelper = std::make_unique<UIHelper>(UIHelper::PromptOptions(
+            config->ui().prompt,
+            config->ui().enableHistory,
+            config->ui().enableCompletion,
+            config->ui().maxHistorySize
+        )); 
+
+        // Initialize Memory Tracker
+        memoryTracker = std::make_shared<MemoryTracker>();
+        memoryTracker->enableTracking(config->debug().enableMemoryTracking);
+
+        // Initialize Event Logger
+        eventLogger = std::make_shared<EventLogger>(config->debug().maxEventLogSize);
+        eventLogger->setEnabled(config->debug().logDebugEvents);
+
+        // Initialize Command Processor - moved to after other components
+        cmdProcessor = std::make_unique<CommandProcessor>(*this);
+
+        // Initialize Event Handler
+        initializeEventHandler();
+        
+        isInitialized = true;
     }
 
-    isRunning = true;
-    stepCount = 0;
-    opCounts.clear();
-    
-    eventLogger->logEvent(
-        EventLogger::EventType::BREAKPOINT,
-        "Debugger started",
-        "",
-        nullptr,
-        0,
-        "Mode: " + getModeString(currentMode)
-    );
+KernelDebugger::~KernelDebugger() {
+    stop();
+    cleanupEventHandler();
+}
 
-    std::cout << "\n=== Kernel Debugger Started ===\n"
-              << "Mode: " << getModeString(currentMode) << "\n"
-              << "===============================" << std::endl;
+void KernelDebugger::initialize() {
+    std::cout << "DEBUG: KernelDebugger::initialize() start\n";
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    isRunning = false;
+    stepCount = 0;
+    currentMode = Mode::RUN;
+    stepStopDepth = -1;
+    vectorRegs.clear();
+    opStats.clear();
+    pauseFlag = false;
+    currentFile = "";
+    currentFunction = "";
+    
+    if (eventLogger) {
+        eventLogger->clear();
+    }
+    if (memoryTracker) {
+        memoryTracker->reset();
+    }
+    
+    sourceManager.reset();
+    breakpointMgr.clearAllBreakpoints();
+    callStack.clear();  // Clear call stack
+    std::cout << "DEBUG: KernelDebugger::initialize() complete\n";
+}
+
+void KernelDebugger::performInitialization() {
+        isRunning = false;
+        stepCount = 0;
+        currentMode = Mode::RUN;
+        stepStopDepth = -1;
+        vectorRegs.clear();
+        opStats.clear();
+        pauseFlag = false;
+        currentFile = "";
+        currentFunction = "";
+        
+        if (eventLogger) {
+            eventLogger->clear();
+        }
+        if (memoryTracker) {
+            memoryTracker->reset();
+        }
+        
+        sourceManager.reset();
+        breakpointMgr.clearAllBreakpoints();
+        callStack.clear();
+}
+
+bool KernelDebugger::loadKernel(const std::string& filename) {
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    if (sourceManager.setKernel(filename)) {
+        logDebugEvent("loadKernel", "Loaded " + filename);
+        return true;
+    }
+    return false;
+}
+
+void KernelDebugger::start() {
+    std::cout << "DEBUG: KernelDebugger::start() begin\n";
+    
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        isRunning = true;
+        std::cout << "DEBUG: Set isRunning to true\n";
+    }
+    
+    logDebugEvent("start", "Debugger started");
+    std::cout << "DEBUG: Logged start event\n";
+    
+    auto loc = sourceManager.getCurrentLocation();
+    std::cout << "DEBUG: Got current location: " << loc.file << ":" << loc.line << "\n";
+    
+    if (loc.line > 0) {
+        std::cout << "DEBUG: About to print location\n";
+        printLocation();
+        std::cout << "DEBUG: Location printed\n";
+    } else {
+        if (uiHelper) {
+            std::cout << "DEBUG: About to print ready message\n";
+            uiHelper->printInfo("Ready to load source file");
+            std::cout << "DEBUG: Ready message printed\n";
+        }
+    }
+    std::cout << "DEBUG: KernelDebugger::start() complete\n";
 }
 
 void KernelDebugger::stop() {
     std::lock_guard<std::mutex> lock(mutex);
     
+    isRunning = false;
+    logDebugEvent("stop", "Debugger stopped");
+}
+
+void KernelDebugger::executeNextInstruction() {
+    std::cout << "DEBUG: KernelDebugger::executeNextInstruction - start\n";
     if (!isRunning) {
-        std::cout << "Debugger is not running" << std::endl;
+        std::cout << "DEBUG: Not running, returning\n";
         return;
     }
 
-    eventLogger->logEvent(
-        EventLogger::EventType::BREAKPOINT,
-        "Debugger stopped",
-        "",
-        nullptr,
-        0,
-        "Total steps: " + std::to_string(stepCount)
-    );
-
-    isRunning = false;
-    printSummary();
-}
-
-void KernelDebugger::onSIMDOperation(SIMDOp op, const void* a, const void* b, const void* result) {
-    if (!isRunning) return;
-    std::lock_guard<std::mutex> lock(mutex);
-
-    stepCount++;
-    std::string opName = getModeString(currentMode);
-    opCounts[opName]++;
-
-    std::stringstream desc;
-    desc << opName;
-    if (a) desc << "\n  Input A: " << formatSIMDVector(a, op);
-    if (b) desc << "\n  Input B: " << formatSIMDVector(b, op);
-    if (result) desc << "\n  Result: " << formatSIMDVector(result, op);
-
-    eventLogger->logEvent(
-        EventLogger::EventType::SIMD_OP,
-        desc.str(),
-        std::to_string(stepCount)
-    );
-
-    if (currentMode == Mode::BREAKPOINT && 
-        breakpointMgr->checkBreakpoint(opName)) {
-        handleBreakpoint(opName);
-    }
-
-    if (currentMode == Mode::STEP) {
-        handleStep(opName);
-    }
-}
-
-void KernelDebugger::onMemoryOperation(const std::string& op, void* addr, 
-                                     size_t size, const std::string& description) {
-    if (!isRunning) return;
-    std::lock_guard<std::mutex> lock(mutex);
-
-    memoryTracker->trackOperation(op, addr, size, description);
-
-    eventLogger->logEvent(
-        EventLogger::EventType::MEMORY_OP,
-        op + " " + std::to_string(size) + " bytes",
-        std::to_string(stepCount),
-        addr,
-        size,
-        description
-    );
-}
-
-void KernelDebugger::onSliceOperation(const std::string& op, const void* slice, 
-                                    size_t index) {
-    if (!isRunning) return;
-    std::lock_guard<std::mutex> lock(mutex);
-
-    stepCount++;
-    std::string sliceType = isSSEVector(slice) ? "SSE" : "AVX";
-    std::string opName = sliceType + "_slice_" + op;
-    opCounts[opName]++;
-
-    std::stringstream desc;
-    desc << sliceType << " Slice " << op << " at index " << index;
-    if (op == "get") {
-        desc << "\n  Content: " << formatSliceElement(slice, index);
-    }
-
-    eventLogger->logEvent(
-        EventLogger::EventType::SLICE_OP,
-        desc.str(),
-        std::to_string(stepCount)
-    );
-
-    if (currentMode == Mode::BREAKPOINT && 
-        breakpointMgr->checkBreakpoint(opName)) {
-        handleBreakpoint(opName);
-    }
-
-    if (currentMode == Mode::STEP) {
-        handleStep(opName);
-    }
-}
-
-int KernelDebugger::addBreakpoint(const std::string& location, 
-                                 std::function<bool()> condition) {
-    return breakpointMgr->addBreakpoint(
-        BreakpointManager::Type::INSTRUCTION,
-        location,
-        condition
-    );
-}
-
-void KernelDebugger::removeBreakpoint(int id) {
-    breakpointMgr->removeBreakpoint(id);
-}
-
-void KernelDebugger::setMode(Mode mode) {
-    std::lock_guard<std::mutex> lock(mutex);
+    auto loc = sourceManager.getCurrentLocation();
+    std::cout << "DEBUG: Executing line " << loc.line << " in " << loc.file << "\n";
     
-    currentMode = mode;
-    std::string modeStr = getModeString(mode);
-    
-    std::cout << "Debugger mode changed to: " << modeStr << std::endl;
-    
-    if (mode == Mode::STEP) {
-        std::cout << "Step-by-step execution enabled.\n";
-    }
+    // Execute the line
+    sourceManager.executeCurrentLine();
+    std::cout << "DEBUG: Line executed\n";
 
-    eventLogger->logEvent(
-        EventLogger::EventType::BREAKPOINT,
-        "Mode changed to " + modeStr,
-        std::to_string(stepCount)
-    );
-}
-
-void KernelDebugger::handleBreakpoint(const std::string& location) {
-    std::cout << "\nBreakpoint hit at " << location << " (step " << stepCount << ")\n";
-    printCurrentState();
-    waitForCommand();
-}
-
-void KernelDebugger::handleStep(const std::string& location) {
-    std::cout << "\nStep " << stepCount << ": " << location << "\n";
-    printCurrentState();
-    waitForCommand();
-}
-
-void KernelDebugger::printCurrentState() const {
-    eventLogger->printEventHistory(1);  // Print the most recent event
-    memoryTracker->printCurrentState();
-}
-
-void KernelDebugger::printSummary() const {
-    std::cout << "\n=== Debug Session Summary ===\n";
-    std::cout << "Total steps executed: " << stepCount << "\n\n";
-
-    // Print operation statistics
-    std::cout << "Operation Counts:\n";
-    for (const auto& [op, count] : opCounts) {
-        std::cout << std::setw(25) << std::left << op << ": " 
-                  << std::setw(6) << count << "\n";
-    }
-
-    // Print memory statistics and recent events
-    memoryTracker->printSummary();
-    eventLogger->printEventHistory(1);  // Print the most recent event
-}
-
-void KernelDebugger::waitForCommand() {
-    std::cout << "\nDebugger Commands:\n"
-              << "  [Enter] - Continue\n"
-              << "  p      - Print full state\n"
-              << "  m      - Print memory details\n"
-              << "  b      - List breakpoints\n"
-              << "  q      - Quit debugging\n"
-              << "Command: ";
-
-    std::string cmd;
-    std::getline(std::cin, cmd);
-
-    switch (cmd[0]) {
-        case 'p':
-            eventLogger->printEventHistory(10);
-            break;
-        case 'm':
-            memoryTracker->printSummary();
-            break;
-        case 'b':
-            breakpointMgr->listBreakpoints();
-            break;
-        case 'q':
-            stop();
-            exit(0);
-            break;
-    }
-}
-
-std::string KernelDebugger::getModeString(Mode mode) const {
-    switch (mode) {
-        case Mode::RUN: return "Run";
-        case Mode::STEP: return "Step";
-        case Mode::BREAKPOINT: return "Breakpoint";
-        default: return "Unknown";
-    }
-}
-
-bool KernelDebugger::isSSEVector(const void* vec) const {
-    return (reinterpret_cast<uintptr_t>(vec) % 64) != 0;
-}
-
-std::string KernelDebugger::formatSIMDVector(const void* vec, SIMDOp op) const {
-    std::stringstream ss;
-    
-    if (op == SIMDOp::ADD_AVX || op == SIMDOp::MUL_AVX) {
-        auto* v = static_cast<const __m512d*>(vec);
-        alignas(64) double values[8];
-        _mm512_store_pd(values, *v);
-        ss << "[";
-        for (int i = 0; i < 8; i++) {
-            if (i > 0) ss << ", ";
-            ss << values[i];
+    // Get current values from memory tracker
+    if (memoryTracker) {
+        std::cout << "Current variable values:\n";
+        auto activeVars = memoryTracker->getActiveVariables();
+        for (const auto& var : activeVars) {
+            if (var.isActive) {
+                if (var.valueHistory.empty()) continue;
+                
+                // Get most recent value
+                const auto& lastValue = var.valueHistory.back().second;
+                std::cout << "  " << var.name << " = " << lastValue << "\n";
+            }
         }
-        ss << "]";
+    }
+
+    sourceManager.advanceLine();
+    std::cout << "DEBUG: Advanced to next line\n";
+    
+    stepCount++;
+    std::cout << "DEBUG: Step count: " << stepCount << "\n";
+}
+
+void KernelDebugger::continueExecution() {
+    std::cout << "DEBUG: KernelDebugger::continueExecution - start\n";
+    
+    // Check if we're running
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!isRunning) {
+            std::cout << "DEBUG: Debugger is not running\n";
+            uiHelper->printError("Debugger is not running");
+            return;
+        }
+    }
+
+    std::cout << "DEBUG: Setting mode to RUN\n";
+    currentMode = Mode::RUN;
+    stepStopDepth = -1;
+    
+    std::cout << "DEBUG: About to resume execution\n";
+    pauseFlag = false;  // Clear pause flag
+    std::cout << "DEBUG: Resumed execution\n";
+    
+    while (!isExecutionComplete() && !shouldBreak()) {
+        std::cout << "DEBUG: Executing next instruction\n";
+        executeNextInstruction();
+    }
+    
+    std::cout << "DEBUG: Execution loop complete\n";
+    if (!isExecutionComplete()) {
+        printLocation();
+        std::cout << "DEBUG: Location printed\n";
     } else {
-        auto* v = static_cast<const __m256d*>(vec);
-        alignas(32) double values[4];
-        _mm256_store_pd(values, *v);
-        ss << "[";
-        for (int i = 0; i < 4; i++) {
-            if (i > 0) ss << ", ";
-            ss << values[i];
-        }
-        ss << "]";
+        uiHelper->printInfo("Program finished");
+        std::cout << "DEBUG: Program finished message printed\n";
+    }
+    std::cout << "DEBUG: KernelDebugger::continueExecution - end\n";
+}
+
+void KernelDebugger::stepIn() {
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    if (!isRunning) return;
+    
+    currentMode = Mode::STEP;
+    executeNextInstruction();
+    printLocation();
+}
+
+void KernelDebugger::stepOver() {
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    if (!isRunning) return;
+    
+    currentMode = Mode::NEXT;
+    stepStopDepth = callStack.getDepth();
+    
+    do {
+        executeNextInstruction();
+    } while (!isExecutionComplete() && !shouldBreak());
+    
+    printLocation();
+}
+
+void KernelDebugger::stepOut() {
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    if (!isRunning || callStack.getDepth() == 0) return;
+    
+    currentMode = Mode::FINISH;
+    stepStopDepth = callStack.getDepth() - 1;
+    
+    while (!isExecutionComplete() && !shouldBreak()) {
+        executeNextInstruction();
     }
     
+    printLocation();
+}
+
+int KernelDebugger::addBreakpoint(const std::string& file, int line, const std::string& condition) {
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    if (!validateBreakpoint(file, line)) {
+        return -1;
+    }
+    
+    int id = breakpointMgr.addBreakpoint(file, line, condition);
+    if (id >= 0) {
+        logDebugEvent("breakpoint", "Added breakpoint " + std::to_string(id) + 
+                     " at " + file + ":" + std::to_string(line));
+    }
+    return id;
+}
+
+bool KernelDebugger::removeBreakpoint(int id) {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (breakpointMgr.removeBreakpoint(id)) {
+        logDebugEvent("breakpoint", "Removed breakpoint " + std::to_string(id));
+        return true;
+    }
+    return false;
+}
+
+void KernelDebugger::enableBreakpoint(int id, bool enable) {
+    std::lock_guard<std::mutex> lock(mutex);
+    breakpointMgr.enableBreakpoint(id, enable);
+}
+
+void KernelDebugger::onSIMDOperation(SIMDOp op, void* result, void* op1, void* op2) {
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    opStats[op]++;
+    
+    std::string opStr;
+    switch (op) {
+        case SIMDOp::ADD_SSE: opStr = "SSE Addition"; break;
+        case SIMDOp::MUL_SSE: opStr = "SSE Multiplication"; break;
+        case SIMDOp::ADD_AVX: opStr = "AVX Addition"; break;
+        case SIMDOp::MUL_AVX: opStr = "AVX Multiplication"; break;
+    }
+
+    bool isAVX = (op == SIMDOp::ADD_AVX || op == SIMDOp::MUL_AVX);
+    
+    if (eventLogger) {
+        eventLogger->logEvent(
+            EventLogger::EventType::SIMD_OP,
+            opStr,
+            sourceManager.getCurrentLocation().file + ":" + 
+            std::to_string(sourceManager.getCurrentLocation().line),
+            result,
+            isAVX ? sizeof(__m512d) : sizeof(__m256d)
+        );
+    }
+
+    // Post SIMD operation event
+    postEvent(DebugEvent(DebugEvent::Type::SIMD_OPERATION, opStr, 
+        sourceManager.getCurrentLocation().file,
+        sourceManager.getCurrentLocation().line,
+        std::make_tuple(result, op1, op2)));
+}
+
+void KernelDebugger::onDebugEvent(const std::string& event, 
+                                 const std::string& file, 
+                                 int line, 
+                                 const std::string& details) {
+    if (event == "line") {
+        postEvent(DebugEvent(DebugEvent::Type::SOURCE_LINE, details, file, line));
+    }
+    else if (event == "enterFunction") {
+        postEvent(DebugEvent(DebugEvent::Type::FUNCTION_ENTRY, details, file, line));
+    }
+    else if (event == "exitFunction") {
+        postEvent(DebugEvent(DebugEvent::Type::FUNCTION_EXIT, details, file, line));
+    }
+}
+
+void KernelDebugger::printLocation() const {
+    std::cout << "DEBUG: KernelDebugger::printLocation - start\n";
+    
+    // Get location without lock
+    auto loc = sourceManager.getCurrentLocation();
+    std::cout << "DEBUG: Got location: " << loc.file << ":" << loc.line << "\n";
+    
+    if (uiHelper) {
+        std::cout << "DEBUG: About to print location info\n";
+        uiHelper->printInfo(loc.file + ":" + std::to_string(loc.line) + 
+                          (loc.function.empty() ? "" : " in " + loc.function));
+        std::cout << "DEBUG: Location info printed\n";
+    }
+
+    if (config->display().showSourceOnBreak) {
+        std::cout << "DEBUG: About to show source\n";
+        int contextLines = config->display().contextLines;
+        showSource("", loc.line - contextLines/2, contextLines);
+        std::cout << "DEBUG: Source shown\n";
+    }
+    std::cout << "DEBUG: KernelDebugger::printLocation - end\n";
+}
+
+void KernelDebugger::printVectorState() const {
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    uiHelper->printInfo("\nVector Registers:");
+    for (const auto& [name, reg] : vectorRegs) {
+        std::cout << std::setw(10) << name << ": " << formatVectorRegister(reg) << "\n";
+    }
+    
+    uiHelper->printInfo("\nSIMD Operation Stats:");
+    for (const auto& [op, count] : opStats) {
+        std::string opStr;
+        switch (op) {
+            case SIMDOp::ADD_SSE: opStr = "ADD_SSE"; break;
+            case SIMDOp::MUL_SSE: opStr = "MUL_SSE"; break;
+            case SIMDOp::ADD_AVX: opStr = "ADD_AVX"; break;
+            case SIMDOp::MUL_AVX: opStr = "MUL_AVX"; break;
+        }
+        std::cout << std::left << std::setw(10) << opStr << ": " << count << "\n";
+    }
+}
+
+bool KernelDebugger::shouldBreak() const {
+    std::cout << "DEBUG: Checking should break\n";
+    return shouldBreakAtCurrentLocation() || pauseFlag;
+}
+
+bool KernelDebugger::shouldBreakAtCurrentLocation() const {
+    auto loc = sourceManager.getCurrentLocation();
+    
+    if (breakpointMgr.shouldBreak(loc.file, loc.line)) {
+        return true;
+    }
+    
+    switch (currentMode) {
+        case Mode::STEP:
+            return true;
+        case Mode::NEXT:
+            return callStack.getDepth() <= static_cast<size_t>(stepStopDepth);
+        case Mode::FINISH:
+            return callStack.getDepth() == static_cast<size_t>(stepStopDepth);
+        default:
+            return false;
+    }
+}
+
+bool KernelDebugger::isExecutionComplete() const {
+    std::cout << "DEBUG: Checking execution completion\n";
+    return !isRunning || sourceManager.isAtEnd();
+}
+
+
+std::string KernelDebugger::formatVectorRegister(const VectorRegister& reg) const {
+    std::stringstream ss;
+    ss << std::fixed << std::setprecision(2);
+    
+    if (reg.is_avx) {
+        alignas(64) double values[8];
+        _mm512_store_pd(values, reg.value.avx);
+        ss << "[" << values[0];
+        for (int i = 1; i < 8; i++) {
+            ss << ", " << values[i];
+        }
+    } else {
+        alignas(32) double values[4];
+        _mm256_store_pd(values, reg.value.sse);
+        ss << "[" << values[0];
+        for (int i = 1; i < 4; i++) {
+            ss << ", " << values[i];
+        }
+    }
+    ss << "]";
     return ss.str();
 }
 
-std::string KernelDebugger::formatSliceElement(const void* slice, size_t index) const {
-    if (isSSEVector(slice)) {
-        auto s = static_cast<const sse_slice_t*>(slice);
-        return formatSIMDVector(&s->data[index], SIMDOp::ADD_SSE);
+void KernelDebugger::validateMemoryAccess(void* addr, size_t size) const {
+    if (!memoryTracker->isValidPointer(addr)) {
+        throw std::runtime_error("Invalid memory access");
+    }
+    
+    size_t allocSize = memoryTracker->getAllocationSize(addr);
+    if (size > allocSize) {
+        throw std::runtime_error("Memory access out of bounds");
+    }
+}
+
+bool KernelDebugger::validateBreakpoint(const std::string& file, int line) const {
+    if (!sourceManager.hasSource(file)) {
+        uiHelper->printError("No such file: " + file);
+        return false;
+    }
+    
+    if (line <= 0 || line > sourceManager.getLineCount(file)) {
+        uiHelper->printError("Invalid line number: " + std::to_string(line));
+        return false;
+    }
+    
+    return true;
+}
+
+void KernelDebugger::logDebugEvent(const std::string& event, const std::string& details) {
+    if (eventLogger) {
+        auto loc = sourceManager.getCurrentLocation();
+        eventLogger->logEvent(
+            EventLogger::EventType::STEP,
+            event,
+            loc.file + ":" + std::to_string(loc.line),
+            nullptr, 0, details
+        );
+    }
+}
+std::string KernelDebugger::getSIMDOpName(SIMDOp op) const {
+    switch (op) {
+        case SIMDOp::ADD_SSE: return "SSE Add";
+        case SIMDOp::MUL_SSE: return "SSE Multiply";
+        case SIMDOp::ADD_AVX: return "AVX Add";
+        case SIMDOp::MUL_AVX: return "AVX Multiply";
+        default: return "Unknown SIMD Operation";
+    }
+}
+size_t KernelDebugger::getSimdOperandSize(SIMDOp op) const {
+    switch (op) {
+        case SIMDOp::ADD_SSE:
+        case SIMDOp::MUL_SSE:
+            return sizeof(__m256d);  // SSE operations use 256-bit vectors
+        case SIMDOp::ADD_AVX:
+        case SIMDOp::MUL_AVX:
+            return sizeof(__m512d);  // AVX operations use 512-bit vectors
+        default:
+            return 0;
+    }
+}
+
+bool KernelDebugger::checkAlignment(void* ptr, size_t required) const {
+    return reinterpret_cast<uintptr_t>(ptr) % required == 0;
+}
+
+// Add missing function implementations
+void KernelDebugger::showSource(const std::string& file, int line, int count) const {
+    std::cout << "DEBUG: KernelDebugger::showSource - start\n";
+    std::cout << "DEBUG: file=" << file << ", line=" << line << ", count=" << count << "\n";
+    
+    std::string sourceFile = file.empty() ? sourceManager.getCurrentFile() : file;
+    std::cout << "DEBUG: Using source file: " << sourceFile << "\n";
+    
+    // If line is negative, center around current line
+    if (line < 0) {
+        auto loc = sourceManager.getCurrentLocation();
+        line = loc.line + line;  // line is negative, so this centers around current line
+        std::cout << "DEBUG: Adjusted line to: " << line << "\n";
+    }
+    
+    // Ensure line is positive
+    line = std::max(1, line);
+    std::cout << "DEBUG: Final line number: " << line << "\n";
+    
+    try {
+        std::cout << "DEBUG: About to print lines\n";
+        sourceManager.printLines(sourceFile, line, count, std::cout);
+        std::cout << "DEBUG: Lines printed\n";
+    } catch (const std::exception& e) {
+        std::cerr << "Error showing source: " << e.what() << std::endl;
+    }
+    std::cout << "DEBUG: KernelDebugger::showSource - end\n";
+}
+
+void KernelDebugger::onMemoryAccess(void* addr, size_t size, bool isWrite) {
+    if (memoryTracker) {
+        memoryTracker->trackAccess(addr, size, isWrite);
+    }
+}
+
+void KernelDebugger::resumeExecution() {
+    pauseFlag = false;
+}
+
+void KernelDebugger::printBacktrace() const {
+    std::lock_guard<std::mutex> lock(mutex);
+    callStack.printBacktrace();
+}
+
+void KernelDebugger::initializeEventHandler() {
+    eventQueue = std::make_unique<DebugEventQueue>();
+    eventThread = std::thread([this]() { eventLoop(); });
+}
+
+void KernelDebugger::postEvent(DebugEvent event) {
+    if (eventQueue) {
+        eventQueue->push(std::move(event));
+    }
+}
+
+void KernelDebugger::printLocals() const {
+    std::lock_guard<std::mutex> lock(mutex);
+    callStack.printLocals();
+}
+
+void KernelDebugger::printExpression(const std::string& expr) const {
+    // For now, just handle simple variable names
+    const auto* var = callStack.getLocal(expr);
+    if (var) {
+        std::cout << expr << " = ";
+        callStack.printLocals();
     } else {
-        auto s = static_cast<const avx_slice_t*>(slice);
-        return formatSIMDVector(&s->data[index], SIMDOp::ADD_AVX);
+        uiHelper->printError("Unknown variable: " + expr);
+    }
+}
+
+void KernelDebugger::displayMemory(void* addr, size_t size) const {
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    try {
+        validateMemoryAccess(addr, size);
+        
+        // Display memory in hex format
+        const uint8_t* bytes = static_cast<const uint8_t*>(addr);
+        for (size_t i = 0; i < size; i += 16) {
+            // Print address
+            std::cout << std::hex << std::setw(8) << std::setfill('0') 
+                      << reinterpret_cast<uintptr_t>(addr) + i << ": ";
+            
+            // Print hex values
+            for (size_t j = 0; j < 16 && (i + j) < size; j++) {
+                std::cout << std::hex << std::setw(2) << std::setfill('0') 
+                          << static_cast<int>(bytes[i + j]) << " ";
+            }
+            
+            // Print ASCII representation
+            std::cout << "  ";
+            for (size_t j = 0; j < 16 && (i + j) < size; j++) {
+                char c = bytes[i + j];
+                std::cout << (std::isprint(c) ? c : '.');
+            }
+            std::cout << "\n";
+        }
+    } catch (const std::exception& e) {
+        uiHelper->printError(e.what());
+    }
+}
+
+void KernelDebugger::cleanupEventHandler() {
+    if (eventQueue) {
+        eventQueue->stop();
+    }
+    if (eventThread.joinable()) {
+        eventThread.join();
+    }
+}
+
+void KernelDebugger::listBreakpoints() const {
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    auto bps = breakpointMgr.getAllBreakpoints();
+    if (bps.empty()) {
+        uiHelper->printInfo("No breakpoints set");
+        return;
+    }
+    
+    std::cout << "Num    Type           Disp    Location\n";
+    for (const auto& bp : bps) {
+        std::cout << std::left << std::setw(7) << bp.id 
+                  << std::setw(14) << "breakpoint"
+                  << std::setw(8) << (bp.enabled ? "enable" : "disable")
+                  << bp.file << ":" << bp.line;
+        if (!bp.condition.empty()) {
+            std::cout << " if " << bp.condition;
+        }
+        std::cout << "\n";
+    }
+}
+
+// Add event loop function
+void KernelDebugger::eventLoop() {
+    while (isRunning) {
+        DebugEvent event;
+        if (eventQueue && eventQueue->pop(event)) {
+            // Process the event based on its type
+            switch (event.type) {
+                case DebugEvent::Type::BREAKPOINT_HIT:
+                    pauseFlag = true;
+                    printLocation();
+                    break;
+                case DebugEvent::Type::SOURCE_LINE:
+                    updateLocation(event.file, event.line);
+                    break;
+                case DebugEvent::Type::SIMD_OPERATION:
+                case DebugEvent::Type::MEMORY_ACCESS:
+                case DebugEvent::Type::ERROR:
+                    // Log these events if event logger is enabled
+                    if (eventLogger) {
+                        eventLogger->logEvent(
+                            EventLogger::EventType::SIMD_OP,
+                            event.description,
+                            event.file + ":" + std::to_string(event.line)
+                        );
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+}
+void KernelDebugger::updateLocation(const std::string& file, int line) {
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    // Update source manager location
+    sourceManager.setLocation(file, line, currentFunction);
+    
+    // Update call stack if needed
+    if (!callStack.isEmpty()) {
+        callStack.updateLocation(file, line);
+    }
+    
+    // Log the location update if event logger is enabled
+    if (eventLogger) {
+        eventLogger->logEvent(
+            EventLogger::EventType::STEP,
+            "Location update",
+            file + ":" + std::to_string(line)
+        );
+    }
+    
+    // Post location update event
+    postEvent(DebugEvent(
+        DebugEvent::Type::SOURCE_LINE,
+        "Location update",
+        file,
+        line
+    ));
+}
+
+void KernelDebugger::setCurrentFunction(const std::string& function) {
+    std::lock_guard<std::mutex> lock(mutex);
+    currentFunction = function;
+    
+    // Log function change if event logger is enabled
+    if (eventLogger) {
+        eventLogger->logEvent(
+            EventLogger::EventType::STEP,
+            "Function change",
+            getCurrentFile() + ":" + std::to_string(sourceManager.getCurrentLocation().line),
+            nullptr, 0,
+            "Entered function: " + function
+        );
     }
 }

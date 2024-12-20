@@ -4,91 +4,47 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <memory>
 #include <functional>
 
 class BreakpointManager {
 public:
-    // Breakpoint types
-    enum class Type {
-        INSTRUCTION,    // Break at specific instruction
-        MEMORY,        // Break on memory access
-        CONDITION      // Break when condition is met
-    };
-
-    // Memory operation types
-    enum class MemoryOperation {
-        READ,
-        WRITE,
-        ACCESS
-    };
-
     struct Breakpoint {
-        Type type;
-        std::string location;
-        std::function<bool()> condition;
-        bool enabled;
+        int id;
+        std::string file;
+        int line;
+        bool enabled{true};
+        std::string condition;
+        size_t hitCount{0};
         
-        Breakpoint(Type t, const std::string& loc, 
-                  std::function<bool()> cond = nullptr)
-            : type(t), location(loc), condition(cond), enabled(true) {}
+        Breakpoint(int i, const std::string& f, int l, const std::string& cond = "")
+            : id(i), file(f), line(l), condition(cond) {}
     };
+
+    BreakpointManager() = default;
+
+    // Breakpoint management
+    int addBreakpoint(const std::string& file, int line, const std::string& condition = "");
+    bool removeBreakpoint(int id);
+    void enableBreakpoint(int id, bool enable = true);
+    void clearAllBreakpoints();
+
+    // Breakpoint queries
+    bool hasBreakpoint(const std::string& file, int line) const;
+    bool shouldBreak(const std::string& file, int line) const;
+    const Breakpoint* getBreakpoint(int id) const;
+    std::vector<Breakpoint> getAllBreakpoints() const;
+
+    // Condition evaluation
+    using ConditionEvaluator = std::function<bool(const std::string&)>;
+    void setConditionEvaluator(ConditionEvaluator evaluator);
 
 private:
     std::map<int, Breakpoint> breakpoints;
-    int nextBreakpointId = 1;
+    int nextBreakpointId{1};
+    ConditionEvaluator conditionEvaluator;
 
-public:
-    // Add specialized breakpoints
-    int addInstructionBreakpoint(const std::string& location);
-    int addMemoryBreakpoint(const std::string& address, 
-                           MemoryOperation op,
-                           size_t size);
-    int addConditionalBreakpoint(const std::string& location,
-                                std::function<bool()> condition);
-
-    // Add a generic breakpoint
-    int addBreakpoint(Type type, const std::string& location,
-                     std::function<bool()> condition = nullptr) {
-        int id = nextBreakpointId++;
-        breakpoints.emplace(id, Breakpoint(type, location, condition));
-        return id;
-    }
-
-    // Remove a breakpoint
-    bool removeBreakpoint(int id) {
-        return breakpoints.erase(id) > 0;
-    }
-
-    // Enable/disable a breakpoint
-    bool enableBreakpoint(int id, bool enable = true) {
-        auto it = breakpoints.find(id);
-        if (it != breakpoints.end()) {
-            it->second.enabled = enable;
-            return true;
-        }
-        return false;
-    }
-
-    // Check if we should break
-    bool checkBreakpoint(const std::string& location,
-                        void* address = nullptr,
-                        MemoryOperation op = MemoryOperation::ACCESS,
-                        size_t size = 0);
-
-    // List breakpoints
-    void listBreakpoints() const;
-
-    // Get breakpoints
-    const std::map<int, Breakpoint>& getBreakpoints() const {
-        return breakpoints;
-    }
-
-private:
-    // Helper method for checking memory breakpoints
-    bool checkMemoryBreakpoint(const Breakpoint& bp,
-                              void* address,
-                              MemoryOperation op,
-                              size_t size);
+    bool evaluateCondition(const std::string& condition) const;
 };
 
 #endif // KERNEL_DEBUGGER_BREAKPOINT_HPP

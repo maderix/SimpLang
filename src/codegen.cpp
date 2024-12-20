@@ -5,6 +5,7 @@
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Support/Host.h>
 #include <llvm/IR/LegacyPassManager.h>
+#include <llvm-c/Target.h>
 #include <iostream>
 
 CodeGenContext::CodeGenContext() : builder(context) {
@@ -29,23 +30,30 @@ CodeGenContext::CodeGenContext() : builder(context) {
 
     module->setDataLayout(targetMachine->createDataLayout());
 
-    // Function Pass Manager for optimizations
+    // Initialize optimization passes
     fpm = std::make_unique<llvm::legacy::FunctionPassManager>(module.get());
     fpm->doInitialization();
 
-    // Initialize slice types
+    // Initialize SIMD interface based on target architecture
+    std::string arch = targetMachine->getTargetCPU().str();
+    if (arch.find("avx") != std::string::npos) {
+        simdInterface = std::unique_ptr<SIMDInterface>(createSIMDInterface("avx"));
+    } else {
+        simdInterface = std::unique_ptr<SIMDInterface>(createSIMDInterface("sse"));
+    }
+
+    // Don't initialize slice types until needed
     sseSliceType = nullptr;
     avxSliceType = nullptr;
-    declareRuntimeFunctions();
 }
 
 CodeGenContext::~CodeGenContext() {
-    // Clean up blocks
     for (auto block : blocks) {
         delete block;
     }
     blocks.clear();
 }
+
 
 void CodeGenContext::initializeRuntimeFunctions() {
     // malloc function
@@ -158,6 +166,181 @@ llvm::Value* CodeGenContext::createSliceWithCap(SliceType type, llvm::Value* len
     return slice;
 }
 
+void CodeGenContext::declareVariable(const std::string& name, llvm::Value* value, 
+                                   llvm::DILocalVariable* debugVar) {
+    std::cout << "Declaring variable: " << name << std::endl;
+    if (!blocks.empty()) {
+        blocks.back()->locals[name] = value;
+        if (debugVar) {
+            blocks.back()->debugLocals[name] = debugVar;
+        }
+
+        // Track the variable in memory tracker if available
+        if (memoryTracker && value) {
+            llvm::Type* varType = value->getType()->getPointerElementType();
+            trackVariable(name, value, varType);
+        }
+    } else {
+        std::cerr << "Error: No active block for variable declaration" << std::endl;
+    }
+}
+
+void CodeGenContext::createDebugInfoForModule(const std::string& filename) {
+    if (!debugBuilder) {
+        return;
+    }
+
+    // Create file descriptor
+    debugFile = debugBuilder->createFile(
+        llvm::StringRef(filename),
+        llvm::StringRef(".")  // Current directory
+    );
+
+    // Create compile unit
+    debugCompileUnit = debugBuilder->createCompileUnit(
+        llvm::dwarf::DW_LANG_C,          // Source language
+        debugFile,                        // File descriptor
+        "SimpleLang Compiler",           // Producer
+        false,                           // isOptimized
+        "",                             // Compiler flags
+        0,                              // Runtime version
+        "",                             // Split name
+        llvm::DICompileUnit::DebugEmissionKind::FullDebug,  // Debug emission
+        0,                              // DWOId
+        true,                           // Split Debug Inlining
+        false,                          // Debug Info for profiling
+        llvm::DICompileUnit::DebugNameTableKind::Default,  // Use default name table
+        false,                          // Range lists
+        "",                             // Sysroot
+        ""                              // SDK
+    );
+
+    // Set compile unit as current debug scope
+    currentDebugScope = debugCompileUnit;
+    
+    // Record current file
+    currentDebugFile = filename;
+}
+
+void CodeGenContext::trackVariable(const std::string& name, llvm::Value* value, llvm::Type* type) {
+    if (!memoryTracker) return;
+
+    MemoryTracker::VarType varType;
+    if (type->isDoubleTy()) {
+        varType = MemoryTracker::VarType::Double;
+    } else if (type->isIntegerTy()) {
+        varType = MemoryTracker::VarType::Int;
+    } else if (isVectorType(type)) {
+        varType = (getVectorWidth(type) == 4) ? MemoryTracker::VarType::SSE_Vector : 
+                                               MemoryTracker::VarType::AVX_Vector;
+    } else if (isSliceType(type)) {
+        varType = (type == sseSliceType) ? MemoryTracker::VarType::SSE_Slice : 
+                                          MemoryTracker::VarType::AVX_Slice;
+    } else {
+        return;
+    }
+
+    memoryTracker->trackVariable(name, value, varType);
+}
+
+void CodeGenContext::updateVariableValue(const std::string& name, llvm::Value* value) {
+    if (!value || !memoryTracker) return;
+    
+    auto* type = value->getType();
+    if (auto* loadInst = llvm::dyn_cast<llvm::LoadInst>(value)) {
+        value = loadInst->getPointerOperand();
+        type = value->getType()->getPointerElementType();
+    }
+    
+    size_t size = module->getDataLayout().getTypeAllocSize(type);
+    memoryTracker->trackAccess(value, size, true);
+}
+
+void CodeGenContext::registerVariableWrite(llvm::Value* ptr, const std::string& name) {
+    if (!ptr || !memoryTracker) return;
+    trackMemoryAccess(ptr, module->getDataLayout().getTypeAllocSize(
+        ptr->getType()->getPointerElementType()), true);
+}
+
+void CodeGenContext::registerVariableRead(llvm::Value* ptr, const std::string& name) {
+    if (!ptr || !memoryTracker) return;
+    trackMemoryAccess(ptr, module->getDataLayout().getTypeAllocSize(
+        ptr->getType()->getPointerElementType()), false);
+}
+
+void CodeGenContext::trackMemoryAccess(llvm::Value* ptr, size_t size, bool isWrite) {
+    if (memoryTracker) {
+        memoryTracker->trackAccess(ptr, size, isWrite);
+    }
+}
+
+void CodeGenContext::addMemoryAccess(llvm::Value* ptr, bool isWrite) {
+    if (!ptr || !memoryTracker) return;
+    trackMemoryAccess(ptr, module->getDataLayout().getTypeAllocSize(
+        ptr->getType()->getPointerElementType()), isWrite);
+}
+
+// Debug Information
+void CodeGenContext::initializeDebugInfo(const std::string& filename) {
+    debugBuilder = std::make_unique<llvm::DIBuilder>(*module);
+    createDebugInfoForModule(filename);
+}
+
+void CodeGenContext::setCurrentDebugLocation(unsigned line, const std::string& filename) {
+    currentDebugLine = line;
+    if (!filename.empty()) {
+        currentDebugFile = filename;
+    }
+    
+    if (debugBuilder) {
+        auto scope = getCurrentDebugScope() ? getCurrentDebugScope() : debugCompileUnit;
+        auto loc = llvm::DILocation::get(context, line, 0, scope);
+        builder.SetCurrentDebugLocation(loc);
+    }
+}
+
+llvm::DILocalVariable* CodeGenContext::createDebugVariable(
+    const std::string& name, llvm::Type* type, llvm::Value* storage, unsigned line) {
+    if (!debugBuilder || !currentDebugScope) return nullptr;
+
+    auto diType = debugBuilder->createBasicType(
+        type->isDoubleTy() ? "double" : "int",
+        type->isDoubleTy() ? 64 : 32,
+        type->isDoubleTy() ? llvm::dwarf::DW_ATE_float : llvm::dwarf::DW_ATE_signed);
+
+    auto var = debugBuilder->createAutoVariable(
+        currentDebugScope, name, debugFile, line, diType);
+    
+    debugBuilder->insertDeclare(
+        storage, var, debugBuilder->createExpression(),
+        llvm::DILocation::get(context, line, 0, currentDebugScope),
+        builder.GetInsertBlock());
+
+    return var;
+}
+
+// Scope Management
+void CodeGenContext::enterScope(llvm::DIScope* scope) {
+    if (scope) currentDebugScope = scope;
+    pushBlock(scope);
+}
+
+void CodeGenContext::exitScope() {
+    popBlock();
+}
+
+void CodeGenContext::enterFunction(llvm::Function* func, llvm::DISubprogram* debugInfo) {
+    if (debugInfo) currentDebugScope = debugInfo;
+    pushBlock(debugInfo);
+}
+
+void CodeGenContext::exitFunction() {
+    popBlock();
+    if (!blocks.empty() && blocks.back()->debugScope) {
+        currentDebugScope = blocks.back()->debugScope;
+    }
+}
+
 void CodeGenContext::emitError(const std::string& message) {
     llvm::Value* msgGlobal = builder.CreateGlobalStringPtr(message);
     builder.CreateCall(errorFunc, {msgGlobal});
@@ -224,24 +407,67 @@ void CodeGenContext::setSliceCap(llvm::Value* slice, llvm::Value* cap) {
 }
 
 void CodeGenContext::generateCode(BlockAST& root) {
-    std::cout << "Generating code..." << std::endl;
-    root.codeGen(*this);
-    llvm::verifyModule(*module, &llvm::errs());
-    fpm->doFinalization();
-    std::cout << "Code generation complete." << std::endl;
+    if (!module) {
+        module = std::make_unique<llvm::Module>("simple-lang", context);
+    }
+
+    // Set target triple if not already set
+    if (module->getTargetTriple().empty()) {
+        module->setTargetTriple(llvm::sys::getDefaultTargetTriple());
+    }
+
+    // Generate code for each top-level statement
+    for (StmtAST* stmt : root.statements) {
+        if (!stmt) continue;
+        llvm::Value* val = stmt->codeGen(*this);
+        if (!val) {
+            std::cerr << "Failed to generate code for statement" << std::endl;
+        }
+    }
+
+    // Verify the complete module
+    std::string error;
+    llvm::raw_string_ostream errorStream(error);
+    
+    if (llvm::verifyModule(*module, &errorStream)) {
+        std::cerr << "Error verifying module: " << error << std::endl;
+        return;
+    }
+
+    // Initialize native target
+    LLVMInitializeNativeTarget();
+    LLVMInitializeNativeAsmParser();
+    LLVMInitializeNativeAsmPrinter();
 }
 
-void CodeGenContext::pushBlock() {
-        std::cout << "Pushing new block" << std::endl;
-        blocks.push_back(new CodeGenBlock());
+void CodeGenContext::pushBlock(llvm::DIScope* debugScope) {
+    std::cout << "Pushing new block" << std::endl;
+    blocks.push_back(new CodeGenBlock(debugScope));
+    if (debugScope) {
+        currentDebugScope = debugScope;
     }
+}
 
 void CodeGenContext::popBlock() {
-        std::cout << "Popping block" << std::endl;
+    std::cout << "Popping block" << std::endl;
+    if (!blocks.empty()) {
         CodeGenBlock* top = blocks.back();
         blocks.pop_back();
+        
+        // Update debug scope
+        if (!blocks.empty() && blocks.back()->debugScope) {
+            currentDebugScope = blocks.back()->debugScope;
+        }
+        
+        // Clean up the block
         delete top;
+        
+        // If we're popping to an empty state, make sure we don't have any dangling insert points
+        if (blocks.empty()) {
+            builder.ClearInsertionPoint();
+        }
     }
+}
 
 void CodeGenContext::setSymbolValue(const std::string& name, llvm::Value* value) {
         std::cout << "Setting symbol: " << name << std::endl;
@@ -281,7 +507,11 @@ void CodeGenContext::dumpSymbols() const {
 }
 
 llvm::Type* CodeGenContext::getVectorType(unsigned width) {
-    return llvm::VectorType::get(getDoubleType(), width, false);
+    if (simdInterface) {
+        return simdInterface->getVectorType(context);
+    }
+    // Fallback to scalar type if no SIMD interface
+    return llvm::Type::getDoubleTy(context);
 }
 
 bool CodeGenContext::isSliceType(llvm::Type* type) const {
@@ -303,104 +533,50 @@ unsigned CodeGenContext::getVectorWidth(llvm::Type* type) const {
 }
 
 void CodeGenContext::declareRuntimeFunctions() {
-    auto& context = getContext();
-    auto module = getModule();
+    // Empty by default - runtime functions will be declared on demand
+}
+
+llvm::Function* createFunction(CodeGenContext& context, 
+                             const std::string& name,
+                             const std::vector<std::string>& args) {
+    std::vector<llvm::Type*> argTypes(args.size(), 
+        llvm::Type::getDoubleTy(context.getContext()));
     
-    // Get base types
-    auto i8PtrTy = llvm::Type::getInt8PtrTy(context);
-    auto i64Ty = llvm::Type::getInt64Ty(context);
-    auto voidTy = llvm::Type::getVoidTy(context);
-    auto doubleTy = llvm::Type::getDoubleTy(context);
-    auto sseVecTy = getVectorType(4);  // 4 x double
-    auto avxVecTy = getVectorType(8);  // 8 x double
-    
-    // Declare slice types if not already declared
-    if (!sseSliceType) {
-        sseSliceType = llvm::StructType::create(context, "sse_slice_t");
-        sseSliceType->setBody({
-            sseVecTy->getPointerTo(),
-            i64Ty,  // len
-            i64Ty   // cap
-        });
+    llvm::FunctionType* funcType = llvm::FunctionType::get(
+        llvm::Type::getDoubleTy(context.getContext()),
+        argTypes,
+        false
+    );
+
+    // Check if function already exists
+    if (llvm::Function* existingFunc = context.getModule()->getFunction(name)) {
+        // If it exists but has wrong linkage, recreate it
+        if (name == "kernel_main" && existingFunc->getLinkage() != llvm::Function::ExternalLinkage) {
+            existingFunc->eraseFromParent();
+        } else {
+            return existingFunc;
+        }
     }
-    
-    if (!avxSliceType) {
-        avxSliceType = llvm::StructType::create(context, "avx_slice_t");
-        avxSliceType->setBody({
-            avxVecTy->getPointerTo(),
-            i64Ty,  // len
-            i64Ty   // cap
-        });
-    }
-    
-    // Declare SIMD vector creation functions with 4 and 8 double arguments
-    std::vector<llvm::Type*> sseArgs(4, doubleTy);
-    std::vector<llvm::Type*> avxArgs(8, doubleTy);
-    
-    module->getOrInsertFunction("sse", 
-        llvm::FunctionType::get(sseVecTy, sseArgs, false));
-    
-    module->getOrInsertFunction("avx", 
-        llvm::FunctionType::get(avxVecTy, avxArgs, false));
-    
-    // Declare SIMD operations
-    module->getOrInsertFunction("simd_add", 
-        llvm::FunctionType::get(sseVecTy, {sseVecTy, sseVecTy}, false));
-    module->getOrInsertFunction("simd_add_avx", 
-        llvm::FunctionType::get(avxVecTy, {avxVecTy, avxVecTy}, false));
-    
-    module->getOrInsertFunction("simd_mul", 
-        llvm::FunctionType::get(sseVecTy, {sseVecTy, sseVecTy}, false));
-    module->getOrInsertFunction("simd_mul_avx", 
-        llvm::FunctionType::get(avxVecTy, {avxVecTy, avxVecTy}, false));
-    
-    // Declare slice functions
-    llvm::FunctionType* make_slice_ty = llvm::FunctionType::get(
-        sseSliceType->getPointerTo(),
-        {i64Ty},
-        false
-    );
-    
-    module->getOrInsertFunction("make_sse_slice", make_slice_ty);
-    
-    make_slice_ty = llvm::FunctionType::get(
-        avxSliceType->getPointerTo(),
-        {i64Ty},
-        false
-    );
-    
-    module->getOrInsertFunction("make_avx_slice", make_slice_ty);
-    
-    // Declare slice access functions
-    llvm::FunctionType* get_sse_ty = llvm::FunctionType::get(
-        sseVecTy,
-        {sseSliceType->getPointerTo(), i64Ty},
-        false
-    );
-    
-    module->getOrInsertFunction("slice_get_sse", get_sse_ty);
-    
-    llvm::FunctionType* get_avx_ty = llvm::FunctionType::get(
-        avxVecTy,
-        {avxSliceType->getPointerTo(), i64Ty},
-        false
-    );
-    
-    module->getOrInsertFunction("slice_get_avx", get_avx_ty);
 
-    llvm::FunctionType* set_sse_ty = llvm::FunctionType::get(
-        voidTy,
-        {sseSliceType->getPointerTo(), i64Ty, sseVecTy},
-        false
+    // Use external linkage for kernel_main, internal for others
+    llvm::Function::LinkageTypes linkage = 
+        (name == "kernel_main") ? llvm::Function::ExternalLinkage 
+                               : llvm::Function::InternalLinkage;
+
+    llvm::Function* function = llvm::Function::Create(
+        funcType,
+        linkage,
+        name,
+        context.getModule()
     );
 
-    module->getOrInsertFunction("slice_set_sse", set_sse_ty);
-
-    llvm::FunctionType* set_avx_ty = llvm::FunctionType::get(
-        voidTy,
-        {avxSliceType->getPointerTo(), i64Ty, avxVecTy},
-        false
+    // Create entry block
+    llvm::BasicBlock* bb = llvm::BasicBlock::Create(
+        context.getContext(),
+        "entry",
+        function
     );
+    context.getBuilder().SetInsertPoint(bb);
 
-    module->getOrInsertFunction("slice_set_avx", set_avx_ty);
+    return function;
 }

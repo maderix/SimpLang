@@ -1,171 +1,91 @@
 #include "kernel_debugger/breakpoint.hpp"
 #include <iostream>
-#include <sstream>
-#include <iomanip>
+#include <algorithm>
 
-namespace {
-    // Helper function to create readable breakpoint descriptions
-    std::string createBreakpointDescription(const BreakpointManager::Breakpoint& bp) {
-        std::stringstream ss;
-        ss << "Type: ";
-        switch (bp.type) {
-            case BreakpointManager::Type::INSTRUCTION:
-                ss << "Instruction";
-                break;
-            case BreakpointManager::Type::MEMORY:
-                ss << "Memory";
-                break;
-            case BreakpointManager::Type::CONDITION:
-                ss << "Condition";
-                break;
-        }
-        ss << ", Location: " << bp.location;
-        if (bp.condition) {
-            ss << " (Conditional)";
-        }
-        ss << ", Status: " << (bp.enabled ? "Enabled" : "Disabled");
-        return ss.str();
-    }
-}
-
-int BreakpointManager::addInstructionBreakpoint(const std::string& location) {
+int BreakpointManager::addBreakpoint(const std::string& file, int line, const std::string& condition) {
     int id = nextBreakpointId++;
-    breakpoints.emplace(id, Breakpoint(Type::INSTRUCTION, location));
-    std::cout << "Added instruction breakpoint [" << id << "] at " << location << std::endl;
-    return id;
-}
-
-int BreakpointManager::addMemoryBreakpoint(const std::string& address, 
-                                         MemoryOperation op,
-                                         size_t size) {
-    std::stringstream ss;
-    ss << "addr:" << address << ";op:" << static_cast<int>(op) << ";size:" << size;
+    auto [it, inserted] = breakpoints.emplace(id, Breakpoint(id, file, line, condition));
     
-    int id = nextBreakpointId++;
-    breakpoints.emplace(id, Breakpoint(Type::MEMORY, ss.str()));
-    
-    std::cout << "Added memory breakpoint [" << id << "] for ";
-    switch (op) {
-        case MemoryOperation::READ:
-            std::cout << "read";
-            break;
-        case MemoryOperation::WRITE:
-            std::cout << "write";
-            break;
-        case MemoryOperation::ACCESS:
-            std::cout << "access";
-            break;
-    }
-    std::cout << " at " << address << " (size: " << size << ")" << std::endl;
-    
-    return id;
-}
-
-int BreakpointManager::addConditionalBreakpoint(const std::string& location,
-                                              std::function<bool()> condition) {
-    int id = nextBreakpointId++;
-    breakpoints.emplace(id, Breakpoint(Type::CONDITION, location, condition));
-    std::cout << "Added conditional breakpoint [" << id << "] at " << location << std::endl;
-    return id;
-}
-
-bool BreakpointManager::checkBreakpoint(const std::string& location,
-                                      void* address,
-                                      MemoryOperation op,
-                                      size_t size) {
-    bool shouldBreak = false;
-    
-    for (const auto& [id, bp] : breakpoints) {
-        if (!bp.enabled) continue;
-
-        switch (bp.type) {
-            case Type::INSTRUCTION:
-                if (bp.location == location) {
-                    shouldBreak = true;
-                    std::cout << "Hit instruction breakpoint [" << id << "] at " 
-                             << location << std::endl;
-                }
-                break;
-
-            case Type::MEMORY:
-                if (checkMemoryBreakpoint(bp, address, op, size)) {
-                    shouldBreak = true;
-                    std::cout << "Hit memory breakpoint [" << id << "] at "
-                             << std::hex << address << std::dec << std::endl;
-                }
-                break;
-
-            case Type::CONDITION:
-                if (bp.location == location && bp.condition && bp.condition()) {
-                    shouldBreak = true;
-                    std::cout << "Hit conditional breakpoint [" << id << "] at "
-                             << location << std::endl;
-                }
-                break;
+    if (inserted) {
+        std::cout << "Breakpoint " << id << " set at " << file << ":" << line;
+        if (!condition.empty()) {
+            std::cout << " when " << condition;
         }
+        std::cout << std::endl;
+        return id;
     }
-
-    return shouldBreak;
+    return -1;
 }
 
-void BreakpointManager::listBreakpoints() const {
-    if (breakpoints.empty()) {
-        std::cout << "No breakpoints set" << std::endl;
-        return;
+bool BreakpointManager::removeBreakpoint(int id) {
+    auto it = breakpoints.find(id);
+    if (it != breakpoints.end()) {
+        breakpoints.erase(it);
+        std::cout << "Breakpoint " << id << " removed\n";
+        return true;
     }
-
-    std::cout << "\nActive Breakpoints:\n";
-    std::cout << std::setfill('-') << std::setw(80) << "-" << std::endl;
-    std::cout << std::setfill(' ');
-    std::cout << std::setw(4) << "ID" << " | " 
-              << std::setw(60) << "Description" << " | "
-              << std::setw(8) << "Status" << std::endl;
-    std::cout << std::setfill('-') << std::setw(80) << "-" << std::endl;
-    std::cout << std::setfill(' ');
-
-    for (const auto& [id, bp] : breakpoints) {
-        std::cout << std::setw(4) << id << " | "
-                  << std::setw(60) << createBreakpointDescription(bp) << " | "
-                  << std::setw(8) << (bp.enabled ? "Enabled" : "Disabled")
-                  << std::endl;
-    }
-    std::cout << std::setfill('-') << std::setw(80) << "-" << std::endl;
-}
-
-bool BreakpointManager::checkMemoryBreakpoint(const Breakpoint& bp,
-                                            void* address,
-                                            MemoryOperation op,
-                                            size_t size) {
-    std::stringstream ss(bp.location);
-    std::string token;
-    void* bpAddress = nullptr;
-    MemoryOperation bpOp = MemoryOperation::ACCESS;
-    size_t bpSize = 0;
-
-    // Parse breakpoint location string
-    while (std::getline(ss, token, ';')) {
-        size_t pos = token.find(':');
-        if (pos == std::string::npos) continue;
-
-        std::string key = token.substr(0, pos);
-        std::string value = token.substr(pos + 1);
-
-        if (key == "addr") {
-            bpAddress = reinterpret_cast<void*>(std::stoull(value, nullptr, 16));
-        } else if (key == "op") {
-            bpOp = static_cast<MemoryOperation>(std::stoi(value));
-        } else if (key == "size") {
-            bpSize = std::stoull(value);
-        }
-    }
-
-    // Check if memory operation matches breakpoint conditions
-    if (bpAddress == address && bpSize == size) {
-        if (bpOp == MemoryOperation::ACCESS ||
-            bpOp == op) {
-            return true;
-        }
-    }
-
     return false;
+}
+
+void BreakpointManager::enableBreakpoint(int id, bool enable) {
+    auto it = breakpoints.find(id);
+    if (it != breakpoints.end()) {
+        it->second.enabled = enable;
+        std::cout << "Breakpoint " << id << (enable ? " enabled\n" : " disabled\n");
+    }
+}
+
+void BreakpointManager::clearAllBreakpoints() {
+    breakpoints.clear();
+    std::cout << "All breakpoints cleared\n";
+}
+
+bool BreakpointManager::hasBreakpoint(const std::string& file, int line) const {
+    return std::any_of(breakpoints.begin(), breakpoints.end(),
+        [&](const auto& pair) {
+            const auto& bp = pair.second;
+            return bp.enabled && bp.file == file && bp.line == line;
+        });
+}
+
+bool BreakpointManager::shouldBreak(const std::string& file, int line) const {
+    for (const auto& [id, bp] : breakpoints) {
+        if (bp.enabled && bp.file == file && bp.line == line) {
+            if (bp.condition.empty() || evaluateCondition(bp.condition)) {
+                const_cast<Breakpoint&>(bp).hitCount++;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+const BreakpointManager::Breakpoint* BreakpointManager::getBreakpoint(int id) const {
+    auto it = breakpoints.find(id);
+    return it != breakpoints.end() ? &it->second : nullptr;
+}
+
+std::vector<BreakpointManager::Breakpoint> BreakpointManager::getAllBreakpoints() const {
+    std::vector<Breakpoint> result;
+    result.reserve(breakpoints.size());
+    for (const auto& [_, bp] : breakpoints) {
+        result.push_back(bp);
+    }
+    return result;
+}
+
+void BreakpointManager::setConditionEvaluator(ConditionEvaluator evaluator) {
+    conditionEvaluator = std::move(evaluator);
+}
+
+bool BreakpointManager::evaluateCondition(const std::string& condition) const {
+    if (condition.empty()) return true;
+    if (!conditionEvaluator) return true;
+    
+    try {
+        return conditionEvaluator(condition);
+    } catch (const std::exception& e) {
+        std::cerr << "Error evaluating breakpoint condition: " << e.what() << std::endl;
+        return true; // Break anyway on evaluation error
+    }
 }

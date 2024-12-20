@@ -1,90 +1,108 @@
+# Runtime CMakeLists.txt
 cmake_minimum_required(VERSION 3.10)
 
-# Debug options
-option(SIMD_DEBUG "Enable SIMD debug output" OFF)
-option(ENABLE_DEBUGGER "Enable kernel debugger" ON)
+# Set C++ standard
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Configure debug definitions
-if(SIMD_DEBUG)
-    add_definitions(-DSIMD_DEBUG)
-endif()
+# Find required packages
+find_package(Threads REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(READLINE readline REQUIRED)
 
-if(ENABLE_DEBUGGER)
-    add_definitions(-DENABLE_DEBUGGER)
-endif()
-
-# Define source files for debugger if enabled
-if(ENABLE_DEBUGGER)
-    set(DEBUGGER_SOURCES
-        src/kernel_debugger/breakpoint.cpp
-        src/kernel_debugger/event_logger.cpp
-        src/kernel_debugger/memory_tracker.cpp
-        src/kernel_debugger/kernel_debugger.cpp
-    )
-endif()
-
-# Runtime library
-add_library(simplang_runtime STATIC
-    src/kernel_runtime.cpp
-    ${DEBUGGER_SOURCES}
-)
-
-# Configure include directories
-target_include_directories(simplang_runtime 
-    PUBLIC 
-        include
-        ${CMAKE_SOURCE_DIR}/include
-        $<$<BOOL:${ENABLE_DEBUGGER}>:${CMAKE_SOURCE_DIR}/include/kernel_debugger>
-)
-
-# Configure compile options
-target_compile_options(simplang_runtime
-    PRIVATE 
-        -mavx512f 
-        -msse4.2
-        $<$<CONFIG:Debug>:-g -O0>
-        $<$<CONFIG:Release>:-O3>
-)
-
-# Host runner library
-add_library(host_runner STATIC
+# Source files
+set(RUNTIME_SOURCES
     src/host.cpp
+    src/kernel_runtime.cpp
+    src/kernel_debugger/kernel_debugger.cpp
+    src/kernel_debugger/command_processor.cpp
+    src/kernel_debugger/memory_tracker.cpp
+    src/kernel_debugger/event_logger.cpp
+    src/kernel_debugger/ui_helper.cpp
+    src/kernel_debugger/source_manager.cpp
+    src/kernel_debugger/call_stack.cpp
+    src/kernel_debugger/breakpoint.cpp
+    src/kernel_debugger/debug_events.cpp
+    src/kernel_debugger/config.cpp
 )
 
+# Create runtime library
+add_library(simplang_runtime SHARED ${RUNTIME_SOURCES})
+
+# Include directories
+target_include_directories(simplang_runtime
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/include
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/include/kernel_debugger
+        ${READLINE_INCLUDE_DIRS}
+)
+
+# Compiler definitions
+target_compile_definitions(simplang_runtime
+    PRIVATE
+        # Debug-related definitions
+        $<$<CONFIG:Debug>:SIMD_DEBUG=1>
+        $<$<BOOL:${ENABLE_DEBUGGER}>:ENABLE_DEBUGGER=1>
+)
+
+# Compiler options
+target_compile_options(simplang_runtime
+    PRIVATE
+        -Wall
+        -Wextra
+        -mavx512f
+        -msse4.2
+        $<$<CONFIG:Debug>:-g>
+        $<$<CONFIG:Debug>:-O0>
+)
+
+# Link libraries
+target_link_libraries(simplang_runtime
+    PRIVATE
+        ${READLINE_LIBRARIES}  # Use READLINE_LIBRARIES instead of just readline
+        readline               # Explicitly link readline
+        history               # Explicitly link history
+        Threads::Threads
+        ${CMAKE_DL_LIBS}
+)
+
+# Create host runner library (used by tests)
+add_library(host_runner SHARED src/host.cpp)
 target_link_libraries(host_runner
-    PUBLIC simplang_runtime
+    PRIVATE
+        simplang_runtime
+        ${CMAKE_DL_LIBS}
+        ${READLINE_LIBRARIES}  # Add readline libraries here too
+        readline
+        history
 )
 
 target_include_directories(host_runner
-    PUBLIC 
-        include
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_SOURCE_DIR}/include
-        $<$<BOOL:${ENABLE_DEBUGGER}>:${CMAKE_SOURCE_DIR}/include/kernel_debugger>
+        ${READLINE_INCLUDE_DIRS}
 )
 
 target_compile_options(host_runner
-    PRIVATE 
-        -mavx512f 
+    PRIVATE
+        -Wall
+        -Wextra
+        -mavx512f
         -msse4.2
-        $<$<CONFIG:Debug>:-g -O0>
-        $<$<CONFIG:Release>:-O3>
 )
 
 # Install rules
 install(TARGETS simplang_runtime host_runner
-    ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib
     RUNTIME DESTINATION bin
 )
 
 install(DIRECTORY include/
     DESTINATION include
-    FILES_MATCHING PATTERN "*.h"
+    FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp"
 )
-
-if(ENABLE_DEBUGGER)
-    install(DIRECTORY ${CMAKE_SOURCE_DIR}/include/kernel_debugger/
-        DESTINATION include/kernel_debugger
-        FILES_MATCHING PATTERN "*.hpp"
-    )
-endif()

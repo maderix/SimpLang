@@ -1,115 +1,169 @@
-#ifndef KERNEL_DEBUGGER_MEMORY_TRACKER_HPP
-#define KERNEL_DEBUGGER_MEMORY_TRACKER_HPP
+#ifndef MEMORY_TRACKER_HPP
+#define MEMORY_TRACKER_HPP
 
 #include <string>
-#include <map>
 #include <vector>
-#include <cstddef>
-#include <sstream>
-#include <chrono>
+#include <map>
 #include <mutex>
+#include <chrono>
+#include <memory>
+#include <immintrin.h>
+#include <iostream>
 
 class MemoryTracker {
 public:
-    struct MemoryBlock {
-        void* address{nullptr};
-        size_t size{0};
-        std::string description;
-        std::chrono::system_clock::time_point allocationTime;
-        size_t accessCount{0};
-        std::chrono::system_clock::time_point lastAccessTime;
-        std::vector<std::string> stackTrace;
-        
-        // Add default constructor
-        MemoryBlock() 
-            : allocationTime(std::chrono::system_clock::now())
-            , lastAccessTime(allocationTime)
-        {}
-        
-        // Keep existing constructor
-        MemoryBlock(void* addr, size_t sz, const std::string& desc)
-            : address(addr)
-            , size(sz)
-            , description(desc)
-            , allocationTime(std::chrono::system_clock::now())
-            , lastAccessTime(allocationTime)
-        {}
+    enum class VarType {
+        Int,
+        Double,
+        SSE_Vector,
+        AVX_Vector,
+        SSE_Slice,
+        AVX_Slice
     };
 
-    struct MemoryOperation {
-        enum class Type {
-            ALLOCATE,
-            FREE,
-            ACCESS
-        };
+    struct VariableState {
+        std::string name;
+        void* address;
+        VarType type;
+        size_t size;
+        bool isActive;
+        std::vector<std::pair<std::chrono::system_clock::time_point, std::string>> valueHistory;
+        
+        VariableState(const std::string& n = "", void* addr = nullptr, 
+                     VarType t = VarType::Double, size_t sz = 0)
+            : name(n), address(addr), type(t), size(sz), isActive(true) {}
+    };
 
-        Type type;
+    struct MemoryStats {
+        size_t totalAllocated{0};
+        size_t currentlyAllocated{0};
+        size_t peakAllocated{0};
+        size_t totalOperations{0};
+        std::map<VarType, size_t> simdOperations;
+        std::map<std::string, size_t> operationTypes;
+        std::map<size_t, size_t> alignmentStats;
+    };
+
+    struct Allocation {
         void* address;
         size_t size;
-        std::string description;
+        std::string name;
+        bool isActive;
+        bool isAligned;
+        size_t alignment;
+        VarType type;
         std::chrono::system_clock::time_point timestamp;
-
-        MemoryOperation(Type t, void* addr, size_t sz, const std::string& desc)
-            : type(t)
-            , address(addr)
-            , size(sz)
-            , description(desc)
-            , timestamp(std::chrono::system_clock::now())
-        {}
+        
+        Allocation(void* addr = nullptr, size_t sz = 0, 
+                  const std::string& n = "", VarType t = VarType::Double,
+                  bool aligned = false, size_t align = 0)
+            : address(addr), size(sz), name(n), isActive(true)
+            , isAligned(aligned), alignment(align), type(t)
+            , timestamp(std::chrono::system_clock::now()) {}
     };
+
+    struct SimdOperation {
+        VarType type;
+        std::string operation;
+        void* result;
+        void* operand1;
+        void* operand2;
+        std::chrono::system_clock::time_point timestamp;
+        std::string location;
+        
+        SimdOperation(VarType t, const std::string& op, void* res, void* op1, void* op2,
+                     const std::string& loc)
+            : type(t), operation(op), result(res), operand1(op1), operand2(op2)
+            , timestamp(std::chrono::system_clock::now()), location(loc) {}
+    };
+
+    // Constructor and basic interface
+    MemoryTracker();
+    void enableTracking(bool enable) { isEnabled = enable; }
+    bool isTrackingEnabled() const { return isEnabled; }
+
+    // Memory tracking
+    void trackAllocation(void* ptr, size_t size, const std::string& type, const std::string& location);
+    void trackSimdAllocation(void* ptr, size_t size, VarType type, size_t alignment,
+                           const std::string& location);
+    void trackDeallocation(void* ptr);
+    void trackAccess(void* ptr, size_t size, bool isWrite);
+
+    // SIMD operations
+    void trackSimdOperation(VarType type, const std::string& operation,
+                          void* result, void* op1, void* op2,
+                          const std::string& location);
+    const SimdOperation* getLastOperation(void* ptr) const;
+    std::vector<SimdOperation> getOperationHistory(void* ptr) const;
+    bool validateSimdAccess(void* ptr, size_t size, VarType type) const;
+    bool isSimdAligned(void* ptr) const;
+
+    // Variable tracking
+    void trackVariable(const std::string& name, void* address, VarType type);
+    void updateVariableValue(void* address);
+    const std::vector<VariableState> getActiveVariables() const;
+    std::vector<Allocation> getActiveAllocations() const;
+    const Allocation* getAllocationInfo(void* ptr) const;
+
+    // Memory validation
+    bool isValidPointer(void* ptr) const;
+    size_t getAllocationSize(void* ptr) const;
+
+    // Value tracking
+    void updateVariableValue(const std::string& name, const std::string& value) {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = variableStates.find(name);
+        if (it != variableStates.end()) {
+            it->second.valueHistory.emplace_back(
+                std::chrono::system_clock::now(),
+                value
+            );
+        }
+    }
+
+    std::string getLatestValue(const std::string& name) const {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = variableStates.find(name);
+        if (it != variableStates.end() && !it->second.valueHistory.empty()) {
+            return it->second.valueHistory.back().second;
+        }
+        return "<undefined>";
+    }
+
+    std::map<std::string, std::string> getCurrentScopeVariables() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::map<std::string, std::string> result;
+        for (const auto& [name, var] : variableStates) {
+            if (var.isActive && !var.valueHistory.empty()) {
+                result[name] = var.valueHistory.back().second;
+            }
+        }
+        return result;
+    }
+
+    // Reporting
+    void generateSimdReport(std::ostream& out = std::cout) const;
+    void dumpSimdState(std::ostream& out = std::cout) const;
+    void generateReport(std::ostream& out = std::cout) const;
+    void reset();
 
 private:
-    std::map<void*, MemoryBlock> allocatedBlocks;
-    std::vector<MemoryOperation> operations;
-    std::map<size_t, size_t> allocationPatterns;
-    std::vector<int64_t> blockLifetimes;
-    
-    size_t totalAllocated{0};
-    size_t peakMemory{0};
-    size_t currentMemory{0};
-    size_t freedMemory{0};
-    
-    const size_t maxOperationHistory{1000};
-    const size_t memoryWarningThreshold{1024 * 1024 * 1024}; // 1GB
-    const size_t blockCountWarningThreshold{1000};
-    const int64_t leakThresholdSeconds{3600}; // 1 hour
-    
     mutable std::mutex mutex;
-    
-    struct LogEntry {
-        std::string message;
-        std::string details;
-        std::chrono::system_clock::time_point timestamp;
-    };
-    
-    std::vector<LogEntry> errors;
-    std::vector<LogEntry> warnings;
+    bool isEnabled;
+    std::map<void*, Allocation> allocations;         // For memory allocations
+    std::map<std::string, VariableState> variableStates;  // For variable tracking
+    std::vector<SimdOperation> operationHistory;
+    std::map<void*, std::string> addressToName;
+    MemoryStats stats;
+    static constexpr size_t MAX_HISTORY_SIZE = 1000;
 
-    // Private helper methods
-    void checkAllocationThresholds();
-    void logError(const std::string& message, const std::string& details = "");
-    void logWarning(const std::string& message, const std::string& details = "");
-    std::string addressToString(void* addr) const;
-    void printOperation(const MemoryOperation& op) const;
-    std::vector<std::string> getCurrentStackTrace() const;
-
-public:
-    MemoryTracker() = default;
-
-    void trackOperation(const std::string& op, void* addr, size_t size,
-                       const std::string& description);
-    void clear();
-    void printSummary() const;
-    void printCurrentState() const;
-    std::vector<MemoryBlock> detectLeaks() const;
-    void analyzeFragmentation() const;
-
-    // Getters
-    size_t getTotalAllocated() const { return totalAllocated; }
-    size_t getPeakMemory() const { return peakMemory; }
-    size_t getCurrentMemory() const { return currentMemory; }
-    size_t getActiveAllocations() const { return allocatedBlocks.size(); }
-    const std::vector<MemoryOperation>& getOperations() const { return operations; }
+    // Helper methods
+    void updateStats(const Allocation& alloc, bool isAllocation);
+    void pruneOperationHistory();
+    std::string formatSize(size_t size) const;
+    std::string formatTimestamp(const std::chrono::system_clock::time_point& time) const;
+    void checkMemoryLeaks() const;
+    bool checkAlignment(void* ptr, size_t required) const;
 };
 
-#endif // KERNEL_DEBUGGER_MEMORY_TRACKER_HPP
+#endif // MEMORY_TRACKER_HPP

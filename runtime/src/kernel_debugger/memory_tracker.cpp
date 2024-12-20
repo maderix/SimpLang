@@ -1,294 +1,302 @@
 #include "kernel_debugger/memory_tracker.hpp"
-#include <iostream>
+#include <sstream>
 #include <iomanip>
 #include <algorithm>
-#include <sstream>
-#include <numeric>
-#include <ctime>
+#include <cstring>
 
-// Helper function to format memory sizes
-static std::string formatMemorySize(size_t size) {
-    constexpr size_t KB = 1024;
-    constexpr size_t MB = KB * 1024;
-    constexpr size_t GB = MB * 1024;
+MemoryTracker::MemoryTracker() : isEnabled(true) {}
 
-    std::stringstream ss;
-    ss << std::fixed << std::setprecision(2);
-
-    if (size >= GB) {
-        ss << static_cast<double>(size) / GB << " GB";
-    } else if (size >= MB) {
-        ss << static_cast<double>(size) / MB << " MB";
-    } else if (size >= KB) {
-        ss << static_cast<double>(size) / KB << " KB";
-    } else {
-        ss << size << " bytes";
-    }
-    return ss.str();
-}
-
-void MemoryTracker::trackOperation(const std::string& op, void* addr, size_t size,
-                                 const std::string& description) {
-    std::lock_guard<std::mutex> lock(mutex);
-    auto now = std::chrono::system_clock::now();
-
-    if (op == "allocate") {
-        // Track allocation
-        auto [it, inserted] = allocatedBlocks.emplace(addr, 
-            MemoryBlock(addr, size, description));
-        if (inserted) {
-            it->second.stackTrace = getCurrentStackTrace();
-            
-            // Update statistics
-            totalAllocated += size;
-            currentMemory += size;
-            peakMemory = std::max(peakMemory, currentMemory);
-            allocationPatterns[size]++;
-
-            // Log operation
-            operations.emplace_back(
-                MemoryOperation::Type::ALLOCATE,
-                addr,
-                size,
-                description
-            );
-
-            checkAllocationThresholds();
-        }
-    } else if (op == "free") {
-        auto it = allocatedBlocks.find(addr);
-        if (it != allocatedBlocks.end()) {
-            // Calculate lifetime
-            auto lifetime = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - it->second.allocationTime).count();
-            blockLifetimes.push_back(lifetime);
-
-            // Update statistics
-            currentMemory -= it->second.size;
-            freedMemory += it->second.size;
-
-            // Log operation
-            operations.emplace_back(
-                MemoryOperation::Type::FREE,
-                addr,
-                it->second.size,
-                description
-            );
-
-            allocatedBlocks.erase(it);
-        } else {
-            logError("Attempt to free untracked memory", addressToString(addr));
-        }
-    } else if (op == "access") {
-        auto it = allocatedBlocks.find(addr);
-        if (it != allocatedBlocks.end()) {
-            it->second.lastAccessTime = now;
-            it->second.accessCount++;
-
-            operations.emplace_back(
-                MemoryOperation::Type::ACCESS,
-                addr,
-                size,
-                description
-            );
-        } else {
-            logError("Access to untracked memory", addressToString(addr));
-        }
-    }
-
-    // Maintain operation history size
-    if (operations.size() > maxOperationHistory) {
-        operations.erase(operations.begin(), 
-                        operations.begin() + operations.size() - maxOperationHistory);
-    }
-}
-
-void MemoryTracker::printSummary() const {
-    std::lock_guard<std::mutex> lock(mutex);
-
-    std::cout << "\n=== Memory Usage Summary ===\n";
-    std::cout << "Total allocated: " << formatMemorySize(totalAllocated) << "\n";
-    std::cout << "Current usage:   " << formatMemorySize(currentMemory) << "\n";
-    std::cout << "Peak usage:      " << formatMemorySize(peakMemory) << "\n";
-    std::cout << "Freed memory:    " << formatMemorySize(freedMemory) << "\n";
-    std::cout << "Active blocks:   " << allocatedBlocks.size() << "\n";
-
-    if (!allocationPatterns.empty()) {
-        std::cout << "\nAllocation Size Patterns:\n";
-        for (const auto& [size, count] : allocationPatterns) {
-            std::cout << "  " << std::setw(10) << formatMemorySize(size) 
-                      << ": " << count << " times\n";
-        }
-    }
-
-    if (!blockLifetimes.empty()) {
-        auto [minIt, maxIt] = std::minmax_element(blockLifetimes.begin(), 
-                                                 blockLifetimes.end());
-        double avgLifetime = std::accumulate(blockLifetimes.begin(), 
-                                           blockLifetimes.end(), 0.0) / 
-                                           blockLifetimes.size();
-
-        std::cout << "\nBlock Lifetime Statistics:\n";
-        std::cout << "  Minimum: " << *minIt << " ms\n";
-        std::cout << "  Maximum: " << *maxIt << " ms\n";
-        std::cout << "  Average: " << std::fixed << std::setprecision(2) 
-                  << avgLifetime << " ms\n";
-    }
-}
-
-void MemoryTracker::printCurrentState() const {
-    std::lock_guard<std::mutex> lock(mutex);
-
-    std::cout << "\nCurrent Memory State:\n";
-    std::cout << "Using " << formatMemorySize(currentMemory) 
-              << " across " << allocatedBlocks.size() << " blocks\n";
-
-    if (!operations.empty()) {
-        std::cout << "\nLast 5 memory operations:\n";
-        auto start = operations.size() <= 5 ? operations.begin() 
-                                          : operations.end() - 5;
-        for (auto it = start; it != operations.end(); ++it) {
-            printOperation(*it);
-        }
-    }
-}
-
-std::vector<MemoryTracker::MemoryBlock> MemoryTracker::detectLeaks() const {
-    std::lock_guard<std::mutex> lock(mutex);
-    std::vector<MemoryBlock> leaks;
-    auto now = std::chrono::system_clock::now();
-
-    for (const auto& [addr, block] : allocatedBlocks) {
-        auto lifetime = std::chrono::duration_cast<std::chrono::seconds>(
-            now - block.allocationTime).count();
-
-        if (lifetime > leakThresholdSeconds) {
-            leaks.push_back(block);
-        }
-    }
-
-    return leaks;
-}
-
-void MemoryTracker::analyzeFragmentation() const {
-    std::lock_guard<std::mutex> lock(mutex);
-
-    std::cout << "\nMemory Fragmentation Analysis:\n";
-
-    std::vector<std::pair<void*, MemoryBlock>> sortedBlocks(
-        allocatedBlocks.begin(), allocatedBlocks.end());
-    std::sort(sortedBlocks.begin(), sortedBlocks.end(),
-              [](const auto& a, const auto& b) {
-                  return a.first < b.first;
-              });
-
-    size_t totalGaps = 0;
-    size_t maxGap = 0;
-    int gapCount = 0;
-
-    for (size_t i = 1; i < sortedBlocks.size(); i++) {
-        uintptr_t prevEnd = reinterpret_cast<uintptr_t>(sortedBlocks[i-1].first) + 
-                           sortedBlocks[i-1].second.size;
-        uintptr_t currStart = reinterpret_cast<uintptr_t>(sortedBlocks[i].first);
-
-        if (currStart > prevEnd) {
-            size_t gap = currStart - prevEnd;
-            totalGaps += gap;
-            maxGap = std::max(maxGap, gap);
-            gapCount++;
-        }
-    }
-
-    std::cout << "Number of gaps: " << gapCount << "\n";
-    std::cout << "Total gap size: " << formatMemorySize(totalGaps) << "\n";
-    std::cout << "Largest gap: " << formatMemorySize(maxGap) << "\n";
+void MemoryTracker::trackAllocation(void* ptr, size_t size, const std::string& type, 
+                                  const std::string& location) {
+    if (!isEnabled || !ptr) return;
     
-    if (gapCount > 0) {
-        double avgGap = static_cast<double>(totalGaps) / gapCount;
-        std::cout << "Average gap size: " << formatMemorySize(static_cast<size_t>(avgGap)) << "\n";
-    }
-
-    double fragmentationRatio = static_cast<double>(totalGaps) / 
-                              (currentMemory + totalGaps);
-    std::cout << "Fragmentation ratio: " << std::fixed << std::setprecision(2)
-              << (fragmentationRatio * 100) << "%\n";
-}
-
-void MemoryTracker::clear() {
     std::lock_guard<std::mutex> lock(mutex);
-    allocatedBlocks.clear();
-    operations.clear();
-    allocationPatterns.clear();
-    blockLifetimes.clear();
-    totalAllocated = 0;
-    currentMemory = 0;
-    peakMemory = 0;
-    freedMemory = 0;
+    
+    Allocation alloc(ptr, size, type);
+    allocations[ptr] = alloc;
+    updateStats(allocations[ptr], true);
+
+    std::cout << "DEBUG: Tracked allocation of " << type << " at " << ptr 
+              << " (size: " << size << ")\n";
 }
 
-void MemoryTracker::checkAllocationThresholds() {
-    if (currentMemory > memoryWarningThreshold) {
-        logWarning("Memory usage exceeds warning threshold",
-                  "Current: " + formatMemorySize(currentMemory));
-    }
+void MemoryTracker::trackSimdAllocation(void* ptr, size_t size, VarType type,
+                                      size_t alignment, const std::string& location) {
+    if (!isEnabled || !ptr) return;
+    
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    Allocation alloc(ptr, size, "", type, true, alignment);
+    allocations[ptr] = alloc;
+    updateStats(alloc, true);
+    stats.alignmentStats[alignment]++;
+}
 
-    if (allocatedBlocks.size() > blockCountWarningThreshold) {
-        logWarning("Block count exceeds warning threshold",
-                  "Count: " + std::to_string(allocatedBlocks.size()));
+void MemoryTracker::trackVariable(const std::string& name, void* address, VarType type) {
+    if (!isEnabled || !address) return;
+    
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    size_t size;
+    switch (type) {
+        case VarType::Double: size = sizeof(double); break;
+        case VarType::Int: size = sizeof(int); break;
+        case VarType::SSE_Vector: size = sizeof(__m256d); break;
+        case VarType::AVX_Vector: size = sizeof(__m512d); break;
+        case VarType::SSE_Slice:
+        case VarType::AVX_Slice:
+            size = sizeof(void*) + 2 * sizeof(size_t);
+            break;
+    }
+    
+    variableStates[name] = VariableState(name, address, type, size);
+    addressToName[address] = name;
+}
+
+void MemoryTracker::updateVariableValue(void* address) {
+    if (!isEnabled || !address) return;
+    
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    auto it = addressToName.find(address);
+    if (it == addressToName.end()) return;
+    
+    auto& var = variableStates[it->second];
+    std::string value;
+    
+    switch (var.type) {
+        case VarType::Double: {
+            double val = *static_cast<double*>(address);
+            std::stringstream ss;
+            ss << val;
+            value = ss.str();
+            break;
+        }
+        case VarType::Int: {
+            int val = *static_cast<int*>(address);
+            std::stringstream ss;
+            ss << val;
+            value = ss.str();
+            break;
+        }
+        case VarType::SSE_Vector: {
+            __m256d vec = *static_cast<__m256d*>(address);
+            alignas(32) double values[4];
+            _mm256_store_pd(values, vec);
+            std::stringstream ss;
+            ss << "[" << values[0];
+            for (int i = 1; i < 4; i++) ss << ", " << values[i];
+            ss << "]";
+            value = ss.str();
+            break;
+        }
+        case VarType::AVX_Vector: {
+            __m512d vec = *static_cast<__m512d*>(address);
+            alignas(64) double values[8];
+            _mm512_store_pd(values, vec);
+            std::stringstream ss;
+            ss << "[" << values[0];
+            for (int i = 1; i < 8; i++) ss << ", " << values[i];
+            ss << "]";
+            value = ss.str();
+            break;
+        }
+        default:
+            value = "<unknown type>";
+    }
+    
+    var.valueHistory.emplace_back(std::chrono::system_clock::now(), value);
+}
+
+
+
+
+void MemoryTracker::trackDeallocation(void* ptr) {
+    if (!isEnabled || !ptr) return;
+    
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    auto it = allocations.find(ptr);
+    if (it != allocations.end()) {
+        if (it->second.isAligned) {
+            stats.alignmentStats[it->second.alignment]--;
+        }
+        updateStats(it->second, false);
+        allocations.erase(it);
     }
 }
 
-void MemoryTracker::logError(const std::string& message, 
-                           const std::string& details) {
-    std::cerr << "Memory Error: " << message << "\n";
-    if (!details.empty()) {
-        std::cerr << "Details: " << details << "\n";
+void MemoryTracker::trackAccess(void* ptr, size_t size, bool isWrite) {
+    if (!isEnabled || !ptr) return;
+    
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    auto it = allocations.find(ptr);
+    if (it != allocations.end() && it->second.isActive) {
+        size_t accessEnd = reinterpret_cast<size_t>(ptr) + size;
+        size_t allocEnd = reinterpret_cast<size_t>(it->second.address) + it->second.size;
+        
+        if (accessEnd > allocEnd) {
+            throw std::runtime_error("Memory access out of bounds");
+        }
+        
+        stats.totalOperations++;
+    } else {
+        throw std::runtime_error("Invalid memory access");
     }
-    errors.push_back({message, details, std::chrono::system_clock::now()});
 }
 
-void MemoryTracker::logWarning(const std::string& message,
-                             const std::string& details) {
-    std::cout << "Memory Warning: " << message << "\n";
-    if (!details.empty()) {
-        std::cout << "Details: " << details << "\n";
-    }
-    warnings.push_back({message, details, std::chrono::system_clock::now()});
+
+bool MemoryTracker::isValidPointer(void* ptr) const {
+    if (!isEnabled || !ptr) return false;
+    
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    auto it = allocations.find(ptr);
+    return it != allocations.end() && it->second.isActive;
 }
 
-std::string MemoryTracker::addressToString(void* addr) const {
+
+void MemoryTracker::generateReport(std::ostream& out) const {
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    out << "\nVariable Tracking Report\n"
+        << "=====================\n\n"
+        << "Active Variables:\n";
+    
+    for (const auto& [name, var] : variableStates) {
+        if (var.isActive) {
+            out << name << ": ";
+            if (!var.valueHistory.empty()) {
+                out << var.valueHistory.back().second;
+            } else {
+                out << "<no value>";
+            }
+            out << "\n";
+        }
+    }
+    
+    out << "\nMemory Statistics:\n"
+        << "Total Allocated: " << formatSize(stats.totalAllocated) << "\n"
+        << "Currently Allocated: " << formatSize(stats.currentlyAllocated) << "\n"
+        << "Peak Allocated: " << formatSize(stats.peakAllocated) << "\n"
+        << "Total Operations: " << stats.totalOperations << "\n";
+}
+
+
+const std::vector<MemoryTracker::VariableState> MemoryTracker::getActiveVariables() const {
+    std::lock_guard<std::mutex> lock(mutex);
+    std::vector<VariableState> result;
+    
+    for (const auto& [name, var] : variableStates) {
+        if (var.isActive) {
+            result.push_back(var);
+        }
+    }
+    
+    return result;
+}
+
+std::vector<MemoryTracker::Allocation> MemoryTracker::getActiveAllocations() const {
+    std::lock_guard<std::mutex> lock(mutex);
+    std::vector<Allocation> result;
+    
+    for (const auto& [_, alloc] : allocations) {
+        if (alloc.isActive) {
+            result.push_back(alloc);
+        }
+    }
+    
+    return result;
+}
+
+size_t MemoryTracker::getAllocationSize(void* ptr) const {
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    auto it = allocations.find(ptr);
+    return (it != allocations.end()) ? it->second.size : 0;
+}
+
+const MemoryTracker::Allocation* MemoryTracker::getAllocationInfo(void* ptr) const {
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    auto it = allocations.find(ptr);
+    if (it != allocations.end()) {
+        return &(it->second);
+    }
+    return nullptr;
+}
+
+void MemoryTracker::reset() {
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    allocations.clear();
+    variableStates.clear();
+    addressToName.clear();
+    operationHistory.clear();
+    stats = MemoryStats();
+}
+
+// Private helper methods
+void MemoryTracker::updateStats(const Allocation& alloc, bool isAllocation) {
+    if (isAllocation) {
+        stats.totalAllocated += alloc.size;
+        stats.currentlyAllocated += alloc.size;
+        stats.peakAllocated = std::max(stats.peakAllocated, stats.currentlyAllocated);
+    } else {
+        stats.currentlyAllocated -= alloc.size;
+    }
+}
+
+void MemoryTracker::pruneOperationHistory() {
+    if (operationHistory.size() > MAX_HISTORY_SIZE) {
+        operationHistory.erase(
+            operationHistory.begin(),
+            operationHistory.begin() + (operationHistory.size() - MAX_HISTORY_SIZE)
+        );
+    }
+}
+
+void MemoryTracker::checkMemoryLeaks() const {
+    size_t leakCount = 0;
+    size_t leakSize = 0;
+    
+    for (const auto& [ptr, alloc] : allocations) {
+        if (alloc.isActive) {
+            leakCount++;
+            leakSize += alloc.size;
+        }
+    }
+    
+    if (leakCount > 0) {
+        std::cerr << "WARNING: " << leakCount << " memory leaks detected, "
+                  << "total size: " << formatSize(leakSize) << std::endl;
+    }
+}
+
+std::string MemoryTracker::formatSize(size_t size) const {
+    const char* units[] = {"B", "KB", "MB", "GB"};
+    int unit = 0;
+    double dsize = static_cast<double>(size);
+    
+    while (dsize >= 1024.0 && unit < 3) {
+        dsize /= 1024.0;
+        unit++;
+    }
+    
     std::stringstream ss;
-    ss << "0x" << std::hex << std::setfill('0') << std::setw(12)
-       << reinterpret_cast<uintptr_t>(addr);
+    ss << std::fixed << std::setprecision(2) << dsize << " " << units[unit];
     return ss.str();
 }
 
-void MemoryTracker::printOperation(const MemoryOperation& op) const {
+std::string MemoryTracker::formatTimestamp(
+    const std::chrono::system_clock::time_point& time) const {
+    auto timer = std::chrono::system_clock::to_time_t(time);
     std::stringstream ss;
-    auto timePoint = std::chrono::system_clock::to_time_t(op.timestamp);
-    ss << std::put_time(std::localtime(&timePoint), "%H:%M:%S") << " - ";
-
-    switch (op.type) {
-        case MemoryOperation::Type::ALLOCATE:
-            ss << "Allocated ";
-            break;
-        case MemoryOperation::Type::FREE:
-            ss << "Freed ";
-            break;
-        case MemoryOperation::Type::ACCESS:
-            ss << "Accessed ";
-            break;
-    }
-
-    ss << formatMemorySize(op.size) << " at " << addressToString(op.address);
-    if (!op.description.empty()) {
-        ss << " (" << op.description << ")";
-    }
-
-    std::cout << ss.str() << "\n";
+    ss << std::put_time(std::localtime(&timer), "%H:%M:%S");
+    return ss.str();
 }
 
-std::vector<std::string> MemoryTracker::getCurrentStackTrace() const {
-    // Platform-specific implementation would go here
-    return std::vector<std::string>();
+bool MemoryTracker::checkAlignment(void* ptr, size_t required) const {
+    return reinterpret_cast<uintptr_t>(ptr) % required == 0;
 }

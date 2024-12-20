@@ -26,33 +26,41 @@ extern "C" {
 struct sse_slice_t;
 struct avx_slice_t;
 
-// SSE slice type (4-wide vectors)
+// SSE slice type (2-wide vectors)
 typedef struct sse_slice_t {
-    __m256d* data;  // Pointer to array of 4-wide vectors
-    size_t len;     // Current length
-    size_t cap;     // Capacity
+    __m128d* data;  // Change to __m128d for SSE
+    size_t len;
+    size_t cap;
 } sse_slice_t;
 
-// AVX slice type (8-wide vectors)
+// AVX slice type (8-wide vectors to match IR)
 typedef struct avx_slice_t {
-    __m512d* data;  // Pointer to array of 8-wide vectors
-    size_t len;     // Current length
-    size_t cap;     // Capacity
+    __m512d* data;  // Change to 8-wide vectors
+    size_t len;
+    size_t cap;
 } avx_slice_t;
 
 // Vector creation functions
-__m256d sse(double a, double b, double c, double d);
-__m512d avx(double a, double b, double c, double d,
-            double e, double f, double g, double h);
+#ifdef _MSC_VER
+    // Windows calling convention
+    __m128d __vectorcall sse(double a, double b, double c, double d);
+    __m512d __vectorcall avx(double a, double b, double c, double d,
+                            double e, double f, double g, double h);
+#else
+    // GCC/Clang calling convention
+    __m128d sse(double a, double b, double c, double d) __attribute__((sysv_abi));
+    __m512d avx(double a, double b, double c, double d,
+                double e, double f, double g, double h) __attribute__((sysv_abi));
+#endif
 
 // SIMD arithmetic operations
-__m256d simd_add(__m256d a, __m256d b);
+__m128d simd_add(__m128d a, __m128d b);
 __m512d simd_add_avx(__m512d a, __m512d b);
-__m256d simd_mul(__m256d a, __m256d b);
+__m128d simd_mul(__m128d a, __m128d b);
 __m512d simd_mul_avx(__m512d a, __m512d b);
 
 // Memory management
-__m256d* allocate_sse_vectors(size_t count);
+__m128d* allocate_sse_vectors(size_t count);  // Change return type
 __m512d* allocate_avx_vectors(size_t count);
 void free_vectors(void* ptr);
 
@@ -62,23 +70,28 @@ avx_slice_t* make_avx_slice(size_t len);
 void free_slice(void* slice);
 
 // Slice operations
-void slice_set_sse(sse_slice_t* slice, size_t idx, __m256d value);
-__m256d slice_get_sse(sse_slice_t* slice, size_t idx);
+void slice_set_sse(sse_slice_t* slice, size_t idx, __m128d value);  // Change parameter type
+__m128d slice_get_sse(sse_slice_t* slice, size_t idx);  // Change return type
 void slice_set_avx(avx_slice_t* slice, size_t idx, __m512d value);
 __m512d slice_get_avx(avx_slice_t* slice, size_t idx);
+void slice_set_avx_values(avx_slice_t* slice, size_t idx, 
+                         double v0, double v1, double v2, double v3,
+                         double v4, double v5, double v6, double v7);
 
 // Vector printing functions
-void print_sse_vector(__m256d vec);
+void print_sse_vector(__m128d vec);  // Change parameter type
 void print_avx_vector(__m512d vec);
 void print_sse_slice(sse_slice_t* slice);
 void print_avx_slice(avx_slice_t* slice);
 
 // Debug vector printing functions
-static inline void print_debug_vector_sse(const char* msg, __m256d vec) {
+static inline void print_debug_vector_sse(const char* msg, __m128d vec) {
     DEBUG_PRINT(msg);
     DEBUG_PRINT(": ");
     #if SIMD_DEBUG
-    print_sse_vector(vec);
+    alignas(16) double values[2];
+    _mm_store_pd(values, vec);
+    printf("[%.2f, %.2f]\n", values[0], values[1]);
     #endif
 }
 
@@ -86,7 +99,10 @@ static inline void print_debug_vector_avx(const char* msg, __m512d vec) {
     DEBUG_PRINT(msg);
     DEBUG_PRINT(": ");
     #if SIMD_DEBUG
-    print_avx_vector(vec);
+    alignas(64) double values[8];
+    _mm512_store_pd(values, vec);
+    printf("[%.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f]\n", 
+           values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7]);
     #endif
 }
 

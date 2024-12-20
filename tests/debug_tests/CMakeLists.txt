@@ -1,42 +1,60 @@
-# Debug tests CMakeLists.txt
+# Debug test specific section
+if(ENABLE_DEBUGGER)
+    # Find readline
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(READLINE readline REQUIRED)
 
-# Add SimpleLang debug test
-add_sl_test(debug_simd test_simd_debug.sl)
+    # Create debug test executable
+    add_executable(debug_test_runner
+        debug_tests/debug_test_runner.cpp
+    )
 
-# Create debug test runner
-add_executable(debug_test_runner
-    debug_test_runner.cpp
-)
+    target_compile_definitions(debug_test_runner
+        PRIVATE
+            SIMD_DEBUG=1
+            ENABLE_DEBUGGER=1
+    )
 
-target_link_libraries(debug_test_runner
-    PRIVATE 
+    target_include_directories(debug_test_runner
+        PRIVATE 
+            ${CMAKE_SOURCE_DIR}/runtime/include
+            ${CMAKE_SOURCE_DIR}/include
+            ${CMAKE_SOURCE_DIR}/include/kernel_debugger
+            ${READLINE_INCLUDE_DIRS}
+    )
+
+    target_link_libraries(debug_test_runner
+        PRIVATE 
+            simplang_runtime
+            ${CMAKE_DL_LIBS}
+            ${READLINE_LIBRARIES}  # Add pkg-config libraries
+            readline               # Explicitly link readline
+            history               # Explicitly link history
+    )
+
+    target_compile_options(debug_test_runner
+        PRIVATE 
+            -g
+            -O0
+            -mavx512f 
+            -msse4.2
+    )
+
+    add_dependencies(debug_test_runner 
+        debug_test_obj 
         simplang_runtime
-        debug_simd_obj
-)
+    )
 
-target_include_directories(debug_test_runner
-    PRIVATE 
-        ${CMAKE_SOURCE_DIR}/include
-        ${CMAKE_SOURCE_DIR}/include/kernel_debugger
-        ${CMAKE_SOURCE_DIR}/runtime/include
-)
+    # Add to CTest
+    add_test(
+        NAME debug_test
+        COMMAND debug_test_runner
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    )
+    
+    set_tests_properties(debug_test PROPERTIES
+        ENVIRONMENT "SIMD_DEBUG=1"
+    )
 
-target_compile_options(debug_test_runner
-    PRIVATE 
-        -mavx512f 
-        -msse4.2
-        $<$<CONFIG:Debug>:-g -O0>
-        $<$<CONFIG:Release>:-O3>
-)
-
-# Add test to CTest
-add_test(NAME debug_test 
-         COMMAND debug_test_runner
-         WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-
-# Create custom target to run debug tests
-add_custom_target(run_debug_tests
-    COMMAND ${CMAKE_CTEST_COMMAND} -R "debug_test" --output-on-failure
-    DEPENDS debug_test_runner
-    COMMENT "Running SimpleLang debug tests"
-)
+    message(STATUS "SIMD debug test configured with readline: ${READLINE_LIBRARIES}")
+endif()

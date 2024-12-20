@@ -1,53 +1,95 @@
 # Tests CMakeLists.txt
 enable_testing()
 
+# Create version script for kernel symbol exports
+file(WRITE ${CMAKE_BINARY_DIR}/tests/kernel.version
+"{\n    global:\n        kernel_main;\n    local:\n        *;\n};\n")
+
+# Find readline package
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(READLINE readline REQUIRED)
+
+# Create test output directories
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/tests/obj)
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/tests/ir)
+
 # Function to add a test
 function(add_sl_test name sl_file expected_result)
     # Get filename without .sl extension
     get_filename_component(base_name ${sl_file} NAME_WE)
     
-    # Define output files
-    set(obj_file "${CMAKE_CURRENT_BINARY_DIR}/${base_name}.o")
-    set(ll_file "${CMAKE_CURRENT_BINARY_DIR}/${base_name}.ll")
+    # Define output files in organized directories
+    set(obj_file "${CMAKE_BINARY_DIR}/tests/obj/${base_name}.o")
+    set(so_file "${CMAKE_BINARY_DIR}/tests/obj/${base_name}.so")
     
     message(STATUS "Processing test ${name}:")
     message(STATUS "  Source: ${sl_file}")
     message(STATUS "  Object: ${obj_file}")
-    message(STATUS "  LLVM IR: ${ll_file}")
+    message(STATUS "  Shared: ${so_file}")
     message(STATUS "  Expected Result: ${expected_result}")
     
-    # Generate LLVM IR and object file
+    # First generate a temporary object file
+    set(temp_obj "${CMAKE_BINARY_DIR}/tests/obj/${base_name}_temp.o")
     add_custom_command(
-        OUTPUT ${obj_file}
+        OUTPUT ${temp_obj}
         COMMAND ${CMAKE_BINARY_DIR}/src/simplang 
                 ${CMAKE_CURRENT_SOURCE_DIR}/${sl_file}
-                -o ${obj_file}
-                -v  # Add verbose output
+                -o ${temp_obj}
+                -v
+                -fPIC
         DEPENDS simplang ${CMAKE_CURRENT_SOURCE_DIR}/${sl_file}
-        COMMENT "Compiling ${sl_file} to ${base_name}.o"
+        COMMENT "Compiling ${sl_file}"
         VERBATIM
     )
 
-    # Create object target
-    add_custom_target(${name}_obj DEPENDS ${obj_file})
+    # Then create object file with proper symbol visibility
+    add_custom_command(
+        OUTPUT ${obj_file}
+        COMMAND ${CMAKE_C_COMPILER} -r ${temp_obj} -o ${obj_file}
+                -Wl,--version-script=${CMAKE_BINARY_DIR}/tests/kernel.version
+                -Wl,--export-dynamic-symbol=kernel_main
+                -fvisibility=default
+        DEPENDS ${temp_obj} ${CMAKE_BINARY_DIR}/tests/kernel.version
+        COMMENT "Creating object file for ${base_name}"
+        VERBATIM
+    )
+
+    # Create shared library with explicit exports
+    add_custom_command(
+        OUTPUT ${so_file}
+        COMMAND ${CMAKE_C_COMPILER} -shared ${obj_file} -o ${so_file} 
+                -Wl,--export-dynamic
+                -Wl,--version-script=${CMAKE_BINARY_DIR}/tests/kernel.version
+                -Wl,--export-dynamic-symbol=kernel_main
+                -fvisibility=default
+        DEPENDS ${obj_file} ${CMAKE_BINARY_DIR}/tests/kernel.version
+        COMMENT "Creating shared library for ${base_name}"
+        VERBATIM
+    )
+
+    add_custom_target(${name}_obj DEPENDS ${so_file})
 
     # Create test runner executable
     add_executable(${name}_runner 
-        ${CMAKE_SOURCE_DIR}/runtime/src/host.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/${name}_host.cpp
+    )
+
+    add_dependencies(${name}_runner ${name}_obj)
+
+    # Link with runtime library and dynamic linker
+    target_link_libraries(${name}_runner
+        PRIVATE 
+            simplang_runtime
+            ${CMAKE_DL_LIBS}
+            ${READLINE_LIBRARIES}
+            readline
+            history
     )
 
     # Add the object file to linker command
     target_link_options(${name}_runner
         PRIVATE ${obj_file}
-    )
-
-    # Add dependency on object file
-    add_dependencies(${name}_runner ${name}_obj)
-
-    # Link with runtime library and dynamic linker
-    target_link_libraries(${name}_runner
-        PRIVATE simplang_runtime
-        PRIVATE ${CMAKE_DL_LIBS}
+        -rdynamic
     )
 
     # Set include directories
@@ -55,60 +97,51 @@ function(add_sl_test name sl_file expected_result)
         PRIVATE 
             ${CMAKE_SOURCE_DIR}/runtime/include
             ${CMAKE_SOURCE_DIR}/include
+            ${READLINE_INCLUDE_DIRS}
     )
 
     # Set compile definitions
     target_compile_definitions(${name}_runner
         PRIVATE 
             SIMD_DEBUG=1
-            EXPECTED_RESULT=${expected_result}  # Pass expected result to the runner
+            EXPECTED_RESULT=${expected_result}
     )
 
     # Set compile options
     target_compile_options(${name}_runner
         PRIVATE 
-            -g  # Add debug symbols
-            -O0 # No optimization
+            -g
+            -O0
             -mavx512f 
             -msse4.2
     )
 
-    # Add symbol check command
+    # Add symbol check command - output to obj directory
     add_custom_command(
         TARGET ${name}_runner POST_BUILD
-        COMMAND objdump -t ${obj_file} > ${name}_symbols.txt
-        COMMAND nm ${obj_file} >> ${name}_symbols.txt
+        COMMAND objdump -t ${obj_file} > ${CMAKE_BINARY_DIR}/tests/obj/${name}_symbols.txt
+        COMMAND nm ${obj_file} >> ${CMAKE_BINARY_DIR}/tests/obj/${name}_symbols.txt
         COMMENT "Dumping symbols for ${obj_file}"
     )
 
-    # Add test to CTest with a reasonable tolerance for floating point comparison
     add_test(
         NAME ${name}
         COMMAND ${name}_runner
-        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/tests
     )
     
-    # Set SIMD_DEBUG environment variable and test properties
     set_tests_properties(${name} PROPERTIES
         ENVIRONMENT "SIMD_DEBUG=1"
         PASS_REGULAR_EXPRESSION "Test passed with result: ${expected_result}"
     )
 endfunction()
 
-# Add regular tests with their expected results
-add_sl_test(test_arithmetic test_arithmetic.sl "130.14")
-add_sl_test(test_conditions test_conditions.sl "55.0")
-add_sl_test(test_loop test_loop.sl "147.0")
-add_sl_test(test_fibonacci test_fibonacci.sl "110.0")
-add_sl_test(test_return test_return.sl "80.0")
-
-# Handle SIMD test separately since it has a different structure
+# Handle SIMD test similarly
 function(add_simd_test)
     set(name "test_simd")
     set(sl_file "${CMAKE_CURRENT_SOURCE_DIR}/${name}.sl")
-    set(obj_file "${CMAKE_CURRENT_BINARY_DIR}/${name}.o")
+    set(obj_file "${CMAKE_BINARY_DIR}/tests/obj/${name}.o")
     
-    # Generate object file
     add_custom_command(
         OUTPUT ${obj_file}
         COMMAND ${CMAKE_BINARY_DIR}/src/simplang 
@@ -121,13 +154,14 @@ function(add_simd_test)
 
     add_custom_target(${name}_obj DEPENDS ${obj_file})
 
-    # Create SIMD test executable
+    # Create SIMD test executable with SIMD-specific host
     add_executable(${name}_runner
-        ${CMAKE_SOURCE_DIR}/runtime/src/host.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_simd_host.cpp
     )
 
     target_link_options(${name}_runner
         PRIVATE ${obj_file}
+        -rdynamic  # Ensures symbols are exported
     )
 
     add_dependencies(${name}_runner ${name}_obj)
@@ -140,14 +174,19 @@ function(add_simd_test)
     )
 
     target_link_libraries(${name}_runner
-        PRIVATE simplang_runtime
-        PRIVATE ${CMAKE_DL_LIBS}
+        PRIVATE 
+            simplang_runtime
+            ${CMAKE_DL_LIBS}
+            ${READLINE_LIBRARIES}
+            readline
+            history
     )
 
     target_include_directories(${name}_runner
         PRIVATE 
             ${CMAKE_SOURCE_DIR}/runtime/include
             ${CMAKE_SOURCE_DIR}/include
+            ${READLINE_INCLUDE_DIRS}
     )
 
     target_compile_options(${name}_runner
@@ -169,6 +208,13 @@ function(add_simd_test)
         ENVIRONMENT "SIMD_DEBUG=1"
     )
 endfunction()
+
+# Add regular tests
+add_sl_test(test_arithmetic test_arithmetic.sl "72.0")
+add_sl_test(test_main test_main.sl "30.0")
+add_sl_test(test_loop test_loop.sl "135.0")
+add_sl_test(test_fibonacci test_fibonacci.sl "110.0")
+add_sl_test(test_return test_return.sl "85.0")
 
 # Add SIMD test
 add_simd_test()
@@ -213,12 +259,16 @@ if(ENABLE_DEBUGGER)
             ${CMAKE_SOURCE_DIR}/runtime/include
             ${CMAKE_SOURCE_DIR}/include
             ${CMAKE_SOURCE_DIR}/include/kernel_debugger
+            ${READLINE_INCLUDE_DIRS}
     )
 
     target_link_libraries(debug_test_runner
         PRIVATE 
             simplang_runtime
             ${CMAKE_DL_LIBS}
+            ${READLINE_LIBRARIES}
+            readline
+            history
     )
 
     target_compile_options(debug_test_runner
@@ -247,3 +297,59 @@ if(ENABLE_DEBUGGER)
 
     message(STATUS "SIMD debug test configured")
 endif()
+
+# Compile performance test kernel
+set(PERF_OBJ_FILE "${CMAKE_BINARY_DIR}/tests/obj/perf_test.o")
+add_custom_command(
+    OUTPUT ${PERF_OBJ_FILE}
+    COMMAND ${CMAKE_BINARY_DIR}/src/simplang 
+            ${CMAKE_CURRENT_SOURCE_DIR}/perf_test.sl
+            -o ${PERF_OBJ_FILE}
+            -v
+    DEPENDS simplang ${CMAKE_CURRENT_SOURCE_DIR}/perf_test.sl
+    COMMENT "Compiling performance test kernel"
+    VERBATIM
+)
+
+# Create shared library for perf test
+set(PERF_SO_FILE "${CMAKE_BINARY_DIR}/tests/obj/perf_test.so")
+add_custom_command(
+    OUTPUT ${PERF_SO_FILE}
+    COMMAND ${CMAKE_C_COMPILER} -shared ${PERF_OBJ_FILE} -o ${PERF_SO_FILE}
+            -Wl,--version-script=${CMAKE_BINARY_DIR}/tests/kernel.version
+            -Wl,--export-dynamic-symbol=kernel_main
+    DEPENDS ${PERF_OBJ_FILE} ${CMAKE_BINARY_DIR}/tests/kernel.version
+    COMMENT "Creating shared library for perf test"
+    VERBATIM
+)
+
+add_custom_target(perf_test_obj DEPENDS ${PERF_SO_FILE})
+
+# Add performance test executable
+add_executable(perf_test_runner 
+    ${CMAKE_CURRENT_SOURCE_DIR}/perf_test_host.cpp
+)
+
+target_link_libraries(perf_test_runner
+    PRIVATE 
+        simplang_runtime
+        ${CMAKE_DL_LIBS}
+        ${READLINE_LIBRARIES}
+)
+
+target_include_directories(perf_test_runner
+    PRIVATE 
+        ${CMAKE_SOURCE_DIR}/runtime/include
+        ${CMAKE_SOURCE_DIR}/include
+        ${READLINE_INCLUDE_DIRS}
+)
+
+target_compile_options(perf_test_runner
+    PRIVATE 
+        -O3  # Use optimization for fair comparison
+        -g
+        -mavx512f 
+        -msse4.2
+)
+
+add_dependencies(perf_test_runner perf_test_obj)

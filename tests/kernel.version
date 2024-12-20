@@ -1,0 +1,6 @@
+{
+    global:
+        kernel_main;
+    local:
+        *;
+};

@@ -1,0 +1,9 @@
+build/
+*.o
+*.out
+.vscode/
+.idea/
+*.tab.*
+*.yy.*
+lexer.cpp
+parser.cpp

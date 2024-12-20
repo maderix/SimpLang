@@ -12,6 +12,9 @@ add_executable(simplang
     main.cpp
     ast.cpp
     codegen.cpp
+    simd_ops.cpp
+    simd_interface.cpp
+    
     ${BISON_Parser_OUTPUTS}
     ${FLEX_Scanner_OUTPUTS}
 )

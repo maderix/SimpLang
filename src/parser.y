@@ -13,6 +13,20 @@
     void yyerror(const char *s) { 
         fprintf(stderr, "Error: %s at symbol \"%s\" on line %d\n", s, yytext, yylineno);
     }
+
+    // Add helper function to convert raw pointers to unique_ptr
+    std::unique_ptr<ExprAST> makeUnique(ExprAST* ptr) {
+        return std::unique_ptr<ExprAST>(ptr);
+    }
+    
+    // Helper to convert vector of raw pointers to vector of unique_ptr
+    std::vector<std::unique_ptr<ExprAST>> makeUniqueVector(const std::vector<ExprAST*>& ptrs) {
+        std::vector<std::unique_ptr<ExprAST>> result;
+        for (auto ptr : ptrs) {
+            result.push_back(std::unique_ptr<ExprAST>(ptr));
+        }
+        return result;
+    }
 %}
 
 %define parse.trace
@@ -37,18 +51,21 @@
 %token <string> TIDENTIFIER TINTEGER TFLOAT TINTLIT
 %token TCEQ TCNE TCLE TCGE
 %token TVAR TFUNC TIF TELSE TWHILE TRETURN
+%token TSSE TAVX    /* Vector creation tokens */
 %token TLPAREN TRPAREN TLBRACE TRBRACE
 %token TCOMMA TSEMICOLON
-/* Slice tokens */
 %token TMAKE TSSESLICE TAVXSLICE TLBRACKET TRBRACKET
+%token UNARY_MINUS  /* Add this token for unary minus */
+%token TOK_MOD
 
 %left TLBRACKET    /* For array subscripting */
 %left '+' '-'
-%left '*' '/'
+%left '*' '/' TOK_MOD
+%left UNARY_MINUS  /* Add precedence for unary minus */
 
 %type <block> program stmts block
 %type <stmt> stmt func_decl if_stmt while_stmt return_stmt
-%type <expr> expr numeric slice_expr slice_access call_expr
+%type <expr> expr numeric slice_expr slice_access call_expr vector_expr  /* Add vector_expr here */
 %type <var_expr> ident
 %type <exprvec> call_args expr_list
 %type <varvec> func_decl_args
@@ -72,27 +89,40 @@ stmt : var_decl TSEMICOLON { $$ = $1; }
      | while_stmt
      ;
 
-expr : expr '+' expr   { $$ = new BinaryExprAST(OpAdd, $1, $3); }
-     | expr '-' expr   { $$ = new BinaryExprAST(OpSub, $1, $3); }
-     | expr '*' expr   { $$ = new BinaryExprAST(OpMul, $1, $3); }
-     | expr '/' expr   { $$ = new BinaryExprAST(OpDiv, $1, $3); }
-     | '-' expr %prec UNARY_MINUS { $$ = new UnaryExprAST(OpNeg, $2); }
-     | expr TCEQ expr  { $$ = new BinaryExprAST(OpEQ, $1, $3); }
-     | expr TCNE expr  { $$ = new BinaryExprAST(OpNE, $1, $3); }
-     | expr '<' expr   { $$ = new BinaryExprAST(OpLT, $1, $3); }  
-     | expr '>' expr   { $$ = new BinaryExprAST(OpGT, $1, $3); }
-     | expr TCLE expr  { $$ = new BinaryExprAST(OpLE, $1, $3); }
-     | expr TCGE expr  { $$ = new BinaryExprAST(OpGE, $1, $3); }
+expr : expr '+' expr   { $$ = new BinaryExprAST(static_cast<BinaryOp>('+'), makeUnique($1), makeUnique($3)); }
+     | expr '-' expr   { $$ = new BinaryExprAST(static_cast<BinaryOp>('-'), makeUnique($1), makeUnique($3)); }
+     | expr '*' expr   { $$ = new BinaryExprAST(static_cast<BinaryOp>('*'), makeUnique($1), makeUnique($3)); }
+     | expr '/' expr   { $$ = new BinaryExprAST(static_cast<BinaryOp>('/'), makeUnique($1), makeUnique($3)); }
+     | expr TOK_MOD expr   { $$ = new BinaryExprAST(BinaryOp::OpMod, makeUnique($1), makeUnique($3)); }
+     | '-' expr %prec UNARY_MINUS { $$ = new UnaryExprAST(OpNeg, makeUnique($2)); }
+     | expr TCEQ expr  { $$ = new BinaryExprAST(BinaryOp::OpEQ, makeUnique($1), makeUnique($3)); }
+     | expr TCNE expr  { $$ = new BinaryExprAST(BinaryOp::OpNE, makeUnique($1), makeUnique($3)); }
+     | expr '<' expr   { $$ = new BinaryExprAST(BinaryOp::OpLT, makeUnique($1), makeUnique($3)); }
+     | expr '>' expr   { $$ = new BinaryExprAST(BinaryOp::OpGT, makeUnique($1), makeUnique($3)); }
+     | expr TCLE expr  { $$ = new BinaryExprAST(BinaryOp::OpLE, makeUnique($1), makeUnique($3)); }
+     | expr TCGE expr  { $$ = new BinaryExprAST(BinaryOp::OpGE, makeUnique($1), makeUnique($3)); }
      | TLPAREN expr TRPAREN { $$ = $2; }
-     | ident '=' expr  { $$ = new AssignmentExprAST($1, $3); }
-     | slice_access '=' expr { $$ = new SliceStoreExprAST(((SliceAccessExprAST*)$1)->getName(), 
-                                                         ((SliceAccessExprAST*)$1)->getIndex(), $3); }
+     | ident '=' expr  { $$ = new AssignmentExprAST($1, makeUnique($3)); }
+     | slice_access '=' expr { 
+         $$ = new SliceStoreExprAST(
+             ((SliceAccessExprAST*)$1)->getName(), 
+             ((SliceAccessExprAST*)$1)->getIndex(), 
+             makeUnique($3)
+         ); 
+     }
      | call_expr       { $$ = $1; }
      | slice_access    { $$ = $1; }
      | ident           { $$ = $1; }
      | numeric         { $$ = $1; }
      | slice_expr      { $$ = $1; }
+     | vector_expr     { $$ = $1; }
      ;
+
+vector_expr : TSSE TLPAREN expr_list TRPAREN 
+             { $$ = new VectorCreationExprAST(makeUniqueVector(*$3), false); }
+           | TAVX TLPAREN expr_list TRPAREN 
+             { $$ = new VectorCreationExprAST(makeUniqueVector(*$3), true); }
+           ;
 
 block : TLBRACE stmts TRBRACE { $$ = $2; }
       | TLBRACE TRBRACE { $$ = new BlockAST(); }
