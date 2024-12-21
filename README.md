@@ -1,170 +1,91 @@
-# SimpleLang
+Okay, here's a significantly reorganized and cleaned-up version of the SimpleLang documentation, aiming for better clarity, conciseness, and logical flow.
 
-A domain-specific language (DSL) designed for SIMD hardware optimization, particularly focused on deep learning applications. SimpleLang provides high-level abstractions for SIMD operations with powerful debugging and runtime infrastructure.
+## SimpleLang: A Domain-Specific Language for SIMD Optimization
 
-## Architecture Overview
+SimpleLang is a domain-specific language (DSL) designed to facilitate SIMD hardware optimization, particularly for deep learning applications. It provides high-level abstractions for SIMD operations, coupled with robust debugging and runtime infrastructure.
 
-### Host-Kernel Interface
+## Core Concepts
 
-The way SimpleLang talks to your main program (the "host") is designed to be straightforward and reliable. Think of it like having a specialized worker (the kernel) that your main program can call on to do specific tasks.
+### Host-Kernel Architecture
 
-### How It Works
+SimpleLang employs a Host-Kernel architecture. Your main application (the **host**, typically written in C++) interacts with specialized, compiled SimpleLang code (the **kernel**) to perform computationally intensive tasks.
 
-When you write a program using SimpleLang, it creates two main parts:
+**Key Benefits:**
 
-1. **Your Main Program (The Host)**
-   This is where you control everything. It's like the manager of your application. You write this in regular C++ and it handles things like:
-   - Loading your SimpleLang code
-   - Sending it data to work on
-   - Getting results back
-   - Handling any errors that might happen
+* **Modularity:** Kernels can be changed or updated without recompiling the entire host application.
+* **Specialization:**  Kernels are optimized for specific SIMD tasks.
+* **Isolation:** Kernel crashes are contained, preventing host application failure.
 
-2. **The SimpleLang Code (The Kernel)**
-   This is your specialized worker. It's compiled into a separate file (a .so file on Linux) that your main program can load when needed. This separation means you can:
-   - Change the kernel without recompiling your whole program
-   - Load different kernels for different tasks
-   - Keep your main program safe if the kernel crashes
+### Workflow
 
-### Using It In Practice
+1. **Write SimpleLang Kernel Code:** Define your SIMD-optimized logic within a SimpleLang kernel.
+2. **Compile Kernel:** The SimpleLang compiler transforms your code into a shared library (e.g., `.so` on Linux).
+3. **Integrate with Host Program:**  Your C++ host application loads and executes the compiled kernel.
 
-Here's what it looks like in real use:
+### Safety and Reliability
 
-1. First, you write your SimpleLang code:
-```simplang
-fn kernel_main() {
-    // Your specialized code here
-    return result;
-}
-```
+SimpleLang prioritizes safety and reliability through:
 
-2. Then, in your main program, you can use it like this:
-```cpp
-KernelRunner runner;
-runner.loadLibrary("./my_kernel.so");
-double result = runner.runKernel();
-```
+* **Robust Error Handling:**  Provides informative error messages for easier debugging.
+* **Automatic Resource Management:** Ensures proper cleanup of memory and other resources.
+* **Type Safety:**  Enforces data type consistency between the host and kernel.
 
-### Safety Features
+## Compiler Pipeline: From Source to Execution
 
-We've built in several safety measures:
+The SimpleLang compiler transforms your code through a series of stages:
 
-- **Error Handling**: If something goes wrong, you get clear error messages, not mysterious crashes
-- **Resource Management**: Memory and other resources are automatically cleaned up
-- **Type Safety**: The interface ensures data is passed correctly between your program and the kernel
+1. **Lexical Analysis (Text to Tokens):** The source code is broken down into fundamental units called tokens (keywords, identifiers, operators, etc.).
 
-### Debugging Support
-
-When you're developing, you can:
-- Step through your kernel code
-- Inspect variables
-- Set breakpoints
-- Monitor performance
-
-This makes it much easier to find and fix problems.
-
-### Performance Considerations
-
-The interface is designed to be lightweight. There's very little overhead when:
-- Loading kernels
-- Passing data back and forth
-- Running kernel code
-
-This means you can focus on making your actual computations fast without worrying about the communication between your program and the kernel slowing things down.
-
-### Compiler Pipeline
-
-When you write SimpleLang code, it goes through several steps to turn into something your computer can run. Let's break down this journey:
-
-### From Text to Tokens
-
-First, your code gets broken down into meaningful pieces (we call these tokens). It's like taking a sentence and identifying the nouns, verbs, and other parts of speech. For example:
-
-```simplang
-fn add(var x, var y) {
-    return x + y;
-}
-```
-
-Gets broken into pieces like:
-- `fn` (this tells us it's a function)
-- `add` (the function's name)
-- `var` (tells us what kind of things we're working with)
-- `x`, `y` (the names we gave our variables)
-- `+` (the operation we want to do)
-
-This step catches basic errors like misspelled keywords or missing punctuation.
-
-### Understanding Structure
-
-Next, SimpleLang figures out how all these pieces fit together. It's like understanding that in "The cat sat on the mat", "the cat" is the subject and "sat" is what it's doing.
-
-The compiler builds what we call an Abstract Syntax Tree (AST). Think of it like an outline:
-- Function `add`
-  - Parameters: `x`, `y`
-  - Body:
-    - Return statement
-      - Addition operation
-        - Left side: `x`
-        - Right side: `y`
-
-This helps catch logical errors, like trying to add a number to a function.
-
-### Making It Fast
-
-Once SimpleLang understands your code, it works on making it run efficiently. This happens in several stages:
-
-1. **Basic Improvements**
-   - Combining simple operations
-   - Removing unnecessary steps
-   - Organizing calculations better
-
-2. **SIMD Optimization**
-   When possible, SimpleLang converts your code to use special CPU instructions that can do multiple calculations at once. For example, instead of:
+   ```simplang
+   fn add(var x, var y) {
+       return x + y;
+   }
    ```
-   a + b
-   c + d
+
+   **Tokens Example:** `fn`, `add`, `(`, `var`, `x`, `,`, `var`, `y`, `)`, `{`, `return`, `x`, `+`, `y`, `}`,
+
+   This stage identifies syntax errors like misspelled keywords.
+
+2. **Syntactic Analysis (Understanding Structure):** The compiler analyzes the token stream to build an Abstract Syntax Tree (AST), representing the code's structure and relationships between elements.
+
+   **AST Example (Simplified):**
+
    ```
-   It might do both additions simultaneously.
+   Function: add
+     Parameters: x, y
+     Body:
+       Return Statement:
+         Binary Operation: +
+           Left Operand: x
+           Right Operand: y
+   ```
 
-3. **Memory Optimization**
-   The compiler tries to arrange your data in ways that work best with modern computers:
-   - Keeping related data close together
-   - Aligning data properly for fast access
-   - Minimizing memory moves
+   This stage detects logical errors, such as incorrect operator usage.
 
-### Final Output
+3. **Optimization:** The compiler applies various optimizations to improve performance:
 
-The end result is a shared library (.so file) that contains your optimized code. This file:
-- Can be loaded by your main program
-- Contains debug information to help you fix problems
-- Is ready for the CPU to execute efficiently
+   * **Basic Optimizations:** Simplifies expressions, removes redundant operations, and reorders calculations.
+   * **SIMD Optimization:** Leverages CPU instructions to perform multiple operations in parallel (e.g., using SSE or AVX).
+   * **Memory Optimization:**  Arranges data for efficient access, including data alignment and minimizing unnecessary memory transfers.
 
-### Development Experience
+4. **Code Generation (Final Output):** The optimized code is translated into a shared library (e.g., `.so`). This library includes:
 
-We've made sure the compiler gives helpful feedback:
+   * **Executable Code:**  Machine code ready for execution.
+   * **Debug Information:**  Facilitates debugging by mapping source code to machine code.
 
-- **Clear Error Messages**
-  Instead of cryptic errors, you get messages that point to the problem and suggest fixes.
+**Development Experience:**
 
-- **Warning System**
-  The compiler warns you about potential problems before they become bugs.
+* **Clear Error Messages:**  Provides specific and helpful error messages to pinpoint issues.
+* **Warnings:**  Alerts developers to potential problems that might not be immediate errors.
+* **Debug Information:** Enables source-level debugging.
 
-- **Debug Information**
-  The compiler includes information that helps you track down problems when they occur.
+**Performance Focus:** The compiler is designed to generate highly efficient code by leveraging modern CPU features, SIMD instructions, and cache-friendly memory layouts.
 
-### Performance Focus
+## Debugging Infrastructure
 
-The compiler is designed to create fast code:
-- It knows about modern CPU features
-- It can use special instructions for math operations
-- It organizes your code to work well with the CPU's cache
-- It can often spot and fix inefficient patterns automatically
+SimpleLang provides a robust debugging infrastructure for inspecting kernel behavior with minimal performance impact when disabled.
 
-### Debug Infrastructure
-
-SimpleLang's debugging infrastructure provides comprehensive introspection capabilities while maintaining performance. The system is designed for minimal overhead when disabled and detailed inspection when needed.
-
-### Core Architecture
+**Core Architecture:**
 
 ```
 Host Program <-> Debug Interface <-> Kernel Runtime
@@ -176,93 +97,26 @@ Host Program <-> Debug Interface <-> Kernel Runtime
      +-- Control <---+-- Breakpoints     |
 ```
 
-The debugger integrates directly with the kernel runtime, providing:
-- Hardware breakpoint support with minimal overhead
-- Real-time memory tracking and leak detection
-- Full call stack inspection with variable state
-- Asynchronous event handling for UI responsiveness
+**Key Features:**
 
-### Breakpoint Implementation
+* **Hardware and Software Breakpoints:** Supports setting breakpoints using hardware registers (minimal overhead) or software interrupts.
+    * **Zero Overhead (Disabled):** Breakpoint checks have negligible performance impact when not active.
+    * **Conditional Breakpoints:**  Break execution based on specific conditions.
+    * **Source-Level Mapping:**  Relate breakpoints to specific lines of SimpleLang code.
+* **Memory Tracking:**  Monitors memory allocation and usage to detect leaks and analyze patterns.
+    * **SIMD Alignment Verification:** Ensures data is correctly aligned for SIMD operations.
+    * **Vector Operation Tracking:** Monitors memory access during vector operations.
+    * **Memory Access Pattern Analysis:** Helps identify inefficient memory access.
+* **Call Stack Inspection:** Provides detailed call stack information, including function arguments and local variable states.
+    * **SIMD Register Inspection:** Examine the contents of SIMD registers.
+    * **Vector Operation Flow:** Track the execution of vector operations.
+    * **Memory Access Analysis:**  Analyze memory access patterns within the call stack.
+* **Asynchronous Event Processing:**  Handles debugging events efficiently without blocking kernel execution.
+    * **Lock-Free Queue:**  Utilizes lock-free data structures for high-throughput event processing.
+    * **Configurable Buffering:**  Allows customization of event buffering strategies.
+    * **Real-time Filtering:**  Filter specific debugging events.
 
-The breakpoint system uses hardware debugging registers when available, falling back to software interrupts when needed:
-
-```
-Code Execution    Breakpoint Handler    Debug Interface
-    |                    |                    |
-    |   [INT3/DR0-3]    |                    |
-    |------------------->|                    |
-    |                    |    [State Sync]    |
-    |                    |------------------->|
-    |   [Resume/Step]    |                    |
-    |<-------------------|                    |
-```
-
-Key features:
-- Zero-overhead when disabled
-- Conditional breakpoints with expression evaluation
-- Non-blocking UI updates during long operations
-- Source-level to machine code mapping
-
-### Memory Tracking System
-
-Memory tracking is implemented through runtime hooks with configurable granularity:
-
-```
-Allocation Path    Tracking System    Analysis
-    |                    |               |
-    +-> malloc/free     [|]  Stats      |
-    |                   [|]  Leaks      |
-    +-> SIMD alloc      [|]  Patterns   |
-    |                   [|]  Alignment  |
-    +-> Pool alloc      [|]  Usage      |
-```
-
-Features targeted at SIMD development:
-- SIMD alignment verification
-- Vector operation tracking
-- Memory access pattern analysis
-- Pool allocation statistics
-
-### Call Stack Integration
-
-The call stack system provides both runtime inspection and post-mortem analysis:
-
-```
-[Top] kernel_main()
-      ├── vector_multiply()  // Args: (float*, float*, size_t)
-      │   └── simd_mul_ps() // Vec registers: xmm0-xmm7
-      └── reduce_sum()      // Alignment: 32-byte
-```
-
-Developers can:
-- Inspect SIMD register state
-- Track vector operation flow
-- Analyze memory access patterns
-- Profile hot paths in real-time
-
-### Event Processing
-
-The event system is designed for high-throughput debugging scenarios:
-
-```
-Producer                Consumer
-   |                       |
-   |  [Lock-Free Queue]    |
-   +---------------------->|
-   |   Debug Events       [|]
-   |   Memory Ops         [|]
-   |   Profile Data       [|]
-   |                       |
-   +---------------------->|
-```
-
-Optimized for:
-- Lock-free event processing
-- Minimal impact on kernel execution
-- Configurable buffering strategies
-- Real-time event filtering
-
-### Integration Example
+**Integration Example (C++ Host):**
 
 ```cpp
 // Attach debugger with custom configuration
@@ -279,56 +133,42 @@ runner.debugger().onMemoryLeak([](const LeakInfo& info) {
 });
 ```
 
-### Performance Characteristics
+**Performance Characteristics (Approximate):**
 
-With selective feature enabling:
-- Breakpoints: ~1 cycle when not hit
-- Memory tracking: 2-5% overhead
-- Call stack: 1-3% overhead
-- Event system: <1% with buffering
+* **Breakpoints (inactive):** Near zero overhead.
+* **Memory Tracking:** 2-5% overhead.
+* **Call Stack Inspection:** 1-3% overhead.
+* **Event System:** <1% overhead with buffering.
+
+## Core Language Features
 
 ### SIMD Operations
 
-Native support for SIMD operations:
+SimpleLang offers native support for SIMD operations, abstracting the underlying hardware details:
 
-1. **SSE Support**
-   - 128-bit vector operations
-   - Aligned memory access
-   - Optimized math functions
-
-2. **AVX Support**
-   - 256-bit vector operations
-   - Advanced vector extensions
-   - Hardware-specific optimizations
+* **SSE Support:**  Provides 128-bit vector operations with aligned memory access and optimized math functions.
+* **AVX Support:**  Offers 256-bit vector operations with advanced vector extensions and hardware-specific optimizations.
 
 ### Runtime System
 
-The runtime provides essential services:
+The SimpleLang runtime environment provides essential services for kernel execution:
 
-1. **Memory Management**
-   - SIMD-aligned allocations
-   - Memory pool optimization
-   - Garbage collection (optional)
-
-2. **Error Handling**
-   - Exception propagation
-   - Error recovery
-   - Debug information
-
-3. **Performance Monitoring**
-   - Operation timing
-   - Memory usage tracking
-   - Optimization hints
+* **Memory Management:**
+    * **SIMD-Aligned Allocations:** Ensures memory is aligned for optimal SIMD performance.
+    * **Memory Pool Optimization:**  Improves allocation efficiency for frequently used memory blocks.
+    * **Optional Garbage Collection:**  Can automatically manage memory, reducing manual memory management.
+* **Error Handling:**  Manages exceptions and provides mechanisms for error recovery and debugging information.
+* **Performance Monitoring:** Tracks operation timing, memory usage, and provides hints for potential optimizations.
 
 ## Implementation Example
 
-### Writing a Kernel
+### SimpleLang Kernel (`kernel.sl`)
 
 ```simplang
 fn bounded_sum(var n) {
     var sum = 0.0;
     var i = 1.0;
-    
+
     while (i <= n) {
         sum = (sum + i) % 10000.0;
         i = i + 1.0;
@@ -342,22 +182,23 @@ fn kernel_main() {
 }
 ```
 
-### Host Program Integration
+### Host Program Integration (C++)
 
 ```cpp
 #include "kernel_runner.hpp"
+#include <iostream>
 
 int main() {
     try {
         KernelRunner runner;
-        runner.loadLibrary("./kernel.so");
-        
+        runner.loadLibrary("./kernel.so"); // Assuming kernel.so is the compiled output
+
         // Optional: Enable debugging
-        runner.attachDebugger();
-        
+        // runner.attachDebugger();
+
         // Run kernel and get result
         double result = runner.runKernel();
-        
+
         std::cout << "Result: " << result << std::endl;
         return 0;
     } catch (const std::exception& e) {
@@ -367,43 +208,41 @@ int main() {
 }
 ```
 
-## Performance Characteristics
+## Performance Characteristics (Typical)
 
-Recent benchmarks show:
-- JIT compilation overhead: < 1ms
-- SIMD operation performance: ~1.3x slower than optimized C++
-- Memory overhead: ~2MB per kernel instance
-- Debug mode overhead: ~5% in typical usage
+* **JIT Compilation Overhead:** < 1 millisecond.
+* **SIMD Operation Performance:** Approximately 1.3x slower than highly optimized native C++ (trade-off for abstraction and ease of use).
+* **Memory Overhead:**  Around 2MB per kernel instance.
+* **Debug Mode Overhead:**  Approximately 5% in typical usage scenarios.
 
 ## Development Workflow
 
-1. Write SimpleLang kernel code
-2. Compile to shared library
-3. Integrate with host program
-4. Debug using built-in tools
-5. Profile and optimize
+1. **Write SimpleLang Kernel Code:** Create your SIMD-optimized logic in `.sl` files.
+2. **Compile Kernel:** Use the SimpleLang compiler to generate a shared library (e.g., `kernel.so`).
+3. **Integrate with Host Program:** Load and interact with the compiled kernel from your C++ application using the provided `KernelRunner` API.
+4. **Debug:** Utilize the built-in debugging infrastructure to step through code, inspect variables, and analyze performance.
+5. **Profile and Optimize:**  Identify performance bottlenecks and refine your SimpleLang code or compiler settings.
 
 ## Future Directions
 
-1. **Language Extensions**
-   - Advanced type system
-   - Template support
-   - Meta-programming capabilities
-
-2. **Optimization Improvements**
-   - Auto-vectorization
-   - Pattern-based optimizations
-   - Hardware-specific tuning
-
-3. **Tooling**
-   - IDE integration
-   - Visual debugger
-   - Performance analyzer
+* **Language Extensions:**
+    * Advanced type system for more robust code.
+    * Template support for generic programming.
+    * Meta-programming capabilities for compile-time code generation.
+* **Optimization Improvements:**
+    * Auto-vectorization to automatically generate SIMD code from scalar operations.
+    * Pattern-based optimizations to recognize and optimize common code patterns.
+    * Hardware-specific tuning to leverage unique features of different processor architectures.
+* **Tooling:**
+    * IDE integration with syntax highlighting, code completion, and debugging support.
+    * Visual debugger for a more intuitive debugging experience.
+    * Performance analyzer to provide detailed performance insights.
 
 ## Contributing
 
-See CONTRIBUTING.md for guidelines on:
-- Code style
-- Testing requirements
-- Pull request process
-- Documentation standards 
+For information on how to contribute to SimpleLang development, please refer to the `CONTRIBUTING.md` file. This includes guidelines for:
+
+* **Code Style:**  Ensuring consistent and readable code.
+* **Testing Requirements:**  Writing thorough unit and integration tests.
+* **Pull Request Process:**  Submitting changes effectively.
+* **Documentation Standards:**  Maintaining clear and up-to-date documentation.
