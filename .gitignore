@@ -1,9 +1,51 @@
+# Build directories
 build/
+out/
+cmake-build-*/
+
+# Generated files
 *.o
+*.so
+*.a
+*.ll
+*.bc
+*.s
+*.exe
 *.out
-.vscode/
+
+# IDE specific
 .idea/
-*.tab.*
-*.yy.*
-lexer.cpp
-parser.cpp
+.vscode/
+*.swp
+*.swo
+.vs/
+*.user
+*.suo
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+
+# Compiler specific
+compile_commands.json
+.cache/
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# OS specific
+.DS_Store
+.directory
+Thumbs.db
+
+# Project specific
+kernel.version
+tests/obj/
+tests/*.ll
+tests/*.o
+tests/*.so
