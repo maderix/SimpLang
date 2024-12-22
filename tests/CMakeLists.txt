@@ -13,6 +13,9 @@ pkg_check_modules(READLINE readline REQUIRED)
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/tests/obj)
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/tests/ir)
 
+# Create all_test_runners target
+add_custom_target(all_test_runners)
+
 # Function to add a test
 function(add_sl_test name sl_file expected_result)
     # Get filename without .sl extension
@@ -75,6 +78,9 @@ function(add_sl_test name sl_file expected_result)
     )
 
     add_dependencies(${name}_runner ${name}_obj)
+
+    # Add to all_test_runners target
+    add_dependencies(all_test_runners ${name}_runner)
 
     # Link with runtime library and dynamic linker
     target_link_libraries(${name}_runner
@@ -166,6 +172,9 @@ function(add_simd_test)
 
     add_dependencies(${name}_runner ${name}_obj)
 
+    # Add to all_test_runners target
+    add_dependencies(all_test_runners ${name}_runner)
+
     # Configure SIMD test
     target_compile_definitions(${name}_runner
         PRIVATE 
@@ -218,6 +227,9 @@ add_sl_test(test_return test_return.sl "85.0")
 
 # Add SIMD test
 add_simd_test()
+
+# Add performance test runner to all_test_runners
+add_dependencies(all_test_runners perf_test_runner)
 
 # Debug test specific section
 if(ENABLE_DEBUGGER)
@@ -296,6 +308,9 @@ if(ENABLE_DEBUGGER)
     )
 
     message(STATUS "SIMD debug test configured")
+
+    # Add to all_test_runners target
+    add_dependencies(all_test_runners debug_test_runner)
 endif()
 
 # Compile performance test kernel

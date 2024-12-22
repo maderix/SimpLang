@@ -1,25 +1,28 @@
 #include "kernel_runner.hpp"
 #include <iostream>
 
-double host_main() {
+int main(int argc, char* argv[]) {
+    if (argc != 2) {
+        std::cerr << "Usage: " << argv[0] << " <kernel.so>" << std::endl;
+        return 1;
+    }
+
+    KernelRunner runner;
+    
     try {
-        KernelRunner runner;
-        runner.loadLibrary("./test_simd.so");
-        return runner.runKernel();
+        runner.loadLibrary(argv[1]);
+        double result = runner.runKernel();
+        
+        std::cout << "Result: " << result << std::endl;
+        
+        // Verify SIMD operations worked correctly
+        bool passed = (result > 0.0);  // Add specific test condition if needed
+        std::cout << "Test " << (passed ? "PASSED! ✓" : "FAILED! ✗") << std::endl;
+        
+        return passed ? 0 : 1;
+        
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
-        return -1.0;
+        return 1;
     }
-}
-
-int main() {
-    double result = host_main();
-    
-    std::cout << "Result: " << result << std::endl;
-    
-    // Verify SIMD operations worked correctly
-    bool passed = (result > 0.0);  // Add specific test condition if needed
-    std::cout << "Test " << (passed ? "PASSED! ✓" : "FAILED! ✗") << std::endl;
-    
-    return passed ? 0 : 1;
 } 
