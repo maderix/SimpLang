@@ -1,14 +1,121 @@
-Okay, here's a significantly reorganized and cleaned-up version of the SimpleLang documentation, aiming for better clarity, conciseness, and logical flow.
+# SimpLang: A Domain-Specific Language for SIMD Optimization
 
-## SimpleLang: A Domain-Specific Language for SIMD Optimization
+SimpLang is a domain-specific language (DSL) designed to facilitate SIMD hardware optimization, particularly for deep learning applications. It provides high-level abstractions for SIMD operations, coupled with robust debugging and runtime infrastructure.
 
-SimpleLang is a domain-specific language (DSL) designed to facilitate SIMD hardware optimization, particularly for deep learning applications. It provides high-level abstractions for SIMD operations, coupled with robust debugging and runtime infrastructure.
+## Getting Started
+
+### Prerequisites
+
+- LLVM 14 or later
+- CMake 3.20+
+- C++17 compatible compiler
+- Boost libraries
+
+```bash
+# Ubuntu/Debian
+sudo apt update
+sudo apt install -y \
+    llvm-14-dev \
+    clang-14 \
+    cmake \
+    libboost-dev
+```
+
+### Building SimpLang
+
+You have two options for building:
+
+1. **Using build script (recommended)**
+```bash
+./build.sh
+```
+
+2. **Manual CMake build**
+```bash
+# Configure with SIMD debugging enabled
+cmake -B build -DSIMD_DEBUG=ON
+
+# Build the compiler
+cmake --build build --target simplang
+```
+
+### Running Tests
+
+Execute the test suite using:
+```bash
+./run_tests.sh
+```
+
+### Using SimpLang
+
+1. **Compile a SimpLang Kernel**
+```bash
+# Syntax: ./build/src/simplang <input_file.sl>
+./build/src/simplang my_kernel.sl
+```
+
+2. **Run a Compiled Kernel**
+```bash
+# Syntax: ./build/tests/test_loop_runner <path_to_compiled_kernel.so>
+./build/tests/test_loop_runner ./build/tests/obj/test_loop.so
+```
+
+### Example Workflow
+
+1. Create a SimpLang kernel (`test_loop.sl`):
+```simplang
+fn kernel_main() {
+    var sum = 0.0;
+    var i = 1.0;
+    
+    while (i <= 100.0) {
+        sum = sum + i;
+        i = i + 1.0;
+    }
+    return sum;
+}
+```
+
+2. Compile the kernel:
+```bash
+./build/src/simplang test_loop.sl
+```
+
+3. Run the compiled kernel:
+```bash
+./build/tests/test_loop_runner ./build/tests/obj/test_loop.so
+```
+
+### Development Tips
+
+- Enable SIMD debugging for detailed vector operation insights:
+```bash
+cmake -B build -DSIMD_DEBUG=ON
+```
+
+- Use the test runner for quick iteration:
+```bash
+# Compile and run in one step
+./run_tests.sh
+```
+
+### Common Issues
+
+1. **Build Failures**
+   - Ensure LLVM 14 is installed and in PATH
+   - Check that all dependencies are installed
+   - Verify CMake version is 3.20 or higher
+
+2. **Runtime Issues**
+   - Verify kernel compilation succeeded
+   - Check shared library paths
+   - Enable SIMD_DEBUG for detailed error messages
 
 ## Core Concepts
 
 ### Host-Kernel Architecture
 
-SimpleLang employs a Host-Kernel architecture. Your main application (the **host**, typically written in C++) interacts with specialized, compiled SimpleLang code (the **kernel**) to perform computationally intensive tasks.
+SimpLang employs a Host-Kernel architecture. Your main application (the **host**, typically written in C++) interacts with specialized, compiled SimpLang code (the **kernel**) to perform computationally intensive tasks.
 
 **Key Benefits:**
 
@@ -18,13 +125,13 @@ SimpleLang employs a Host-Kernel architecture. Your main application (the **host
 
 ### Workflow
 
-1. **Write SimpleLang Kernel Code:** Define your SIMD-optimized logic within a SimpleLang kernel.
-2. **Compile Kernel:** The SimpleLang compiler transforms your code into a shared library (e.g., `.so` on Linux).
+1. **Write SimpLang Kernel Code:** Define your SIMD-optimized logic within a SimpLang kernel.
+2. **Compile Kernel:** The SimpLang compiler transforms your code into a shared library (e.g., `.so` on Linux).
 3. **Integrate with Host Program:**  Your C++ host application loads and executes the compiled kernel.
 
 ### Safety and Reliability
 
-SimpleLang prioritizes safety and reliability through:
+SimpLang prioritizes safety and reliability through:
 
 * **Robust Error Handling:**  Provides informative error messages for easier debugging.
 * **Automatic Resource Management:** Ensures proper cleanup of memory and other resources.
@@ -32,7 +139,7 @@ SimpleLang prioritizes safety and reliability through:
 
 ## Compiler Pipeline: From Source to Execution
 
-The SimpleLang compiler transforms your code through a series of stages:
+The SimpLang compiler transforms your code through a series of stages:
 
 1. **Lexical Analysis (Text to Tokens):** The source code is broken down into fundamental units called tokens (keywords, identifiers, operators, etc.).
 
@@ -83,7 +190,7 @@ The SimpleLang compiler transforms your code through a series of stages:
 
 ## Debugging Infrastructure
 
-SimpleLang provides a robust debugging infrastructure for inspecting kernel behavior with minimal performance impact when disabled.
+SimpLang provides a robust debugging infrastructure for inspecting kernel behavior with minimal performance impact when disabled.
 
 **Core Architecture:**
 
@@ -102,7 +209,7 @@ Host Program <-> Debug Interface <-> Kernel Runtime
 * **Hardware and Software Breakpoints:** Supports setting breakpoints using hardware registers (minimal overhead) or software interrupts.
     * **Zero Overhead (Disabled):** Breakpoint checks have negligible performance impact when not active.
     * **Conditional Breakpoints:**  Break execution based on specific conditions.
-    * **Source-Level Mapping:**  Relate breakpoints to specific lines of SimpleLang code.
+    * **Source-Level Mapping:**  Relate breakpoints to specific lines of SimpLang code.
 * **Memory Tracking:**  Monitors memory allocation and usage to detect leaks and analyze patterns.
     * **SIMD Alignment Verification:** Ensures data is correctly aligned for SIMD operations.
     * **Vector Operation Tracking:** Monitors memory access during vector operations.
@@ -144,14 +251,14 @@ runner.debugger().onMemoryLeak([](const LeakInfo& info) {
 
 ### SIMD Operations
 
-SimpleLang offers native support for SIMD operations, abstracting the underlying hardware details:
+SimpLang offers native support for SIMD operations, abstracting the underlying hardware details:
 
 * **SSE Support:**  Provides 128-bit vector operations with aligned memory access and optimized math functions.
 * **AVX Support:**  Offers 256-bit vector operations with advanced vector extensions and hardware-specific optimizations.
 
 ### Runtime System
 
-The SimpleLang runtime environment provides essential services for kernel execution:
+The SimpLang runtime environment provides essential services for kernel execution:
 
 * **Memory Management:**
     * **SIMD-Aligned Allocations:** Ensures memory is aligned for optimal SIMD performance.
@@ -162,7 +269,7 @@ The SimpleLang runtime environment provides essential services for kernel execut
 
 ## Implementation Example
 
-### SimpleLang Kernel (`kernel.sl`)
+### SimpLang Kernel (`kernel.sl`)
 
 ```simplang
 fn bounded_sum(var n) {
@@ -217,11 +324,11 @@ int main() {
 
 ## Development Workflow
 
-1. **Write SimpleLang Kernel Code:** Create your SIMD-optimized logic in `.sl` files.
-2. **Compile Kernel:** Use the SimpleLang compiler to generate a shared library (e.g., `kernel.so`).
+1. **Write SimpLang Kernel Code:** Create your SIMD-optimized logic in `.sl` files.
+2. **Compile Kernel:** Use the SimpLang compiler to generate a shared library (e.g., `kernel.so`).
 3. **Integrate with Host Program:** Load and interact with the compiled kernel from your C++ application using the provided `KernelRunner` API.
 4. **Debug:** Utilize the built-in debugging infrastructure to step through code, inspect variables, and analyze performance.
-5. **Profile and Optimize:**  Identify performance bottlenecks and refine your SimpleLang code or compiler settings.
+5. **Profile and Optimize:**  Identify performance bottlenecks and refine your SimpLang code or compiler settings.
 
 ## Future Directions
 
@@ -240,7 +347,7 @@ int main() {
 
 ## Contributing
 
-For information on how to contribute to SimpleLang development, please refer to the `CONTRIBUTING.md` file. This includes guidelines for:
+For information on how to contribute to SimpLang development, please refer to the `CONTRIBUTING.md` file. This includes guidelines for:
 
 * **Code Style:**  Ensuring consistent and readable code.
 * **Testing Requirements:**  Writing thorough unit and integration tests.
