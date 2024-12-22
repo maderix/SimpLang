@@ -1,174 +1,193 @@
-#include "kernel.h"
-#include "kernel_debugger/debugger.hpp"
+#include "kernel_runner.hpp"
 #include <iostream>
-#include <stdexcept>
-#include <memory>
-#include <dlfcn.h>
+#include <chrono>
+#include <vector>
 #include <iomanip>
+#include <numeric>
 #include <cmath>
+#include <fstream>
+#include <algorithm>
 
-class SliceRAII {
-    void* slice;
+class ExecutionMetrics {
 public:
-    explicit SliceRAII(void* s) : slice(s) {}
-    ~SliceRAII() { if (slice) free_slice(slice); }
-    
-    void* get() const { return slice; }
-    void* release() { void* tmp = slice; slice = nullptr; return tmp; }
-    
-    SliceRAII(const SliceRAII&) = delete;
-    SliceRAII& operator=(const SliceRAII&) = delete;
-};
+    struct Measurement {
+        double duration_us;  // microseconds
+        double result;
+    };
 
-class KernelRunner {
-    static constexpr size_t SLICE_SIZE = 2;  // Changed to match test size
-    
-    SliceRAII sse_slice;
-    SliceRAII avx_slice;
-    KernelDebugger& debugger;
-    bool is_simd_test;
-    bool debug_mode;
-    
-public:
-    KernelRunner() 
-        : sse_slice(make_sse_slice(SLICE_SIZE))
-        , avx_slice(make_avx_slice(SLICE_SIZE))
-        , debugger(KernelDebugger::getInstance())
-        , is_simd_test(false)
-        , debug_mode(true)  // Set to true for SIMD debugging
-    {
-        if (!sse_slice.get() || !avx_slice.get()) {
-            throw std::runtime_error("Failed to allocate slices");
-        }
+    ExecutionMetrics(size_t warmup = 10, size_t total = 100) 
+        : warmup_iterations(warmup)
+        , total_iterations(total) {}
 
-        debugger.start();
-        debugger.setMode(KernelDebugger::Mode::STEP);
+    void addMeasurement(double duration_us, double result) {
+        measurements.push_back({duration_us, result});
     }
 
-    ~KernelRunner() = default;
-    
-    double run() {
-        #if defined(TEST_SIMD)
-            is_simd_test = true;
-        #else
-            is_simd_test = false;
-        #endif
-        double result = 0.0;
-        
-        try {
-            std::cout << "Starting kernel execution..." << std::endl;
+    // Make these accessible to ProfiledKernelRunner
+    size_t getWarmupIterations() const { return warmup_iterations; }
+    size_t getTotalIterations() const { return total_iterations; }
 
-            #if defined(TEST_SIMD)
-                std::cout << "Calling SIMD kernel_main..." << std::endl;
-                auto* sse = static_cast<sse_slice_t*>(sse_slice.get());
-                auto* avx = static_cast<avx_slice_t*>(avx_slice.get());
-                kernel_main(sse, avx);  // Special SIMD test
-                result = 1.0;  // Return 1.0 for successful SIMD test
-            #else
-                using KernelMainFunc = double(*)();
-                KernelMainFunc kernel_main_ptr = reinterpret_cast<KernelMainFunc>(dlsym(RTLD_DEFAULT, "kernel_main"));
-                if (!kernel_main_ptr) {
-                    std::cerr << "Failed to find kernel_main: " << dlerror() << std::endl;
-                    throw std::runtime_error("kernel_main not found");
-                }
-                std::cout << "Found kernel_main at " << (void*)kernel_main_ptr << std::endl;
-                result = kernel_main_ptr();
-            #endif
+    void printStatistics() const {
+        if (measurements.empty()) {
+            std::cout << "No measurements recorded.\n";
+            return;
+        }
+
+        // Skip warmup iterations for statistics
+        auto start = measurements.begin() + warmup_iterations;
+        auto end = measurements.end();
+        
+        std::vector<double> durations;
+        durations.reserve(end - start);
+        
+        for (auto it = start; it != end; ++it) {
+            durations.push_back(it->duration_us);
+        }
+
+        // Calculate statistics
+        double avg = std::accumulate(durations.begin(), durations.end(), 0.0) / durations.size();
+        
+        std::vector<double> sorted_durations = durations;
+        std::sort(sorted_durations.begin(), sorted_durations.end());
+        
+        double median = sorted_durations[sorted_durations.size() / 2];
+        double min = sorted_durations.front();
+        double max = sorted_durations.back();
+        
+        double sq_sum = std::inner_product(durations.begin(), durations.end(), 
+                                         durations.begin(), 0.0);
+        double std_dev = std::sqrt(sq_sum / durations.size() - avg * avg);
+
+        // Print results
+        std::cout << "\n=== Execution Metrics ===\n";
+        std::cout << std::fixed << std::setprecision(2);
+        std::cout << "Sample size: " << durations.size() << " iterations";
+        std::cout << " (+" << warmup_iterations << " warmup iterations)\n";
+        std::cout << "Average time: " << avg << " μs\n";
+        std::cout << "Median time: " << median << " μs\n";
+        std::cout << "Min time: " << min << " μs\n";
+        std::cout << "Max time: " << max << " μs\n";
+        std::cout << "Std deviation: " << std_dev << " μs\n";
+        
+        std::cout << "\nFirst measured result: " << measurements[warmup_iterations].result << "\n";
+    }
+
+    void exportCSV(const std::string& filename) const {
+        std::ofstream file(filename);
+        if (!file.is_open()) {
+            std::cerr << "Failed to open " << filename << " for writing\n";
+            return;
+        }
+
+        file << "Iteration,Duration_us,Result\n";
+        for (size_t i = 0; i < measurements.size(); ++i) {
+            file << i << "," 
+                 << measurements[i].duration_us << "," 
+                 << measurements[i].result << "\n";
+        }
+    }
+
+private:
+    std::vector<Measurement> measurements;
+    size_t warmup_iterations;
+    size_t total_iterations;
+};
+
+class ProfiledKernelRunner {
+private:
+    KernelRunner runner;
+    ExecutionMetrics metrics;
+    bool verbose;
+
+public:
+    ProfiledKernelRunner(size_t warmup = 10, size_t total = 100, bool verbose = false) 
+        : metrics(warmup, total)
+        , verbose(verbose) {}
+
+    void runBenchmark(const char* kernel_path) {
+        try {
+            runner.loadLibrary(kernel_path);
             
-            if (debug_mode) {
-                std::cout << "Kernel execution completed successfully\n";
+            if (verbose) {
+                std::cout << "Running kernel: " << kernel_path << "\n";
+                std::cout << "Warming up...\n";
             }
+
+            // Warmup runs
+            for (size_t i = 0; i < metrics.getWarmupIterations(); ++i) {
+                auto start = std::chrono::high_resolution_clock::now();
+                double result = runner.runKernel();
+                auto end = std::chrono::high_resolution_clock::now();
+                
+                auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+                metrics.addMeasurement(duration.count(), result);
+            }
+
+            if (verbose) {
+                std::cout << "Running benchmark...\n";
+            }
+
+            // Actual measurements
+            for (size_t i = 0; i < metrics.getTotalIterations(); ++i) {
+                auto start = std::chrono::high_resolution_clock::now();
+                double result = runner.runKernel();
+                auto end = std::chrono::high_resolution_clock::now();
+                
+                auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+                metrics.addMeasurement(duration.count(), result);
+            }
+
+            metrics.printStatistics();
+            metrics.exportCSV("kernel_profile.csv");
+
         } catch (const std::exception& e) {
-            std::cerr << "Kernel execution failed: " << e.what() << "\n";
+            std::cerr << "Error running kernel: " << e.what() << "\n";
             throw;
         }
-
-        return result;
-    }
-    
-    void print_results() const {
-        if (!is_simd_test) return;
-
-        std::cout << "\n=== Detailed Test Results ===\n\n";
-        
-        /* Comment out SSE tests
-        // Print SSE Tests
-        std::cout << "SSE Tests:\n";
-        std::cout << "----------------------------\n";
-        auto* sse = static_cast<sse_slice_t*>(sse_slice.get());
-        std::cout << "SSE Slice Info:\n";
-        std::cout << "  Length: " << sse->len << "\n";
-        std::cout << "  Capacity: " << sse->cap << "\n";
-        std::cout << "  Data pointer: " << sse->data << "\n\n";
-        
-        std::cout << "SSE Vector Contents:\n";
-        for (size_t i = 0; i < SLICE_SIZE; i++) {
-            std::cout << "  Vector " << i << " (at " << &sse->data[i] << "): ";
-            print_sse_vector(sse->data[i]);
-        }
-        std::cout << "\n";
-        */
-        
-        // Print AVX Tests
-        std::cout << "\nAVX Tests:\n";
-        std::cout << "----------------------------\n";
-        auto* avx = static_cast<avx_slice_t*>(avx_slice.get());
-        std::cout << "AVX Slice Info:\n";
-        std::cout << "  Length: " << avx->len << "\n";
-        std::cout << "  Capacity: " << avx->cap << "\n";
-        std::cout << "  Data pointer: " << avx->data << "\n\n";
-        
-        std::cout << "AVX Vector Contents:\n";
-        for (size_t i = 0; i < SLICE_SIZE; i++) {
-            std::cout << "  Vector " << i << " (at " << &avx->data[i] << "): ";
-            print_avx_vector(avx->data[i]);
-            
-            // Add raw memory dump
-            alignas(64) double values[8];
-            _mm512_store_pd(values, avx->data[i]);
-            std::cout << "    Raw values: ";
-            for (int j = 0; j < 8; j++) {
-                std::cout << values[j] << " ";
-            }
-            std::cout << "\n";
-        }
-        std::cout << "\n";
     }
 };
 
-double host_main() {
-    try {
-        KernelRunner runner;
-        double result = runner.run();
-        
-        // Print test results
-        std::cout << "\nKernel returned: " << std::fixed << std::setprecision(1) << result << std::endl;
-        
-        // Expected results:
-        // sum_to_n(5.0) = 15.0 (1+2+3+4+5)
-        // factorial(5.0) = 120.0 (5*4*3*2*1)
-        // Total should be 135.0
-        const double expected = 135.0;
-        const double epsilon = 0.0001;
-        
-        if (std::abs(result - expected) < epsilon) {
-            std::cout << "Test PASSED! ✓" << std::endl;
-        } else {
-            std::cout << "Test FAILED! ✗" << std::endl;
-            std::cout << "Expected: " << expected << std::endl;
-            std::cout << "Got: " << result << std::endl;
-        }
-        
-        runner.print_results();
-        return result;
-    }
-    catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
-        return -1.0;
-    }
+void printUsage(const char* program) {
+    std::cout << "Usage: " << program << " <kernel.so> [options]\n";
+    std::cout << "Options:\n";
+    std::cout << "  --warmup N     Number of warmup iterations (default: 10)\n";
+    std::cout << "  --iterations N Number of measured iterations (default: 100)\n";
+    std::cout << "  --verbose      Enable verbose output\n";
 }
 
-int main() {
-    double result = host_main();
-    return static_cast<int>(result);
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        printUsage(argv[0]);
+        return 1;
+    }
+
+    const char* kernel_path = argv[1];
+    size_t warmup = 10;
+    size_t iterations = 100;
+    bool verbose = false;
+
+    // Parse command line arguments
+    for (int i = 2; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--warmup" && i + 1 < argc) {
+            warmup = std::stoul(argv[++i]);
+        } else if (arg == "--iterations" && i + 1 < argc) {
+            iterations = std::stoul(argv[++i]);
+        } else if (arg == "--verbose") {
+            verbose = true;
+        } else {
+            std::cerr << "Unknown option: " << arg << "\n";
+            printUsage(argv[0]);
+            return 1;
+        }
+    }
+
+    try {
+        ProfiledKernelRunner profiler(warmup, iterations, verbose);
+        profiler.runBenchmark(kernel_path);
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << "\n";
+        return 1;
+    }
 }

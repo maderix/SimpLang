@@ -47,13 +47,61 @@ include_directories(
 
 add_definitions(${LLVM_DEFINITIONS})
 
+# Create build_all target first
+add_custom_target(build_all
+    COMMENT "Building all targets"
+)
+
 # Add subdirectories
 add_subdirectory(runtime)    # Runtime library and utilities first
 add_subdirectory(src)        # SimpleLang compiler
 add_subdirectory(tests)      # Tests directory
+add_subdirectory(tests/benchmark)  # Benchmarks
 
-# Convenience target to build everything
-add_custom_target(build_all
-    DEPENDS simplang simplang_runtime host_runner test_simd_runner debug_test_runner
-    COMMENT "Building all targets"
+# Update build_all dependencies
+add_dependencies(build_all 
+    simplang 
+    simplang_runtime 
+    host_runner 
+    test_simd_runner 
+    debug_test_runner
+    simplang_runner
+)
+
+# Add the runner executable
+add_executable(simplang_runner
+    runtime/src/host.cpp
+)
+
+# Link against required libraries
+target_link_libraries(simplang_runner
+    PRIVATE 
+        simplang_runtime
+        ${CMAKE_DL_LIBS}
+        ${READLINE_LIBRARIES}
+)
+
+# Add compile definitions
+target_compile_definitions(simplang_runner
+    PRIVATE
+        ENABLE_PROFILING=1
+)
+
+# Set include directories
+target_include_directories(simplang_runner
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/runtime/include
+        ${CMAKE_SOURCE_DIR}/src
+)
+
+# Install the runner
+install(TARGETS simplang_runner
+    RUNTIME DESTINATION bin
+)
+
+# Optional: Add test that uses the runner
+add_test(
+    NAME runner_test
+    COMMAND simplang_runner ${CMAKE_BINARY_DIR}/tests/obj/test_arithmetic.so
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
 )
