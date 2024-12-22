@@ -147,18 +147,32 @@ function(add_simd_test)
     set(name "test_simd")
     set(sl_file "${CMAKE_CURRENT_SOURCE_DIR}/${name}.sl")
     set(obj_file "${CMAKE_BINARY_DIR}/tests/obj/${name}.o")
+    set(so_file "${CMAKE_BINARY_DIR}/tests/obj/${name}.so")
     
+    # First compile to object file
     add_custom_command(
         OUTPUT ${obj_file}
         COMMAND ${CMAKE_BINARY_DIR}/src/simplang 
                 ${sl_file}
                 -o ${obj_file}
                 -v
+                -fPIC
         DEPENDS simplang ${sl_file}
         COMMENT "Compiling SIMD test"
     )
 
-    add_custom_target(${name}_obj DEPENDS ${obj_file})
+    # Then create shared library
+    add_custom_command(
+        OUTPUT ${so_file}
+        COMMAND ${CMAKE_C_COMPILER} -shared ${obj_file} -o ${so_file}
+                -Wl,--version-script=${CMAKE_BINARY_DIR}/tests/kernel.version
+                -Wl,--export-dynamic-symbol=kernel_main
+        DEPENDS ${obj_file} ${CMAKE_BINARY_DIR}/tests/kernel.version
+        COMMENT "Creating shared library for SIMD test"
+        VERBATIM
+    )
+
+    add_custom_target(${name}_obj DEPENDS ${so_file})
 
     # Create SIMD test executable with SIMD-specific host
     add_executable(${name}_runner
