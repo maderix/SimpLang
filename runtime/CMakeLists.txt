@@ -27,8 +27,13 @@ set(RUNTIME_SOURCES
     src/kernel_debugger/config.cpp
 )
 
-# Create runtime library
-add_library(simplang_runtime SHARED ${RUNTIME_SOURCES})
+# Add runner source
+set(RUNNER_SOURCES
+    src/host.cpp
+)
+
+# Create runtime library first
+add_library(simplang_runtime SHARED ${RUNTIME_SOURCES} ${SIMD_SOURCES} ${DEBUG_SOURCES})
 
 # Include directories
 target_include_directories(simplang_runtime
@@ -47,6 +52,7 @@ target_compile_definitions(simplang_runtime
         # Debug-related definitions
         $<$<CONFIG:Debug>:SIMD_DEBUG=1>
         $<$<BOOL:${ENABLE_DEBUGGER}>:ENABLE_DEBUGGER=1>
+        $<$<BOOL:${ENABLE_PROFILING}>:ENABLE_PROFILING=1>
 )
 
 # Compiler options
@@ -63,9 +69,9 @@ target_compile_options(simplang_runtime
 # Link libraries
 target_link_libraries(simplang_runtime
     PRIVATE
-        ${READLINE_LIBRARIES}  # Use READLINE_LIBRARIES instead of just readline
-        readline               # Explicitly link readline
-        history               # Explicitly link history
+        ${READLINE_LIBRARIES}
+        readline
+        history
         Threads::Threads
         ${CMAKE_DL_LIBS}
 )
@@ -76,7 +82,7 @@ target_link_libraries(host_runner
     PRIVATE
         simplang_runtime
         ${CMAKE_DL_LIBS}
-        ${READLINE_LIBRARIES}  # Add readline libraries here too
+        ${READLINE_LIBRARIES}
         readline
         history
 )
