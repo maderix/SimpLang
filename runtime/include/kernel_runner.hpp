@@ -5,12 +5,14 @@
 #include <stdexcept>
 #include <iostream>
 #include <memory>
+#include "simd_types.hpp"
 
 class KernelRunner {
 public:
     using KernelMainFunc = double (*)();
+    using KernelMainSIMDFunc = double (*)(SSESlice*, AVXSlice*);
 
-    KernelRunner() : handle_(nullptr), kernel_main_(nullptr) {}
+    KernelRunner() : handle_(nullptr), kernel_main_(nullptr), kernel_main_simd_(nullptr) {}
     virtual ~KernelRunner() {
         if (handle_) {
             dlclose(handle_);
@@ -29,6 +31,7 @@ public:
             dlclose(handle_);
             handle_ = nullptr;
             kernel_main_ = nullptr;
+            kernel_main_simd_ = nullptr;
         }
 
         // Load the shared library
@@ -41,22 +44,27 @@ public:
         // Clear any existing error
         dlerror();
 
-        // Get the kernel_main symbol
-        void* symbol = dlsym(handle_, "kernel_main");
-        const char* dlsym_error = dlerror();
-        if (dlsym_error) {
-            dlclose(handle_);
-            throw std::runtime_error("Failed to load kernel_main: " + std::string(dlsym_error));
+        // Try to load SIMD kernel first
+        void* simd_symbol = dlsym(handle_, "kernel_main");
+        const char* simd_dlsym_error = dlerror();
+        
+        if (!simd_dlsym_error) {
+            // SIMD kernel found
+            kernel_main_simd_ = reinterpret_cast<KernelMainSIMDFunc>(simd_symbol);
+            if (!kernel_main_simd_) {
+                dlclose(handle_);
+                throw std::runtime_error("Invalid kernel_main_simd function pointer");
+            }
+            std::cout << "SIMD kernel loaded successfully" << std::endl;
+        } else {
+            // No SIMD kernel found
+            kernel_main_ = reinterpret_cast<KernelMainFunc>(simd_symbol);
+            if (!kernel_main_) {
+                dlclose(handle_);
+                throw std::runtime_error("Invalid kernel_main function pointer");
+            }
+            std::cout << "Regular kernel loaded successfully" << std::endl;
         }
-        std::cout << "Symbol found at: " << symbol << std::endl;
-
-        // Cast to function pointer
-        kernel_main_ = reinterpret_cast<KernelMainFunc>(symbol);
-        if (!kernel_main_) {
-            dlclose(handle_);
-            throw std::runtime_error("Invalid kernel_main function pointer");
-        }
-        std::cout << "Function pointer created successfully" << std::endl;
     }
 
     double runKernel() {
@@ -66,7 +74,15 @@ public:
         return kernel_main_();
     }
 
+    double runKernel(SSESlice* sse_slice, AVXSlice* avx_slice) {
+        if (!kernel_main_simd_) {
+            throw std::runtime_error("No SIMD kernel loaded");
+        }
+        return kernel_main_simd_(sse_slice, avx_slice);
+    }
+
 protected:
     void* handle_;
     KernelMainFunc kernel_main_;
+    KernelMainSIMDFunc kernel_main_simd_;
 };

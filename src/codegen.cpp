@@ -10,41 +10,50 @@
 
 CodeGenContext::CodeGenContext() : builder(context) {
     module = std::make_unique<llvm::Module>("simple-lang", context);
-
-    // Set target triple and data layout
+    
+    // Enable SIMD by default
+    simd_enabled = true;
+    
+    // Initialize target machine first
     targetTriple = llvm::sys::getDefaultTargetTriple();
     module->setTargetTriple(targetTriple);
-
+    
     std::string error;
     const llvm::Target* target = llvm::TargetRegistry::lookupTarget(targetTriple, error);
     if (!target) {
-        llvm::errs() << error << "\n";
-        exit(1);
+        std::cerr << "Target lookup failed: " << error << std::endl;
+        return;
     }
 
     llvm::TargetOptions opt;
     auto RM = llvm::Optional<llvm::Reloc::Model>();
-
     targetMachine = std::unique_ptr<llvm::TargetMachine>(
-        target->createTargetMachine(targetTriple, "generic", "", opt, RM));
+        target->createTargetMachine(
+            targetTriple,
+            "generic",  // CPU
+            "+avx2",    // Enable AVX2 features
+            opt,
+            RM
+        )
+    );
 
+    if (!targetMachine) {
+        std::cerr << "Could not create target machine" << std::endl;
+        return;
+    }
+
+    // Set data layout before initializing types
     module->setDataLayout(targetMachine->createDataLayout());
-
+    
+    // Initialize SIMD interface using the factory function
+    simdInterface.reset(createSIMDInterface("sse"));  // or "avx" for AVX support
+    
+    // Now initialize runtime functions
+    initializeRuntimeFunctions();
+    
     // Initialize optimization passes
     fpm = std::make_unique<llvm::legacy::FunctionPassManager>(module.get());
     fpm->doInitialization();
-
-    // Initialize SIMD interface based on target architecture
-    std::string arch = targetMachine->getTargetCPU().str();
-    if (arch.find("avx") != std::string::npos) {
-        simdInterface = std::unique_ptr<SIMDInterface>(createSIMDInterface("avx"));
-    } else {
-        simdInterface = std::unique_ptr<SIMDInterface>(createSIMDInterface("sse"));
-    }
-
-    // Don't initialize slice types until needed
-    sseSliceType = nullptr;
-    avxSliceType = nullptr;
 }
 
 CodeGenContext::~CodeGenContext() {
@@ -56,26 +65,28 @@ CodeGenContext::~CodeGenContext() {
 
 
 void CodeGenContext::initializeRuntimeFunctions() {
-    // malloc function
-    std::vector<llvm::Type*> mallocArgs = {llvm::Type::getInt64Ty(context)};
-    llvm::FunctionType* mallocType = llvm::FunctionType::get(
-        llvm::Type::getInt8PtrTy(context), mallocArgs, false);
-    mallocFunc = llvm::Function::Create(mallocType, llvm::Function::ExternalLinkage,
-                                      "malloc", module.get());
-
-    // free function
-    std::vector<llvm::Type*> freeArgs = {llvm::Type::getInt8PtrTy(context)};
-    llvm::FunctionType* freeType = llvm::FunctionType::get(
-        llvm::Type::getVoidTy(context), freeArgs, false);
-    freeFunc = llvm::Function::Create(freeType, llvm::Function::ExternalLinkage,
-                                    "free", module.get());
-
-    // error function (for bounds checking)
+    // Always initialize basic runtime functions
+    initializeMallocFree();
+    
+    // Always declare error function
     std::vector<llvm::Type*> errorArgs = {llvm::Type::getInt8PtrTy(context)};
     llvm::FunctionType* errorType = llvm::FunctionType::get(
-        llvm::Type::getVoidTy(context), errorArgs, false);
-    errorFunc = llvm::Function::Create(errorType, llvm::Function::ExternalLinkage,
-                                     "error", module.get());
+        llvm::Type::getVoidTy(context),
+        errorArgs,
+        false
+    );
+    errorFunc = llvm::Function::Create(
+        errorType,
+        llvm::Function::ExternalLinkage,
+        "error",
+        module.get()
+    );
+    
+    // Initialize SIMD functions only if enabled
+    if (simd_enabled) {
+        initializeSliceTypes();
+        initializeSIMDFunctions();
+    }
 }
 
 void CodeGenContext::initializeSliceTypes() {
@@ -100,28 +111,24 @@ llvm::Type* CodeGenContext::getSliceType(SliceType type) {
     return type == SliceType::SSE_SLICE ? sseSliceType : avxSliceType;
 }
 
-llvm::Value* CodeGenContext::createSlice(SliceType type, llvm::Value* len, llvm::Value* cap) {
-    // Convert length to i64 if it's a double
+llvm::Value* CodeGenContext::createSlice(SliceType type, llvm::Value* len) {
+    std::cout << "Creating slice of type " << (type == SliceType::SSE_SLICE ? "SSE" : "AVX") << std::endl;
+    
+    // Convert length to i64 if needed
     if (len->getType()->isDoubleTy()) {
         len = builder.CreateFPToSI(len, builder.getInt64Ty(), "len.conv");
     }
-    
-    // Convert capacity to i64 if it's a double
-    if (cap && cap->getType()->isDoubleTy()) {
-        cap = builder.CreateFPToSI(cap, builder.getInt64Ty(), "cap.conv");
-    }
 
     // Get the appropriate make function
-    llvm::Function* makeFunc = type == SliceType::SSE_SLICE ? 
-        module->getFunction("make_sse_slice") : 
-        module->getFunction("make_avx_slice");
-
+    const char* funcName = (type == SliceType::SSE_SLICE) ? "make_sse_slice" : "make_avx_slice";
+    llvm::Function* makeFunc = module->getFunction(funcName);
+    
     if (!makeFunc) {
-        std::cerr << "Make function not found for slice type" << std::endl;
+        std::cerr << "Error: Make function " << funcName << " not found" << std::endl;
         return nullptr;
     }
 
-    // Create the slice
+    // Create the call
     return builder.CreateCall(makeFunc, {len}, "slice.create");
 }
 
@@ -342,8 +349,41 @@ void CodeGenContext::exitFunction() {
 }
 
 void CodeGenContext::emitError(const std::string& message) {
-    llvm::Value* msgGlobal = builder.CreateGlobalStringPtr(message);
-    builder.CreateCall(errorFunc, {msgGlobal});
+    if (!errorFunc) {
+        std::cerr << "Error function not initialized" << std::endl;
+        return;
+    }
+
+    // Create a global string constant for the error message
+    llvm::Constant* strConstant = llvm::ConstantDataArray::getString(
+        context, 
+        message
+    );
+    
+    // Create a global variable to hold the string
+    auto global = new llvm::GlobalVariable(
+        *module,
+        strConstant->getType(),
+        true,
+        llvm::GlobalValue::PrivateLinkage,
+        strConstant,
+        ".str"
+    );
+    
+    // Get pointer to the start of the string
+    std::vector<llvm::Value*> indices = {
+        llvm::ConstantInt::get(context, llvm::APInt(64, 0)),
+        llvm::ConstantInt::get(context, llvm::APInt(64, 0))
+    };
+    llvm::Value* strPtr = builder.CreateInBoundsGEP(
+        global->getValueType(),
+        global,
+        indices,
+        "str"
+    );
+    
+    // Call error function
+    builder.CreateCall(errorFunc, {strPtr});
 }
 
 llvm::Value* CodeGenContext::getSliceData(llvm::Value* slice) {
@@ -414,6 +454,38 @@ void CodeGenContext::generateCode(BlockAST& root) {
     // Set target triple if not already set
     if (module->getTargetTriple().empty()) {
         module->setTargetTriple(llvm::sys::getDefaultTargetTriple());
+    }
+
+    // Initialize target machine if not already done
+    if (!targetMachine) {
+        std::string error;
+        const llvm::Target* target = llvm::TargetRegistry::lookupTarget(
+            module->getTargetTriple(), error);
+        
+        if (!target) {
+            std::cerr << "Target lookup failed: " << error << std::endl;
+            return;
+        }
+
+        llvm::TargetOptions opt;
+        auto RM = llvm::Optional<llvm::Reloc::Model>();
+        targetMachine = std::unique_ptr<llvm::TargetMachine>(
+            target->createTargetMachine(
+                module->getTargetTriple(),
+                "generic",  // CPU
+                "",        // Features
+                opt,
+                RM
+            )
+        );
+
+        if (!targetMachine) {
+            std::cerr << "Could not create target machine" << std::endl;
+            return;
+        }
+
+        // Set data layout
+        module->setDataLayout(targetMachine->createDataLayout());
     }
 
     // Generate code for each top-level statement
@@ -536,47 +608,166 @@ void CodeGenContext::declareRuntimeFunctions() {
     // Empty by default - runtime functions will be declared on demand
 }
 
-llvm::Function* createFunction(CodeGenContext& context, 
-                             const std::string& name,
-                             const std::vector<std::string>& args) {
-    std::vector<llvm::Type*> argTypes(args.size(), 
-        llvm::Type::getDoubleTy(context.getContext()));
+llvm::Function* CodeGenContext::createFunction(const std::string& name, 
+                                             const std::vector<std::pair<std::string, llvm::Type*>>& args) {
+    std::vector<llvm::Type*> argTypes;
     
-    llvm::FunctionType* funcType = llvm::FunctionType::get(
-        llvm::Type::getDoubleTy(context.getContext()),
-        argTypes,
-        false
-    );
-
-    // Check if function already exists
-    if (llvm::Function* existingFunc = context.getModule()->getFunction(name)) {
-        // If it exists but has wrong linkage, recreate it
-        if (name == "kernel_main" && existingFunc->getLinkage() != llvm::Function::ExternalLinkage) {
-            existingFunc->eraseFromParent();
-        } else {
-            return existingFunc;
+    // Special case for kernel_main
+    if (name == "kernel_main") {
+        // Use slice types directly for kernel_main
+        argTypes = {
+            sseSliceType->getPointerTo(),  // out_sse: SSESlice*
+            avxSliceType->getPointerTo()   // out_avx: AVXSlice*
+        };
+    } else {
+        // For other functions, use the provided types
+        for (const auto& arg : args) {
+            argTypes.push_back(arg.second);
         }
     }
 
-    // Use external linkage for kernel_main, internal for others
-    llvm::Function::LinkageTypes linkage = 
-        (name == "kernel_main") ? llvm::Function::ExternalLinkage 
-                               : llvm::Function::InternalLinkage;
+    llvm::FunctionType* funcType = llvm::FunctionType::get(
+        llvm::Type::getDoubleTy(context),  // Return type is always double
+        argTypes,
+        false  // Not variadic
+    );
 
     llvm::Function* function = llvm::Function::Create(
         funcType,
-        linkage,
+        llvm::Function::ExternalLinkage,
         name,
-        context.getModule()
+        module.get()
     );
 
-    // Create entry block
-    llvm::BasicBlock* bb = llvm::BasicBlock::Create(
-        context.getContext(),
-        "entry",
-        function
-    );
-    context.getBuilder().SetInsertPoint(bb);
+    // Set argument names
+    unsigned idx = 0;
+    for (auto& arg : function->args()) {
+        if (idx < args.size()) {
+            arg.setName(args[idx].first);
+        }
+        idx++;
+    }
 
     return function;
+}
+
+void CodeGenContext::initializeMallocFree() {
+    // Malloc function
+    std::vector<llvm::Type*> mallocArgs = {llvm::Type::getInt64Ty(context)};
+    llvm::FunctionType* mallocType = llvm::FunctionType::get(
+        llvm::Type::getInt8PtrTy(context),
+        mallocArgs,
+        false
+    );
+    mallocFunc = llvm::Function::Create(
+        mallocType,
+        llvm::Function::ExternalLinkage,
+        "malloc",
+        module.get()
+    );
+
+    // Free function
+    std::vector<llvm::Type*> freeArgs = {llvm::Type::getInt8PtrTy(context)};
+    llvm::FunctionType* freeType = llvm::FunctionType::get(
+        llvm::Type::getVoidTy(context),
+        freeArgs,
+        false
+    );
+    freeFunc = llvm::Function::Create(
+        freeType,
+        llvm::Function::ExternalLinkage,
+        "free",
+        module.get()
+    );
+}
+
+void CodeGenContext::initializeSIMDFunctions() {
+    // Define slice struct types first
+    llvm::StructType* sliceStructTy = llvm::StructType::create(context, "slice_struct");
+    sliceStructTy->setBody({
+        llvm::Type::getInt8PtrTy(context),  // data pointer
+        llvm::Type::getInt64Ty(context)     // length
+    });
+
+    // Register named types for SSE and AVX slices
+    llvm::StructType* sseSliceTy = llvm::StructType::create(context, "sse_slice_t");
+    llvm::StructType* avxSliceTy = llvm::StructType::create(context, "avx_slice_t");
+    sseSliceTy->setBody(sliceStructTy->elements());
+    avxSliceTy->setBody(sliceStructTy->elements());
+
+    // Vector types
+    auto sseVecTy = llvm::VectorType::get(llvm::Type::getDoubleTy(context), 2, false);
+    auto avxVecTy = llvm::VectorType::get(llvm::Type::getDoubleTy(context), 8, false);
+
+    // SIMD operations (existing code remains the same)
+    std::vector<llvm::Type*> sseArgs = {sseVecTy, sseVecTy};
+    llvm::FunctionType* sseOpType = llvm::FunctionType::get(sseVecTy, sseArgs, false);
+    
+    llvm::Function::Create(sseOpType, llvm::Function::ExternalLinkage, "simd_add", module.get());
+    llvm::Function::Create(sseOpType, llvm::Function::ExternalLinkage, "simd_sub", module.get());
+    llvm::Function::Create(sseOpType, llvm::Function::ExternalLinkage, "simd_mul", module.get());
+    llvm::Function::Create(sseOpType, llvm::Function::ExternalLinkage, "simd_div", module.get());
+
+    // AVX operations (similar to SSE)
+    std::vector<llvm::Type*> avxArgs = {avxVecTy, avxVecTy};
+    llvm::FunctionType* avxOpType = llvm::FunctionType::get(avxVecTy, avxArgs, false);
+    
+    llvm::Function::Create(avxOpType, llvm::Function::ExternalLinkage, "simd_add_avx", module.get());
+    llvm::Function::Create(avxOpType, llvm::Function::ExternalLinkage, "simd_sub_avx", module.get());
+    llvm::Function::Create(avxOpType, llvm::Function::ExternalLinkage, "simd_mul_avx", module.get());
+    llvm::Function::Create(avxOpType, llvm::Function::ExternalLinkage, "simd_div_avx", module.get());
+
+    // Slice creation functions
+    std::vector<llvm::Type*> makeSliceArgs = {llvm::Type::getInt64Ty(context)};
+    
+    llvm::FunctionType* makeSSESliceType = llvm::FunctionType::get(
+        sseSliceTy->getPointerTo(), makeSliceArgs, false);
+    llvm::FunctionType* makeAVXSliceType = llvm::FunctionType::get(
+        avxSliceTy->getPointerTo(), makeSliceArgs, false);
+
+    llvm::Function::Create(makeSSESliceType, llvm::Function::ExternalLinkage, 
+                          "make_sse_slice", module.get());
+    llvm::Function::Create(makeAVXSliceType, llvm::Function::ExternalLinkage, 
+                          "make_avx_slice", module.get());
+
+    // Slice get/set operations
+    std::vector<llvm::Type*> getSliceArgs = {
+        sseSliceTy->getPointerTo(),
+        llvm::Type::getInt64Ty(context)
+    };
+
+    llvm::FunctionType* getSSESliceType = llvm::FunctionType::get(sseVecTy, getSliceArgs, false);
+    getSliceArgs[0] = avxSliceTy->getPointerTo();
+    llvm::FunctionType* getAVXSliceType = llvm::FunctionType::get(avxVecTy, getSliceArgs, false);
+
+    llvm::Function::Create(getSSESliceType, llvm::Function::ExternalLinkage, 
+                          "slice_get_sse", module.get());
+    llvm::Function::Create(getAVXSliceType, llvm::Function::ExternalLinkage, 
+                          "slice_get_avx", module.get());
+
+    // Set operations
+    std::vector<llvm::Type*> setSSESliceArgs = {
+        sseSliceTy->getPointerTo(),
+        llvm::Type::getInt64Ty(context),
+        sseVecTy
+    };
+    std::vector<llvm::Type*> setAVXSliceArgs = {
+        avxSliceTy->getPointerTo(),
+        llvm::Type::getInt64Ty(context),
+        avxVecTy
+    };
+
+    llvm::FunctionType* setSSESliceType = llvm::FunctionType::get(
+        llvm::Type::getVoidTy(context), setSSESliceArgs, false);
+    llvm::FunctionType* setAVXSliceType = llvm::FunctionType::get(
+        llvm::Type::getVoidTy(context), setAVXSliceArgs, false);
+
+    llvm::Function::Create(setSSESliceType, llvm::Function::ExternalLinkage, 
+                          "slice_set_sse", module.get());
+    llvm::Function::Create(setAVXSliceType, llvm::Function::ExternalLinkage, 
+                          "slice_set_avx", module.get());
+}
+
+llvm::TargetMachine* CodeGenContext::getTargetMachine() {
+    return targetMachine.get();
 }

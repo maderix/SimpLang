@@ -1,6 +1,7 @@
 #ifndef CODEGEN_HPP
 #define CODEGEN_HPP
 
+#include "slice_type.hpp"
 #include "simd_interface.hpp"
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LLVMContext.h>
@@ -43,7 +44,28 @@ private:
     std::unique_ptr<llvm::TargetMachine> targetMachine;
     std::string targetTriple;
 
+    // SIMD support
+    bool simd_enabled = false;
+    void initializeMallocFree();
+    void initializeSIMDFunctions();
+    std::unique_ptr<SIMDInterface> simdInterface;
+
+    // Cache for commonly used types
+    llvm::StructType* sseSliceType;
+    llvm::StructType* avxSliceType;
+    llvm::Function* mallocFunc;
+    llvm::Function* freeFunc;
+    llvm::Function* errorFunc;
+
+    // Private initialization methods
+    void initializeModuleAndPassManager();
+    void initializeTargetMachine();
+    void initializeRuntimeFunctions();
+    void initializeSliceTypes();
+    void declareRuntimeFunctions();
+
     // Debug info support
+    void createDebugInfoForModule(const std::string& filename);
     std::unique_ptr<llvm::DIBuilder> debugBuilder;
     llvm::DIFile* debugFile;
     llvm::DICompileUnit* debugCompileUnit;
@@ -56,30 +78,17 @@ private:
     std::map<std::string, llvm::DILocalVariable*> debugVariables;
     std::map<std::string, llvm::Value*> globalDebugValues;
 
-    // Cache for commonly used types
-    llvm::StructType* sseSliceType;
-    llvm::StructType* avxSliceType;
-    llvm::Function* mallocFunc;
-    llvm::Function* freeFunc;
-    llvm::Function* errorFunc;
-
     bool integerContextFlag = false;
 
-    // SIMD support
-    std::unique_ptr<SIMDInterface> simdInterface;
-
-    // Private initialization methods
-    void initializeModuleAndPassManager();
-    void initializeTargetMachine();
-    void initializeRuntimeFunctions();
-    void initializeSliceTypes();
-    void declareRuntimeFunctions();
-    void createDebugInfoForModule(const std::string& filename);
     llvm::Value* createSliceWithCap(SliceType type, llvm::Value* len, llvm::Value* cap);
 
 public:
     CodeGenContext();
     ~CodeGenContext();
+
+    // SIMD control methods
+    void enableSIMD() { simd_enabled = true; }
+    bool isSIMDEnabled() const { return simd_enabled; }
 
     // Debug info methods
     void initializeDebugInfo(const std::string& filename);
@@ -119,14 +128,14 @@ public:
     llvm::Type* getDoubleType() { return llvm::Type::getDoubleTy(context); }
     llvm::Type* getVectorType(unsigned width);
     llvm::Function* currentFunction() { return builder.GetInsertBlock()->getParent(); }
-    llvm::TargetMachine* getTargetMachine() { return targetMachine.get(); }
+    llvm::TargetMachine* getTargetMachine();
     bool isSliceType(llvm::Type* type) const;
     bool isVectorType(llvm::Type* type) const;
     unsigned getVectorWidth(llvm::Type* type) const;
 
     // SIMD support
     llvm::Type* getSliceType(SliceType type);
-    llvm::Value* createSlice(SliceType type, llvm::Value* len, llvm::Value* cap = nullptr);
+    llvm::Value* createSlice(SliceType type, llvm::Value* len);
     llvm::Value* getSliceData(llvm::Value* slice);
     llvm::Value* getSliceLen(llvm::Value* slice);
     llvm::Value* getSliceCap(llvm::Value* slice);
@@ -169,6 +178,9 @@ public:
 
     // SIMD operations
     SIMDInterface* getSIMDInterface() { return simdInterface.get(); }
+
+    llvm::Function* createFunction(const std::string& name,
+                                 const std::vector<std::pair<std::string, llvm::Type*>>& args);
 };
 
 #endif // CODEGEN_HPP
