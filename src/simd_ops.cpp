@@ -135,4 +135,70 @@ llvm::Value* SIMDHelper::broadcastScalar(
     }
     
     return vec;
+}
+
+llvm::Value* make_sse_slice(llvm::IRBuilder<>& builder, unsigned size) {
+    // Create struct type for slice
+    std::vector<llvm::Type*> members;
+    members.push_back(llvm::PointerType::get(llvm::VectorType::get(
+        builder.getDoubleTy(), 2, false), 0));
+    members.push_back(builder.getInt32Ty());
+    llvm::StructType* sliceType = llvm::StructType::create(
+        builder.getContext(), members, "SSESlice");
+    
+    // Allocate memory for the vector data
+    llvm::Value* dataSize = builder.getInt64(size * sizeof(double) * 2);
+    llvm::Value* data = builder.CreateCall(
+        builder.GetInsertBlock()->getModule()->getFunction("malloc"), 
+        {dataSize});
+    data = builder.CreateBitCast(data, members[0]);
+    
+    // Create and initialize the slice struct
+    llvm::Value* slice = llvm::UndefValue::get(sliceType);
+    slice = builder.CreateInsertValue(slice, data, 0);
+    slice = builder.CreateInsertValue(slice, 
+        builder.getInt32(size), 1);
+    
+    return slice;
+}
+
+void slice_set_sse(llvm::IRBuilder<>& builder, SliceStruct& slice, 
+                   unsigned index, llvm::Value* value) {
+    llvm::Value* ptr = builder.CreateGEP(
+        llvm::VectorType::get(builder.getDoubleTy(), 2, false),
+        slice.data, 
+        builder.getInt32(index));
+    builder.CreateStore(value, ptr);
+}
+
+llvm::Value* make_avx_slice(llvm::IRBuilder<>& builder, unsigned size) {
+    // Similar to SSE but with 8-wide vectors
+    std::vector<llvm::Type*> members;
+    members.push_back(llvm::PointerType::get(llvm::VectorType::get(
+        builder.getDoubleTy(), 8, false), 0));
+    members.push_back(builder.getInt32Ty());
+    llvm::StructType* sliceType = llvm::StructType::create(
+        builder.getContext(), members, "AVXSlice");
+    
+    llvm::Value* dataSize = builder.getInt64(size * sizeof(double) * 8);
+    llvm::Value* data = builder.CreateCall(
+        builder.GetInsertBlock()->getModule()->getFunction("malloc"), 
+        {dataSize});
+    data = builder.CreateBitCast(data, members[0]);
+    
+    llvm::Value* slice = llvm::UndefValue::get(sliceType);
+    slice = builder.CreateInsertValue(slice, data, 0);
+    slice = builder.CreateInsertValue(slice, 
+        builder.getInt32(size), 1);
+    
+    return slice;
+}
+
+void slice_set_avx(llvm::IRBuilder<>& builder, SliceStruct& slice, 
+                   unsigned index, llvm::Value* value) {
+    llvm::Value* ptr = builder.CreateGEP(
+        llvm::VectorType::get(builder.getDoubleTy(), 8, false),
+        slice.data, 
+        builder.getInt32(index));
+    builder.CreateStore(value, ptr);
 } 

@@ -232,6 +232,95 @@ function(add_simd_test)
     )
 endfunction()
 
+# Add function for performance test
+function(add_perf_simd_test)
+    set(name "perf_simd")
+    set(sl_file "${CMAKE_CURRENT_SOURCE_DIR}/${name}.sl")
+    set(obj_file "${CMAKE_BINARY_DIR}/tests/obj/${name}.o")
+    set(so_file "${CMAKE_BINARY_DIR}/tests/obj/${name}.so")
+    
+    # First compile to object file
+    add_custom_command(
+        OUTPUT ${obj_file}
+        COMMAND ${CMAKE_BINARY_DIR}/src/simplang 
+                ${sl_file}
+                -o ${obj_file}
+                -v
+                -fPIC
+        DEPENDS simplang ${sl_file}
+        COMMENT "Compiling SIMD performance test"
+    )
+
+    # Then create shared library
+    add_custom_command(
+        OUTPUT ${so_file}
+        COMMAND ${CMAKE_C_COMPILER} -shared ${obj_file} -o ${so_file}
+                -Wl,--version-script=${CMAKE_BINARY_DIR}/tests/kernel.version
+                -Wl,--export-dynamic-symbol=kernel_main
+        DEPENDS ${obj_file} ${CMAKE_BINARY_DIR}/tests/kernel.version
+        COMMENT "Creating shared library for SIMD performance test"
+        VERBATIM
+    )
+
+    add_custom_target(${name}_obj DEPENDS ${so_file})
+
+    # Create SIMD test executable
+    add_executable(${name}_runner
+        ${CMAKE_CURRENT_SOURCE_DIR}/${name}.cpp
+    )
+
+    target_link_options(${name}_runner
+        PRIVATE ${obj_file}
+        -rdynamic  # Ensures symbols are exported
+    )
+
+    add_dependencies(${name}_runner ${name}_obj)
+    add_dependencies(all_test_runners ${name}_runner)
+
+    # Configure SIMD test
+    target_compile_definitions(${name}_runner
+        PRIVATE 
+            TEST_SIMD
+            SIMD_DEBUG=0  # Disable debug for performance testing
+    )
+
+    target_link_libraries(${name}_runner
+        PRIVATE 
+            simplang_runtime
+            ${CMAKE_DL_LIBS}
+            ${READLINE_LIBRARIES}
+            readline
+            history
+    )
+
+    target_include_directories(${name}_runner
+        PRIVATE 
+            ${CMAKE_SOURCE_DIR}/runtime/include
+            ${CMAKE_SOURCE_DIR}/include
+            ${READLINE_INCLUDE_DIRS}
+    )
+
+    target_compile_options(${name}_runner
+        PRIVATE 
+            -O3  # Use optimization for performance testing
+            -march=native
+            -mavx512f 
+            -msse4.2
+            -ffast-math
+    )
+
+    # Add test to CTest
+    add_test(
+        NAME ${name}
+        COMMAND ${name}_runner ${so_file}
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/tests
+    )
+
+    set_tests_properties(${name} PROPERTIES
+        ENVIRONMENT "SIMD_DEBUG=0"
+    )
+endfunction()
+
 # Add regular tests
 add_sl_test(test_arithmetic test_arithmetic.sl "72.0")
 add_sl_test(test_main test_main.sl "30.0")
@@ -382,3 +471,52 @@ target_compile_options(perf_test_runner
 )
 
 add_dependencies(perf_test_runner perf_test_obj)
+
+# Move this line to after all other test definitions
+add_perf_simd_test()
+
+# Find LLVM package if not already found
+if(NOT LLVM_FOUND)
+    find_package(LLVM REQUIRED CONFIG)
+    include_directories(${LLVM_INCLUDE_DIRS})
+    add_definitions(${LLVM_DEFINITIONS})
+endif()
+
+# Update existing SIMD test target
+if(TARGET test_simd_runner)
+    # Get required LLVM libraries
+    llvm_map_components_to_libnames(llvm_libs
+        core
+        support
+        irreader
+        analysis
+        native
+    )
+
+    # Update target properties
+    target_include_directories(test_simd_runner 
+        PRIVATE
+        ${CMAKE_SOURCE_DIR}/runtime/include
+        ${CMAKE_SOURCE_DIR}/include
+    )
+
+    target_link_libraries(test_simd_runner
+        PRIVATE
+        simplang_runtime
+        ${llvm_libs}
+    )
+
+    target_compile_options(test_simd_runner
+        PRIVATE
+        -mavx2
+        -msse4.2
+    )
+
+    # Update test properties
+    set_tests_properties(test_simd 
+        PROPERTIES
+        ENVIRONMENT "SIMD_DEBUG=1"
+    )
+else()
+    message(FATAL_ERROR "SIMD test target not found. Make sure it's defined before this block.")
+endif()

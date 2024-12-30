@@ -1,14 +1,41 @@
 fn kernel_main(var out_sse SSESlice, var out_avx AVXSlice) {
-    // 2. AVX Test
-    var avx1 = make(AVXSlice, 2);
+    // 1. SSE Tests (128-bit, 2 doubles)
+    var sse1 = make(SSESlice, 1);
+    var sse2 = make(SSESlice, 1);
     
-    // Test single AVX vector operation - explicitly pass all 8 values
-    avx1[0i] = avx(1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0);  // Explicit 8 values
-    avx1[1i] = avx(5.0, 6.0, 7.0, 8.0, 0.0, 0.0, 0.0, 0.0);  // Explicit 8 values
+    // Initialize with easily recognizable patterns
+    sse1[0i] = sse(1.0, 2.0);  // [1.0, 2.0]
+    sse2[0i] = sse(3.0, 4.0);  // [3.0, 4.0]
     
-    // Store result
-    slice_set_avx(out_avx, 0i, slice_get_avx(avx1, 0i));
-    slice_set_avx(out_avx, 1i, slice_get_avx(avx1, 1i));
+    // Expected results:
+    // ADD: [4.0, 6.0]    (1+3, 2+4)
+    // SUB: [-2.0, -2.0]  (1-3, 2-4)
+    // MUL: [3.0, 8.0]    (1*3, 2*4)
+    // DIV: [0.333, 0.5]  (1/3, 2/4)
+    
+    slice_set_sse(out_sse, 0i, slice_get_sse(sse1, 0i) + slice_get_sse(sse2, 0i));
+    slice_set_sse(out_sse, 1i, slice_get_sse(sse1, 0i) - slice_get_sse(sse2, 0i));
+    slice_set_sse(out_sse, 2i, slice_get_sse(sse1, 0i) * slice_get_sse(sse2, 0i));
+    slice_set_sse(out_sse, 3i, slice_get_sse(sse1, 0i) / slice_get_sse(sse2, 0i));
+    
+    // 2. AVX Tests (512-bit, 8 doubles)
+    var avx1 = make(AVXSlice, 1);
+    var avx2 = make(AVXSlice, 1);
+    
+    // Initialize with counting patterns
+    avx1[0i] = avx(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0);
+    avx2[0i] = avx(2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0);
+    
+    // Expected results:
+    // ADD: [3.0, 5.0, 7.0, 9.0, 11.0, 13.0, 15.0, 17.0]  (each + 2)
+    // SUB: [-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]  (each - 2)
+    // MUL: [2.0, 6.0, 10.0, 14.0, 18.0, 22.0, 26.0, 30.0]  (each * 2)
+    // DIV: [0.5, 0.667, 0.75, 0.8, 0.833, 0.857, 0.875, 0.889]  (each / 2)
+    
+    slice_set_avx(out_avx, 0i, slice_get_avx(avx1, 0i) + slice_get_avx(avx2, 0i));
+    slice_set_avx(out_avx, 1i, slice_get_avx(avx1, 0i) - slice_get_avx(avx2, 0i));
+    slice_set_avx(out_avx, 2i, slice_get_avx(avx1, 0i) * slice_get_avx(avx2, 0i));
+    slice_set_avx(out_avx, 3i, slice_get_avx(avx1, 0i) / slice_get_avx(avx2, 0i));
     
     return 1.0;
 }

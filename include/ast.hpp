@@ -8,6 +8,7 @@
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Module.h>
+#include "slice_type.hpp"
 
 class CodeGenContext;
 
@@ -27,12 +28,6 @@ enum BinaryOp {
     OpEQ  = 258,
     OpNE  = 259,
     OpMod = '%'  // Add modulo operator
-};
-
-// SIMD Slice types
-enum SliceType {
-    SSE_SLICE,  // 4 x double
-    AVX_SLICE   // 8 x double
 };
 
 // Base AST classes
@@ -215,10 +210,13 @@ public:
 
     const std::string& getName() const { return name; }
     bool isSlice() const { return sliceType != nullptr; }
-    SliceType getSliceType() const { return sliceType ? sliceType->getType() : SSE_SLICE; }
+    SliceType getSliceType() const { 
+        return sliceType ? sliceType->getType() : SliceType::SSE_SLICE; 
+    }
     unsigned getLine() const { return lineNo; }
     bool isGlobalVariable() const { return isGlobal; }
     const std::string& getTypeName() const { return typeName; }
+    ExprAST* getAssignmentExpr() const { return assignmentExpr; }
     
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
 };

@@ -1,19 +1,30 @@
-#ifndef SIMD_OPS_H
-#define SIMD_OPS_H
-
-#include <llvm/IR/Value.h>
+#pragma once
+#include <immintrin.h>
+#include <llvm/IR/IRBuilder.h>
 #include <vector>
-#include <string>
-#include <unordered_map>
-#include "codegen.hpp"
 
-// Forward declaration
+// Forward declarations
 class CodeGenContext;
 
-enum class SIMDWidth {
-    SSE = 2,    // 128-bit (2 doubles)
-    AVX = 8     // 512-bit (8 doubles)
-};
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// SSE Operations
+__m128d simd_add(__m128d a, __m128d b);
+__m128d simd_sub(__m128d a, __m128d b);
+__m128d simd_mul(__m128d a, __m128d b);
+__m128d simd_div(__m128d a, __m128d b);
+
+// AVX Operations
+__m256d simd_add_avx(__m256d a, __m256d b);
+__m256d simd_sub_avx(__m256d a, __m256d b);
+__m256d simd_mul_avx(__m256d a, __m256d b);
+__m256d simd_div_avx(__m256d a, __m256d b);
+
+#ifdef __cplusplus
+}
+#endif
 
 enum class SIMDOp {
     ADD,
@@ -22,14 +33,18 @@ enum class SIMDOp {
     DIV
 };
 
+enum class SIMDWidth {
+    SSE = 2,
+    AVX = 8
+};
+
+struct SliceStruct {
+    llvm::Value* data;  // Pointer to data
+    llvm::Value* length;  // Length of slice
+};
+
 class SIMDHelper {
 public:
-    static llvm::Value* createVector(
-        CodeGenContext& context,
-        const std::vector<llvm::Value*>& args,
-        SIMDWidth width
-    );
-    
     static llvm::Value* performOp(
         CodeGenContext& context,
         llvm::Value* lhs,
@@ -37,40 +52,13 @@ public:
         SIMDOp op,
         SIMDWidth width
     );
-    
-    static unsigned getVectorWidth(SIMDWidth width) {
-        return static_cast<unsigned>(width);
-    }
-    
-    static const char* getRuntimeFuncName(SIMDWidth width) {
-        switch(width) {
-            case SIMDWidth::SSE: return "sse";
-            case SIMDWidth::AVX: return "avx";
-            default: return nullptr;
-        }
-    }
-    
-    static const char* getOpFuncName(SIMDOp op, SIMDWidth width) {
-        static const std::unordered_map<SIMDOp, std::string> sse_ops = {
-            {SIMDOp::ADD, "simd_add"},
-            {SIMDOp::SUB, "simd_sub"},
-            {SIMDOp::MUL, "simd_mul"},
-            {SIMDOp::DIV, "simd_div"}
-        };
-        
-        static const std::unordered_map<SIMDOp, std::string> avx_ops = {
-            {SIMDOp::ADD, "simd_add_avx"},
-            {SIMDOp::SUB, "simd_sub_avx"},
-            {SIMDOp::MUL, "simd_mul_avx"},
-            {SIMDOp::DIV, "simd_div_avx"}
-        };
-        
-        const auto& ops = (width == SIMDWidth::AVX) ? avx_ops : sse_ops;
-        auto it = ops.find(op);
-        return it != ops.end() ? it->second.c_str() : nullptr;
-    }
 
-private:
+    static llvm::Value* createVector(
+        CodeGenContext& context,
+        const std::vector<llvm::Value*>& elements,
+        SIMDWidth width
+    );
+
     static llvm::Value* broadcastScalar(
         CodeGenContext& context,
         llvm::Value* scalar,
@@ -78,4 +66,12 @@ private:
     );
 };
 
-#endif // SIMD_OPS_H 
+// SSE slice operations
+llvm::Value* make_sse_slice(llvm::IRBuilder<>& builder, unsigned size);
+void slice_set_sse(llvm::IRBuilder<>& builder, SliceStruct& slice, 
+                   unsigned index, llvm::Value* value);
+
+// AVX slice operations
+llvm::Value* make_avx_slice(llvm::IRBuilder<>& builder, unsigned size);
+void slice_set_avx(llvm::IRBuilder<>& builder, SliceStruct& slice, 
+                   unsigned index, llvm::Value* value);
