@@ -13,19 +13,9 @@
 #endif
 
 // Vector creation operations
-__m128d sse(double a, double b, double c, double d) {
-    printf("\nSSE vector creation debug:\n");
-    printf("  Input values: %.2f, %.2f, %.2f, %.2f\n", a, b, c, d);
-    
-    alignas(16) double values[2] = {a, b};  // SSE only uses first two values
-    __m128d result = _mm_load_pd(values);
-    
-    // Debug the created vector
-    alignas(16) double check[2];
-    _mm_store_pd(check, result);
-    printf("  Created vector: [%.2f, %.2f]\n", check[0], check[1]);
-    
-    return result;
+__m128d sse(double a, double b) {
+    alignas(16) double values[2] = {a, b};
+    return _mm_load_pd(values);
 }
 
 #ifdef _MSC_VER
