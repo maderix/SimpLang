@@ -4,8 +4,8 @@ fn kernel_main(var out_sse SSESlice, var out_avx AVXSlice) {
     var sse2 = make(SSESlice, 4);
     
     // Initialize SSE test vectors
-    sse1[0i] = sse(1.0, 2.0, 3.0, 4.0);
-    sse2[0i] = sse(5.0, 6.0, 7.0, 8.0);
+    sse1[0i] = sse(1.0, 2.0);
+    sse2[0i] = sse(5.0, 6.0);
     
     // SSE Addition test
     var sse_vec1 = slice_get_sse(sse1, 0i);

@@ -25,8 +25,8 @@ fn kernel_main() {
     var output = make(SSESlice, 4);
 
     // Initialize vectors
-    input1[0i] = sse(1.0, 2.0, 3.0, 4.0);
-    input2[0i] = sse(5.0, 6.0, 7.0, 8.0);
+    input1[0i] = sse(1.0, 2.0);
+    input2[0i] = sse(5.0, 6.0);
 
     // Test vector addition
     var sum = add_vectors(input1, input2);
