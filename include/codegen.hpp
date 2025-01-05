@@ -181,6 +181,12 @@ public:
 
     llvm::Function* createFunction(const std::string& name,
                                  const std::vector<std::pair<std::string, llvm::Type*>>& args);
+
+    llvm::Value* createAlignedVector(llvm::Type* vectorType, llvm::Value* dataPtr);
+
+    llvm::Value* createAVXVector(const std::vector<double>& values);
+
+    void emitSliceSet(llvm::Value* slice, llvm::Value* index, llvm::Value* value);
 };
 
 #endif // CODEGEN_HPP

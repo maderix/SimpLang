@@ -7,7 +7,8 @@
 #include <llvm/IR/Type.h>
 
 llvm::Value* NumberExprAST::codeGen(CodeGenContext& context) {
-    if (isInteger) {
+    // Always use doubles unless explicitly needed for array indices
+    if (context.isIntegerContext() || isInteger) {
         return llvm::ConstantInt::get(
             context.getBuilder().getInt64Ty(), 
             (int64_t)value
@@ -34,8 +35,8 @@ llvm::Value* VariableExprAST::codeGen(CodeGenContext& context) {
         if (llvm::StructType* structTy = llvm::dyn_cast<llvm::StructType>(
             ptrTy->getPointerElementType()
         )) {
-            if (structTy->getName().equals("sse_slice_t") || 
-                structTy->getName().equals("avx_slice_t")) {
+            if (structTy->getName().equals("SSESlice") || 
+                structTy->getName().equals("AVXSlice")) {
                 return value;  // Return the pointer directly
             }
         }
@@ -278,9 +279,9 @@ llvm::Value* VariableDeclarationAST::codeGen(CodeGenContext& context) {
     if (auto sliceExpr = dynamic_cast<SliceExprAST*>(assignmentExpr)) {
         // Get the base slice struct type
         if (sliceExpr->getType() == SliceType::SSE_SLICE) {
-            type = llvm::StructType::getTypeByName(context.getContext(), "sse_slice_t");
+            type = llvm::StructType::getTypeByName(context.getContext(), "SSESlice");
         } else {
-            type = llvm::StructType::getTypeByName(context.getContext(), "avx_slice_t");
+            type = llvm::StructType::getTypeByName(context.getContext(), "AVXSlice");
         }
         
         if (!type) {
@@ -324,7 +325,7 @@ llvm::Value* FunctionAST::codeGen(CodeGenContext& context) {
         if (arg->isSlice()) {
             // Get the appropriate slice struct type based on the slice type
             SliceType sliceType = arg->getSliceType();
-            const char* typeName = sliceType == SliceType::SSE_SLICE ? "sse_slice_t" : "avx_slice_t";
+            const char* typeName = sliceType == SliceType::SSE_SLICE ? "SSESlice" : "AVXSlice";
             
             llvm::StructType* structType = llvm::StructType::getTypeByName(context.getContext(), typeName);
             if (!structType) {
@@ -546,92 +547,103 @@ llvm::Value* ReturnAST::codeGen(CodeGenContext& context) {
 
 llvm::Value* SIMDTypeExprAST::codeGen(CodeGenContext& context) {
     auto& builder = context.getBuilder();
-    unsigned width = isAVX ? 8 : 2;  // AVX uses 8 doubles, SSE uses 2 doubles
+    unsigned width = isAVX ? 8 : 2;
     
-    std::cout << "Generating " << (isAVX ? "AVX" : "SSE") << " vector with " 
-              << elements.size() << " elements (width=" << width << ")" << std::endl;
+    std::cout << "\nParsing " << (isAVX ? "AVX" : "SSE") << " vector initialization:" << std::endl;
+    std::cout << "Number of elements provided: " << elements.size() << std::endl;
+    std::cout << "Values: ";
     
-    // Create a vector of constant values
-    std::vector<llvm::Constant*> values;
-    for (auto elem : elements) {
-        llvm::Value* val = elem->codeGen(context);
-        if (!val) {
-            std::cerr << "Failed to generate element value" << std::endl;
-            return nullptr;
-        }
-        
-        // If it's a NumberExprAST, it should give us a constant
-        llvm::Constant* constVal = nullptr;
-        if (auto constFP = llvm::dyn_cast<llvm::ConstantFP>(val)) {
-            constVal = constFP;
-        } else if (auto constInt = llvm::dyn_cast<llvm::ConstantInt>(val)) {
-            // Convert integer constant to double
-            constVal = llvm::ConstantFP::get(
-                llvm::Type::getDoubleTy(context.getContext()),
-                (double)constInt->getSExtValue()
-            );
+    // Print the actual values being parsed
+    for (size_t i = 0; i < elements.size(); i++) {
+        if (auto* num = dynamic_cast<NumberExprAST*>(elements[i])) {
+            std::cout << num->getValue();
+            if (i < elements.size() - 1) std::cout << ", ";
         } else {
-            std::cerr << "Expected constant value for SIMD vector element" << std::endl;
+            std::cout << "<non-constant>";
+            if (i < elements.size() - 1) std::cout << ", ";
+        }
+    }
+    std::cout << std::endl;
+    
+    // Verify we have the right number of elements
+    if (elements.size() != width) {
+        std::cerr << "Vector size mismatch. Got " << elements.size() 
+                  << " elements but expected " << width << std::endl;
+        return nullptr;
+    }
+    
+    // Convert expressions to constants
+    std::vector<llvm::Constant*> constants;
+    llvm::Type* doubleType = llvm::Type::getDoubleTy(context.getContext());
+    
+    for (auto& expr : elements) {
+        llvm::Value* val = expr->codeGen(context);
+        if (!val) return nullptr;
+        
+        // Convert to constant
+        if (auto constFP = llvm::dyn_cast<llvm::ConstantFP>(val)) {
+            constants.push_back(constFP);
+        } else if (auto constInt = llvm::dyn_cast<llvm::ConstantInt>(val)) {
+            constants.push_back(llvm::ConstantFP::get(doubleType, 
+                static_cast<double>(constInt->getSExtValue())));
+        } else {
+            std::cerr << "Non-constant value in vector initialization" << std::endl;
             return nullptr;
         }
-        
-        double value = llvm::cast<llvm::ConstantFP>(constVal)->getValueAPF().convertToDouble();
-        std::cout << "Adding value to vector: " << value << std::endl;
-        values.push_back(constVal);
     }
     
-    // Pad with zeros if needed
-    while (values.size() < width) {
-        auto zero = llvm::ConstantFP::get(
-            llvm::Type::getDoubleTy(context.getContext()), 
-            0.0
-        );
-        std::cout << "Padding with zero" << std::endl;
-        values.push_back(zero);
+    // Create vector type with correct width
+    llvm::VectorType* vecType = llvm::VectorType::get(doubleType, width, false);
+    
+    std::cout << "Creating " << width << "-wide vector with values: ";
+    for (size_t i = 0; i < constants.size(); i++) {
+        if (auto constFP = llvm::dyn_cast<llvm::ConstantFP>(constants[i])) {
+            std::cout << constFP->getValueAPF().convertToDouble();
+            if (i < constants.size() - 1) std::cout << ", ";
+        }
     }
+    std::cout << std::endl;
     
-    // Create vector type and constant
-    auto vecType = llvm::FixedVectorType::get(
-        llvm::Type::getDoubleTy(context.getContext()),
-        width
-    );
-    
-    auto result = llvm::ConstantVector::get(values);
-    
-    // Debug: print the vector contents
-    std::cout << "Created " << width << "-wide vector with values: [";
-    for (unsigned i = 0; i < values.size(); i++) {
-        if (i > 0) std::cout << ", ";
-        double val = llvm::cast<llvm::ConstantFP>(values[i])->getValueAPF().convertToDouble();
-        std::cout << val;
-    }
-    std::cout << "]" << std::endl;
-    
-    return result;
+    return llvm::ConstantVector::get(constants);
 }
 
 
 llvm::Value* SIMDIntrinsicExprAST::codeGen(CodeGenContext& context) {
+    if (args.size() != 2) {
+        std::cerr << "SIMD intrinsic requires exactly 2 arguments" << std::endl;
+        return nullptr;
+    }
+
     llvm::Value* lhs = args[0]->codeGen(context);
     llvm::Value* rhs = args[1]->codeGen(context);
-    auto& builder = context.getBuilder();
+    if (!lhs || !rhs) return nullptr;
 
-    if (intrinsic == "add") {
-        return builder.CreateFAdd(lhs, rhs, "vec.add");
-    } else if (intrinsic == "mul") {
-        return builder.CreateFMul(lhs, rhs, "vec.mul");
-    } else if (intrinsic == "sub") {
-        return builder.CreateFSub(lhs, rhs, "vec.sub");
-    } else if (intrinsic == "div") {
-        return builder.CreateFDiv(lhs, rhs, "vec.div");
+    auto* simd = context.getSIMDInterface();
+    ArithOp op;
+    if (intrinsic == "add") op = ArithOp::Add;
+    else if (intrinsic == "mul") op = ArithOp::Mul;
+    else if (intrinsic == "sub") op = ArithOp::Sub;
+    else if (intrinsic == "div") op = ArithOp::Div;
+    else {
+        std::cerr << "Unknown SIMD intrinsic: " << intrinsic << std::endl;
+        return nullptr;
     }
-    return nullptr;
+
+    return simd->arithOp(context.getBuilder(), lhs, rhs, op);
 }
 
 // Slice implementations
 llvm::Value* SliceTypeAST::codeGen(CodeGenContext& context) {
-    // Rather than returning the type directly, create a null pointer of the slice type
-    llvm::Type* sliceType = context.getSliceType(type);
+    // Get the correct slice type (SSESlice or AVXSlice)
+    llvm::StructType* sliceType = type == SliceType::SSE_SLICE ? 
+        llvm::StructType::getTypeByName(context.getContext(), "SSESlice") :
+        llvm::StructType::getTypeByName(context.getContext(), "AVXSlice");
+    
+    if (!sliceType) {
+        std::cerr << "Slice type not found" << std::endl;
+        return nullptr;
+    }
+
     return llvm::ConstantPointerNull::get(
         llvm::PointerType::get(sliceType, 0)
     );
@@ -646,48 +658,41 @@ llvm::Value* SliceExprAST::codeGen(CodeGenContext& context) {
         std::cerr << "Failed to generate length code" << std::endl;
         return nullptr;
     }
-
-    // Give the SliceType first, then the length
-    return context.createSlice(type, len);  // type is a member variable of SliceExprAST
+    
+    // Convert double to i64 if needed
+    if (len->getType()->isDoubleTy()) {
+        len = context.getBuilder().CreateFPToSI(
+            len,
+            llvm::Type::getInt64Ty(context.getContext()),
+            "len_i64"
+        );
+    }
+    
+    // Get the appropriate make function based on slice type
+    std::string makeFuncName = type == SliceType::SSE_SLICE ? 
+                              "make_sse_slice" : "make_avx_slice";
+    
+    llvm::Function* makeFunc = context.getModule()->getFunction(makeFuncName);
+    if (!makeFunc) {
+        std::cerr << "Make function " << makeFuncName << " not found" << std::endl;
+        return nullptr;
+    }
+    
+    // Call make function with length
+    return context.getBuilder().CreateCall(makeFunc, {len});
 }
 
 llvm::Value* SliceStoreExprAST::codeGen(CodeGenContext& context) {
     std::cout << "Generating slice store for " << slice_name_ << std::endl;
     
-    // Get the pointer to pointer (alloca)
+    // Get the slice pointer
     llvm::Value* slicePtrPtr = context.getSymbolValue(slice_name_);
     if (!slicePtrPtr) {
         std::cerr << "Unknown slice: " << slice_name_ << std::endl;
         return nullptr;
     }
-    std::cout << "Found slice pointer pointer" << std::endl;
     
-    // Generate index
-    llvm::Value* idx = index_->codeGen(context);
-    if (!idx) return nullptr;
-    
-    if (auto constIdx = llvm::dyn_cast<llvm::ConstantInt>(idx)) {
-        std::cout << "Store index: " << constIdx->getSExtValue() << std::endl;
-    }
-    
-    // Generate value to store
-    llvm::Value* value = value_->codeGen(context);
-    if (!value) {
-        std::cerr << "Failed to generate value to store" << std::endl;
-        return nullptr;
-    }
-    
-    // Print vector contents if it's a constant vector
-    if (auto constVec = llvm::dyn_cast<llvm::ConstantDataVector>(value)) {
-        std::cout << "Storing constant vector: [";
-        for (unsigned i = 0; i < constVec->getNumElements(); i++) {
-            if (i > 0) std::cout << ", ";
-            std::cout << constVec->getElementAsDouble(i);
-        }
-        std::cout << "]" << std::endl;
-    }
-    
-    // Load the actual slice pointer from the alloca
+    // Load the actual slice pointer
     auto& builder = context.getBuilder();
     llvm::Value* slicePtr = builder.CreateLoad(
         slicePtrPtr->getType()->getPointerElementType(),
@@ -695,142 +700,117 @@ llvm::Value* SliceStoreExprAST::codeGen(CodeGenContext& context) {
         slice_name_ + ".loaded"
     );
     
-    // Get the appropriate store function
-    llvm::Function* setFunc = nullptr;
-    unsigned expectedWidth = 0;
+    // Determine slice type (SSE or AVX)
+    llvm::Type* sliceType = slicePtr->getType()->getPointerElementType();
+    std::string typeName = sliceType->getStructName().str();
+    std::cout << "Slice type: " << typeName << std::endl;
+    bool isAVX = (typeName == "AVXSlice");
     
-    // Check that we have a pointer to a struct
-    if (!slicePtr->getType()->isPointerTy()) {
-        std::cerr << "Expected pointer type for slice" << std::endl;
+    std::cout << "Storing to " << typeName << " at " << slice_name_ 
+              << " (pointer: " << slicePtr << ")" << std::endl;
+    
+    // Generate index
+    llvm::Value* idx = index_->codeGen(context);
+    if (!idx) return nullptr;
+    
+    // Generate value
+    llvm::Value* value = value_->codeGen(context);
+    if (!value) return nullptr;
+    
+    // Verify vector type
+    auto vecType = llvm::dyn_cast<llvm::FixedVectorType>(value->getType());
+    if (!vecType) {
+        std::cerr << "Value is not a vector type" << std::endl;
         return nullptr;
     }
     
-    // Get the struct type
-    llvm::Type* sliceStructTy = slicePtr->getType()->getPointerElementType();
-    if (!sliceStructTy->isStructTy()) {
-        std::cerr << "Expected struct type for slice" << std::endl;
+    unsigned width = vecType->getElementCount().getFixedValue();
+    unsigned expectedWidth = isAVX ? 8 : 2;
+    
+    if (width != expectedWidth) {
+        std::cerr << "Vector width mismatch. Got " << width 
+                  << " but expected " << expectedWidth << std::endl;
         return nullptr;
     }
     
-    // Check the struct type name
-    llvm::StructType* structTy = llvm::cast<llvm::StructType>(sliceStructTy);
-    std::string typeName = structTy->getName().str();
-    std::cout << "Struct type name: " << typeName << std::endl;
+    // Call appropriate set function
+    llvm::Function* setFunc = context.getModule()->getFunction(
+        isAVX ? "slice_set_avx" : "slice_set_sse"
+    );
     
-    if (typeName == "sse_slice_t") {
-        setFunc = context.getModule()->getFunction("slice_set_sse");
-        expectedWidth = 2;
-    } else if (typeName == "avx_slice_t") {
-        setFunc = context.getModule()->getFunction("slice_set_avx");
-        expectedWidth = 8;
+    if (!setFunc) {
+        std::cerr << "Failed to find slice set function: " 
+                  << (isAVX ? "slice_set_avx" : "slice_set_sse") << std::endl;
+        return nullptr;
+    }
+    
+    std::cout << "Calling " << (isAVX ? "slice_set_avx" : "slice_set_sse") 
+              << " with slice pointer " << slicePtr 
+              << " and vector width " << width << std::endl;
+    
+    return builder.CreateCall(setFunc, {slicePtr, idx, value});
+}
+
+llvm::Value* SliceAccessExprAST::codeGen(CodeGenContext& context) {
+    // Get the slice pointer
+    llvm::Value* slicePtrPtr = context.getSymbolValue(slice_name);
+    if (!slicePtrPtr) {
+        std::cerr << "Unknown slice: " << slice_name << std::endl;
+        return nullptr;
+    }
+    
+    // Load the slice struct
+    auto& builder = context.getBuilder();
+    llvm::Value* slicePtr = builder.CreateLoad(
+        slicePtrPtr->getType()->getPointerElementType(),
+        slicePtrPtr
+    );
+    
+    // Generate index
+    llvm::Value* idx = index->codeGen(context);
+    if (!idx) return nullptr;
+    
+    // Determine if this is an AVX or SSE slice and call appropriate get function
+    llvm::Type* sliceType = slicePtr->getType()->getPointerElementType();
+    std::string typeName = sliceType->getStructName().str();
+    
+    llvm::Function* getFunc;
+    if (typeName == "SSESlice") {
+        getFunc = context.getModule()->getFunction("slice_get_sse");
+    } else if (typeName == "AVXSlice") {
+        getFunc = context.getModule()->getFunction("slice_get_avx");
     } else {
         std::cerr << "Unknown slice type: " << typeName << std::endl;
         return nullptr;
     }
     
-    if (!setFunc) {
-        std::cerr << "Set function not found" << std::endl;
-        return nullptr;
-    }
-    
-    // Make sure the value is a vector of the right size
-    if (auto vecTy = llvm::dyn_cast<llvm::FixedVectorType>(value->getType())) {
-        if (vecTy->getNumElements() != expectedWidth) {
-            std::cerr << "Vector size mismatch. Expected " << expectedWidth 
-                      << " but got " << vecTy->getNumElements() << std::endl;
-            return nullptr;
-        }
-        std::cout << "Storing vector with " << vecTy->getNumElements() 
-                  << " elements at index " << slice_name_ << "[" 
-                  << (llvm::dyn_cast<llvm::ConstantInt>(idx) ? 
-                      llvm::dyn_cast<llvm::ConstantInt>(idx)->getSExtValue() : -1)
-                  << "]" << std::endl;
-    }
-    
-    // Create the store call
-    auto call = builder.CreateCall(
-        setFunc,
-        {slicePtr, idx, value}
-    );
-    
-    std::cout << "Generated slice store instruction" << std::endl;
-    return call;
-}
-
-llvm::Value* SliceAccessExprAST::codeGen(CodeGenContext& context) {
-    std::cout << "Generating code for SliceAccess: " << slice_name << std::endl;
-    
-    // Get slice pointer
-    llvm::Value* slicePtr = context.getSymbolValue(slice_name);
-    if (!slicePtr) {
-        std::cerr << "Error: Unknown slice: " << slice_name << std::endl;
-        return nullptr;
-    }
-    std::cout << "Found slice pointer" << std::endl;
-    
-    // Load actual slice using newer API
-    llvm::Type* elementType = slicePtr->getType()->getPointerElementType();
-    llvm::Value* slice = context.getBuilder().CreateLoad(elementType, slicePtr, "slice.ptr");
-    std::cout << "Loaded slice" << std::endl;
-    
-    // Generate index
-    llvm::Value* idx = index->codeGen(context);
-    if (!idx) {
-        std::cerr << "Error: Failed to generate index" << std::endl;
-        return nullptr;
-    }
-    
-    // Convert index to i64 if needed
-    if (idx->getType()->isDoubleTy()) {
-        idx = context.getBuilder().CreateFPToSI(idx, 
-            context.getBuilder().getInt64Ty(), "idx.conv");
-    }
-    
-    // Determine slice type using newer API
-    bool isSSE = false;
-    llvm::Type* sliceType = slice->getType()->getPointerElementType();
-    if (auto structTy = llvm::dyn_cast<llvm::StructType>(sliceType)) {
-        isSSE = (structTy->getName() == "SSESlice");
-        std::cout << "Slice type is " << (isSSE ? "SSE" : "AVX") << std::endl;
-    } else {
-        std::cerr << "Error: Not a struct type" << std::endl;
-        return nullptr;
-    }
-    
-    // Get get function
-    llvm::Function* getFunc = context.getModule()->getFunction(
-        isSSE ? "slice_get_sse" : "slice_get_avx"
-    );
-    if (!getFunc) {
-        std::cerr << "Error: Get function not found" << std::endl;
-        return nullptr;
-    }
-    
-    std::cout << "Creating call with types:" << std::endl;
-    std::cout << "  slice: " << slice->getType()->getTypeID() << std::endl;
-    std::cout << "  idx: " << idx->getType()->getTypeID() << std::endl;
-    
-    // Create call
-    return context.getBuilder().CreateCall(getFunc, {slice, idx}, "slice.get");
+    return builder.CreateCall(getFunc, {slicePtr, idx});
 }
 
 llvm::Value* VectorCreationExprAST::codeGen(CodeGenContext& context) {
-    std::vector<llvm::Value*> args;
+    std::cout << "\nCreating vector in VectorCreationExprAST:" << std::endl;
+    std::cout << "isAVX: " << isAVX_ << std::endl;
+    std::cout << "Number of elements: " << elements_.size() << std::endl;
+    
+    // Convert unique_ptrs to raw pointers for SIMDTypeExprAST
+    std::vector<ExprAST*> raw_elements;
     for (const auto& elem : elements_) {
-        llvm::Value* val = elem->codeGen(context);
-        if (!val) return nullptr;
-        args.push_back(val);
+        raw_elements.push_back(elem.get());
     }
     
-    // Verify vector size matches expected width
-    SIMDWidth width = isAVX_ ? SIMDWidth::AVX : SIMDWidth::SSE;
-    size_t expectedSize = isAVX_ ? 8 : 2;
+    // Create SIMD type expression with correct width flag
+    auto simdExpr = std::make_unique<SIMDTypeExprAST>(raw_elements, isAVX_);
     
-    if (args.size() != expectedSize) {
-        std::cerr << "Vector size mismatch. Expected " << expectedSize 
-                  << " elements but got " << args.size() << std::endl;
-        return nullptr;
+    // Generate the vector with proper width
+    llvm::Value* result = simdExpr->codeGen(context);
+    
+    // Check the resulting vector type
+    if (result) {
+        if (auto vecType = llvm::dyn_cast<llvm::VectorType>(result->getType())) {
+            std::cout << "Created vector with width: " 
+                      << vecType->getElementCount().getFixedValue() << std::endl;
+        }
     }
     
-    return SIMDHelper::createVector(context, args, width);
+    return result;
 }

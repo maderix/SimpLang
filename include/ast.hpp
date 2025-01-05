@@ -290,7 +290,17 @@ class VectorCreationExprAST : public ExprAST {
     
 public:
     VectorCreationExprAST(std::vector<std::unique_ptr<ExprAST>> elements, bool isAVX)
-        : elements_(std::move(elements)), isAVX_(isAVX) {}
+        : elements_(std::move(elements)), isAVX_(isAVX) {
+        // Validate vector size at construction
+        size_t expected = isAVX ? 8 : 2;
+        if (elements_.size() != expected) {
+            std::string msg = "Vector size mismatch. Got " + 
+                            std::to_string(elements_.size()) + 
+                            " elements but expected " + 
+                            std::to_string(expected);
+            throw std::runtime_error(msg);
+        }
+    }
         
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
 };

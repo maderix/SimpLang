@@ -6,6 +6,7 @@
 #include <vector>
 #include <string>
 #include <immintrin.h>
+#include <iostream>
 
 // On MSVC use __forceinline; otherwise use GCC/Clang attribute
 #ifdef _MSC_VER
@@ -74,18 +75,20 @@ enum class CmpOp { EQ, LT, GT, LE, GE, NE };
  * We do not define or rename __m512d or _mm512_* here if AVX-512 is found.
  */
 class SIMDInterface {
-protected:
-    // Helper for arithmetic operations
+public:
+    virtual ~SIMDInterface() = default;
+
+    // Move arithOp to public and make it a public interface method
     virtual llvm::Value* arithOp(llvm::IRBuilder<>& builder,
                                 llvm::Value* lhs, llvm::Value* rhs,
                                 ArithOp op) {
         switch (op) {
-            case ArithOp::Add: return builder.CreateFAdd(lhs, rhs);
-            case ArithOp::Sub: return builder.CreateFSub(lhs, rhs);
-            case ArithOp::Mul: return builder.CreateFMul(lhs, rhs);
-            case ArithOp::Div: return builder.CreateFDiv(lhs, rhs);
+            case ArithOp::Add: return builder.CreateFAdd(lhs, rhs, "simd.add");
+            case ArithOp::Sub: return builder.CreateFSub(lhs, rhs, "simd.sub");
+            case ArithOp::Mul: return builder.CreateFMul(lhs, rhs, "simd.mul");
+            case ArithOp::Div: return builder.CreateFDiv(lhs, rhs, "simd.div");
+            default: return nullptr;
         }
-        return nullptr;
     }
 
     // Helper for comparison operations
@@ -102,9 +105,6 @@ protected:
         }
         return nullptr;
     }
-
-public:
-    virtual ~SIMDInterface() = default;
 
     // Vector creation
     virtual llvm::Value* createVector(llvm::IRBuilder<>& builder,
@@ -161,9 +161,13 @@ protected:
     BaseSIMDImpl(unsigned width) : vectorWidth_(width) {}
 
 public:
-    // Common implementations that were duplicated
     llvm::Value* createVector(llvm::IRBuilder<>& builder,
                              std::vector<llvm::Value*>& elements) override {
+        if (elements.size() > vectorWidth_) {
+            std::cerr << "Warning: Vector creation truncated to " 
+                      << vectorWidth_ << " elements" << std::endl;
+        }
+        
         llvm::Type* doubleType = builder.getDoubleTy();
         llvm::VectorType* vectorType = llvm::VectorType::get(doubleType, vectorWidth_, false);
         llvm::Value* vector = llvm::UndefValue::get(vectorType);
@@ -172,6 +176,16 @@ public:
             vector = builder.CreateInsertElement(vector, elements[i], 
                                               builder.getInt32(i));
         }
+        
+        // Fill remaining elements with zeros if needed
+        if (elements.size() < vectorWidth_) {
+            auto zero = llvm::ConstantFP::get(doubleType, 0.0);
+            for (size_t i = elements.size(); i < vectorWidth_; i++) {
+                vector = builder.CreateInsertElement(vector, zero, 
+                                                  builder.getInt32(i));
+            }
+        }
+        
         return vector;
     }
 

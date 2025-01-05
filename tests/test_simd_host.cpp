@@ -5,6 +5,18 @@
 #include <vector>
 #include <immintrin.h>
 
+// Global variables
+sse_vector_t* sse_data = nullptr;
+avx_vector_t* avx_data = nullptr;
+
+// Number of vectors in each slice
+#define NUM_SSE_VECTORS 4  // Number of SSE vectors (each vector is 2 doubles)
+#define NUM_AVX_VECTORS 4  // Number of AVX vectors (each vector is 8 doubles)
+
+// Vector sizes (for reference)
+#define SSE_VECTOR_SIZE 2  // Each SSE vector holds 2 doubles
+#define AVX_VECTOR_SIZE 8  // Each AVX vector holds 8 doubles
+
 void print_vector(const char* label, double* data, size_t elements) {
     std::cout << label << ": [";
     for (size_t i = 0; i < elements; i++) {
@@ -12,6 +24,48 @@ void print_vector(const char* label, double* data, size_t elements) {
         if (i < elements - 1) std::cout << ", ";
     }
     std::cout << "]\n";
+}
+
+// Allocate memory for test data
+void allocateTestData() {
+    // Allocate SSE vectors
+    size_t sse_size = NUM_SSE_VECTORS * sizeof(sse_vector_t);
+    sse_data = (sse_vector_t*)aligned_alloc(16, sse_size);
+    
+    // Allocate AVX vectors
+    size_t avx_size = NUM_AVX_VECTORS * sizeof(avx_vector_t);
+    avx_data = (avx_vector_t*)aligned_alloc(64, avx_size);
+
+    // Initialize test data (using vector types)
+    for (size_t i = 0; i < NUM_SSE_VECTORS; i++) {
+        sse_data[i] = (sse_vector_t){static_cast<double>(i*2 + 1),
+                                    static_cast<double>(i*2 + 2)};
+    }
+    
+    for (size_t i = 0; i < NUM_AVX_VECTORS; i++) {
+        avx_data[i] = (avx_vector_t){
+            static_cast<double>(i*8 + 1),
+            static_cast<double>(i*8 + 2),
+            static_cast<double>(i*8 + 3),
+            static_cast<double>(i*8 + 4),
+            static_cast<double>(i*8 + 5),
+            static_cast<double>(i*8 + 6),
+            static_cast<double>(i*8 + 7),
+            static_cast<double>(i*8 + 8)
+        };
+    }
+}
+
+// Clean up function
+void cleanupTestData() {
+    if (sse_data) {
+        free(sse_data);
+        sse_data = nullptr;
+    }
+    if (avx_data) {
+        free(avx_data);
+        avx_data = nullptr;
+    }
 }
 
 int main(int argc, char* argv[]) {
@@ -35,9 +89,13 @@ int main(int argc, char* argv[]) {
             throw std::runtime_error("Failed to allocate aligned memory");
         }
 
+        // Cast the raw double pointers to the appropriate SIMD vector types
+        sse_vector_t* sse_vec_data = reinterpret_cast<sse_vector_t*>(sse_data);
+        avx_vector_t* avx_vec_data = reinterpret_cast<avx_vector_t*>(avx_data);
+
         // Initialize slices
-        SSESlice sse_slice = {(float*)sse_data, num_vectors};
-        AVXSlice avx_slice = {(float*)avx_data, num_vectors};
+        SSESlice sse_slice = {sse_vec_data, num_vectors, num_vectors};
+        AVXSlice avx_slice = {avx_vec_data, num_vectors, num_vectors};
 
         // Run kernel
         runner.loadLibrary(argv[1]);

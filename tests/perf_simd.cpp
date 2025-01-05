@@ -46,9 +46,14 @@ int main(int argc, char* argv[]) {
             throw std::runtime_error("Failed to allocate aligned memory");
         }
 
-        // Initialize slices
-        SSESlice sse_slice = {(float*)sse_data, VECTOR_SIZE};
-        AVXSlice avx_slice = {(float*)avx_data, VECTOR_SIZE};
+        // Before slice initialization
+        // Cast the raw double pointers to the appropriate SIMD vector types
+        sse_vector_t* sse_vec_data = reinterpret_cast<sse_vector_t*>(sse_data);
+        avx_vector_t* avx_vec_data = reinterpret_cast<avx_vector_t*>(avx_data);
+
+        // Initialize slices with properly typed pointers
+        SSESlice sse_slice = {sse_vec_data, VECTOR_SIZE, VECTOR_SIZE};
+        AVXSlice avx_slice = {avx_vec_data, VECTOR_SIZE, VECTOR_SIZE};
 
         // Load kernel
         runner.loadLibrary(argv[1]);

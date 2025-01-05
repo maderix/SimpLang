@@ -39,8 +39,9 @@ enum class SIMDWidth {
 };
 
 struct SliceStruct {
-    llvm::Value* data;  // Pointer to data
+    llvm::Value* data;    // Pointer to data
     llvm::Value* length;  // Length of slice
+    llvm::Value* capacity;  // Capacity of slice
 };
 
 class SIMDHelper {
