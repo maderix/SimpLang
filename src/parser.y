@@ -57,6 +57,9 @@
 %token TMAKE TSSESLICE TAVXSLICE TLBRACKET TRBRACKET
 %token UNARY_MINUS  /* Add this token for unary minus */
 %token TOK_MOD
+%token <string> IDENTIFIER
+%token <double> NUMBER
+%token SSE AVX
 
 %left TLBRACKET    /* For array subscripting */
 %left '+' '-'
@@ -118,11 +121,26 @@ expr : expr '+' expr   { $$ = new BinaryExprAST(static_cast<BinaryOp>('+'), make
      | vector_expr     { $$ = $1; }
      ;
 
-vector_expr : TSSE TLPAREN expr_list TRPAREN 
-             { $$ = new VectorCreationExprAST(makeUniqueVector(*$3), false); }
-           | TAVX TLPAREN expr_list TRPAREN 
-             { $$ = new VectorCreationExprAST(makeUniqueVector(*$3), true); }
-           ;
+vector_expr 
+    : TSSE TLPAREN expr_list TRPAREN {
+        std::cout << "\nParsing SSE vector with " << $3->size() << " elements" << std::endl;
+        if ($3->size() != 2) {
+            yyerror("SSE vector must have exactly 2 elements");
+            YYERROR;
+        }
+        $$ = new VectorCreationExprAST(makeUniqueVector(*$3), false);
+        delete $3;
+    }
+    | TAVX TLPAREN expr_list TRPAREN {
+        std::cout << "\nParsing AVX vector with " << $3->size() << " elements" << std::endl;
+        if ($3->size() != 8) {
+            yyerror("AVX vector must have exactly 8 elements");
+            YYERROR;
+        }
+        $$ = new VectorCreationExprAST(makeUniqueVector(*$3), true);
+        delete $3;
+    }
+    ;
 
 block : TLBRACE stmts TRBRACE { $$ = $2; }
       | TLBRACE TRBRACE { $$ = new BlockAST(); }
@@ -139,9 +157,16 @@ slice_type : TSSESLICE { $$ = new SliceTypeAST(SliceType::SSE_SLICE); }
           | TAVXSLICE { $$ = new SliceTypeAST(SliceType::AVX_SLICE); }
           ;
 
-expr_list : expr { $$ = new std::vector<ExprAST*>(); $$->push_back($1); }
-         | expr_list TCOMMA expr { $1->push_back($3); $$ = $1; }
-         ;
+expr_list 
+    : expr { 
+        $$ = new std::vector<ExprAST*>(); 
+        $$->push_back($1); 
+    }
+    | expr_list TCOMMA expr { 
+        $1->push_back($3); 
+        $$ = $1; 
+    }
+    ;
 
 slice_expr : TMAKE TLPAREN slice_type TCOMMA expr TRPAREN 
             { $$ = new SliceExprAST($3->getType(), $5); }

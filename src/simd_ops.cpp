@@ -13,14 +13,7 @@ llvm::Value* SIMDHelper::performOp(
     SIMDWidth width
 ) {
     auto& builder = context.getBuilder();
-    
-    // Get vector type
-    unsigned numElements = static_cast<unsigned>(width);
-    llvm::Type* vecType = llvm::VectorType::get(
-        builder.getDoubleTy(),
-        numElements,
-        false
-    );
+    auto* simd = context.getSIMDInterface();
     
     // Load pointers if needed
     if (lhs->getType()->isPointerTy()) {
@@ -30,28 +23,20 @@ llvm::Value* SIMDHelper::performOp(
         rhs = builder.CreateLoad(rhs->getType()->getPointerElementType(), rhs);
     }
     
-    // Broadcast scalar to vector if needed
-    if (!lhs->getType()->isVectorTy()) {
-        lhs = broadcastScalar(context, lhs, vecType);
-    }
-    if (!rhs->getType()->isVectorTy()) {
-        rhs = broadcastScalar(context, rhs, vecType);
-    }
-    
-    // Perform operation
+    // Convert SIMDOp to ArithOp
+    ArithOp arithOp;
     switch (op) {
-        case SIMDOp::ADD:
-            return builder.CreateFAdd(lhs, rhs, "vec.add");
-        case SIMDOp::SUB:
-            return builder.CreateFSub(lhs, rhs, "vec.sub");
-        case SIMDOp::MUL:
-            return builder.CreateFMul(lhs, rhs, "vec.mul");
-        case SIMDOp::DIV:
-            return builder.CreateFDiv(lhs, rhs, "vec.div");
+        case SIMDOp::ADD: arithOp = ArithOp::Add; break;
+        case SIMDOp::SUB: arithOp = ArithOp::Sub; break;
+        case SIMDOp::MUL: arithOp = ArithOp::Mul; break;
+        case SIMDOp::DIV: arithOp = ArithOp::Div; break;
         default:
             std::cerr << "Unknown SIMD operation" << std::endl;
             return nullptr;
     }
+    
+    // Use SIMD interface for operation
+    return simd->arithOp(builder, lhs, rhs, arithOp);
 }
 
 llvm::Value* SIMDHelper::createVector(
@@ -138,11 +123,13 @@ llvm::Value* SIMDHelper::broadcastScalar(
 }
 
 llvm::Value* make_sse_slice(llvm::IRBuilder<>& builder, unsigned size) {
-    // Create struct type for slice
-    std::vector<llvm::Type*> members;
-    members.push_back(llvm::PointerType::get(llvm::VectorType::get(
-        builder.getDoubleTy(), 2, false), 0));
-    members.push_back(builder.getInt32Ty());
+    std::vector<llvm::Type*> members = {
+        llvm::PointerType::get(llvm::VectorType::get(
+            builder.getDoubleTy(), 2, false), 0),
+        builder.getInt64Ty(),  // size
+        builder.getInt64Ty()   // capacity
+    };
+    
     llvm::StructType* sliceType = llvm::StructType::create(
         builder.getContext(), members, "SSESlice");
     
@@ -156,8 +143,8 @@ llvm::Value* make_sse_slice(llvm::IRBuilder<>& builder, unsigned size) {
     // Create and initialize the slice struct
     llvm::Value* slice = llvm::UndefValue::get(sliceType);
     slice = builder.CreateInsertValue(slice, data, 0);
-    slice = builder.CreateInsertValue(slice, 
-        builder.getInt32(size), 1);
+    slice = builder.CreateInsertValue(slice, builder.getInt64(size), 1);
+    slice = builder.CreateInsertValue(slice, builder.getInt64(size), 2);
     
     return slice;
 }
@@ -172,33 +159,57 @@ void slice_set_sse(llvm::IRBuilder<>& builder, SliceStruct& slice,
 }
 
 llvm::Value* make_avx_slice(llvm::IRBuilder<>& builder, unsigned size) {
-    // Similar to SSE but with 8-wide vectors
-    std::vector<llvm::Type*> members;
-    members.push_back(llvm::PointerType::get(llvm::VectorType::get(
-        builder.getDoubleTy(), 8, false), 0));
-    members.push_back(builder.getInt32Ty());
+    // Make AVX slice consistent with SSE slice structure
+    std::vector<llvm::Type*> members = {
+        llvm::PointerType::get(llvm::VectorType::get(
+            builder.getDoubleTy(), 8, false), 0),  // data pointer to 8-wide vectors
+        builder.getInt64Ty(),  // size
+        builder.getInt64Ty()   // capacity
+    };
+    
     llvm::StructType* sliceType = llvm::StructType::create(
         builder.getContext(), members, "AVXSlice");
     
+    // Allocate memory for the vector data (8 doubles per vector)
     llvm::Value* dataSize = builder.getInt64(size * sizeof(double) * 8);
     llvm::Value* data = builder.CreateCall(
         builder.GetInsertBlock()->getModule()->getFunction("malloc"), 
         {dataSize});
     data = builder.CreateBitCast(data, members[0]);
     
+    // Create and initialize the slice struct (same pattern as SSE)
     llvm::Value* slice = llvm::UndefValue::get(sliceType);
     slice = builder.CreateInsertValue(slice, data, 0);
-    slice = builder.CreateInsertValue(slice, 
-        builder.getInt32(size), 1);
+    slice = builder.CreateInsertValue(slice, builder.getInt64(size), 1);
+    slice = builder.CreateInsertValue(slice, builder.getInt64(size), 2);
+    
+    std::cout << "Created AVX slice with size " << size 
+              << " and data pointer " << data << std::endl;
     
     return slice;
 }
 
 void slice_set_avx(llvm::IRBuilder<>& builder, SliceStruct& slice, 
                    unsigned index, llvm::Value* value) {
-    llvm::Value* ptr = builder.CreateGEP(
-        llvm::VectorType::get(builder.getDoubleTy(), 8, false),
-        slice.data, 
-        builder.getInt32(index));
-    builder.CreateStore(value, ptr);
+    std::cout << "\nAVX slice_set_avx debug:" << std::endl;
+    
+    // Calculate proper byte offset for AVX vectors (8 doubles = 64 bytes)
+    llvm::Value* offset = builder.CreateMul(
+        builder.getInt64(index),
+        builder.getInt64(8),  // 8 doubles per AVX vector
+        "avx.offset"
+    );
+    
+    // Create GEP with explicit AVX vector type (8 doubles)
+    auto avxType = llvm::VectorType::get(builder.getDoubleTy(), 8, false);
+    llvm::Value* ptr = builder.CreateGEP(avxType, slice.data, offset, "avx.ptr");
+    
+    // Store with proper alignment
+    auto store = builder.CreateStore(value, ptr);
+    store->setAlignment(llvm::Align(64));  // AVX-512 needs 64-byte alignment
+    
+    std::cout << "  Vector width: " << 
+        llvm::dyn_cast<llvm::VectorType>(avxType)->getElementCount().getFixedValue() << std::endl;
+    std::cout << "  Offset in doubles: " << index * 8 << std::endl;
+    std::cout << "  Store operation completed with 64-byte alignment" << std::endl;
 } 

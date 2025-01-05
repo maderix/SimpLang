@@ -26,31 +26,18 @@ __m512d avx(double a, double b, double c, double d,
             double e, double f, double g, double h)
 #endif
 {
-    // Immediately store all XMM registers to prevent them from being clobbered
-    alignas(64) double values[8];
-    __asm__ volatile(
-        "vmovsd %%xmm0, %0\n\t"
-        "vmovsd %%xmm1, %1\n\t"
-        "vmovsd %%xmm2, %2\n\t"
-        "vmovsd %%xmm3, %3\n\t"
-        "vmovsd %%xmm4, %4\n\t"
-        "vmovsd %%xmm5, %5\n\t"
-        "vmovsd %%xmm6, %6\n\t"
-        "vmovsd %%xmm7, %7\n\t"
-        : "=m"(values[0]), "=m"(values[1]), "=m"(values[2]), "=m"(values[3]),
-          "=m"(values[4]), "=m"(values[5]), "=m"(values[6]), "=m"(values[7])
-        :
-        : "memory"
-    );
+    // Directly store function parameters into aligned array
+    alignas(64) double values[8] = {a, b, c, d, e, f, g, h};
 
     printf("\nAVX vector creation debug:\n");
     printf("  Input values: %.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f\n",
            values[0], values[1], values[2], values[3],
            values[4], values[5], values[6], values[7]);
            
+    // Load values into AVX register
     __m512d result = _mm512_load_pd(values);
     
-    // Debug the created vector
+    // Debug: verify the loaded values
     alignas(64) double check[8];
     _mm512_store_pd(check, result);
     printf("  Created vector: [%.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f]\n",
@@ -131,23 +118,37 @@ sse_slice_t* make_sse_slice(size_t len) {
     return slice;
 }
 
-avx_slice_t* make_avx_slice(size_t len) {
-    avx_slice_t* slice = (avx_slice_t*)malloc(sizeof(avx_slice_t));
+avx_slice_t* make_avx_slice(size_t capacity) {
+    printf("\nCreating AVX slice with capacity %zu\n", capacity);
+    
+    // Allocate the slice struct
+    avx_slice_t* slice = (avx_slice_t*)aligned_alloc(64, sizeof(avx_slice_t));
     if (!slice) {
-        printf("Failed to allocate AVX slice\n");
-        abort();
+        printf("Failed to allocate AVX slice struct\n");
+        return nullptr;
     }
     
-    size_t cap = len > 0 ? len : 1;
-    slice->data = allocate_avx_vectors(cap);
+    // Each AVX vector is 512 bits (64 bytes, 8 doubles)
+    size_t total_size = capacity * sizeof(__m512d);
+    slice->data = (__m512d*)aligned_alloc(64, total_size);
     if (!slice->data) {
-        printf("Failed to allocate AVX vectors\n");
-        free(slice);
-        abort();
+        printf("Failed to allocate AVX slice data array\n");
+        aligned_free(slice);
+        return nullptr;
     }
     
-    slice->len = 0;
-    slice->cap = cap;
+    // Initialize everything to zero
+    memset(slice->data, 0, total_size);
+    
+    slice->len = 0;  // Start with length 0
+    slice->cap = capacity;  // Use requested capacity
+    
+    printf("  Slice created at %p\n", (void*)slice);
+    printf("  Data pointer at %p\n", (void*)slice->data);
+    printf("  Vector size: %zu bytes\n", sizeof(__m512d));
+    printf("  Total allocation: %zu bytes\n", total_size);
+    printf("  Capacity: %zu vectors\n", capacity);
+    
     return slice;
 }
 
@@ -164,19 +165,9 @@ __m128d slice_get_sse(sse_slice_t* slice, size_t idx) {
 }
 
 __m512d slice_get_avx(avx_slice_t* slice, size_t idx) {
-    if (!slice) {
-        printf("ERROR: Null slice pointer in slice_get_avx\n");
-        abort();
-    }
-    
-    if (!slice->data) {
-        printf("ERROR: Null data pointer in slice_get_avx\n");
-        abort();
-    }
-    
-    if (idx >= slice->cap) {
-        printf("AVX slice index out of bounds\n");
-        abort();
+    if (!slice || !slice->data || idx >= slice->cap) {
+        printf("Invalid slice_get_avx parameters\n");
+        return _mm512_setzero_pd();
     }
     
     printf("\nAVX slice_get_avx debug:\n");
@@ -186,15 +177,16 @@ __m512d slice_get_avx(avx_slice_t* slice, size_t idx) {
     printf("  Slice length: %zu\n", slice->len);
     printf("  Slice capacity: %zu\n", slice->cap);
     
-    __m512d result = slice->data[idx];
+    // Load full 512-bit (8 doubles) vector
+    __m512d result = _mm512_load_pd((double*)&slice->data[idx]);
     
-    // Debug the retrieved value
-    alignas(64) double values[8];
-    _mm512_store_pd(values, result);
+    // Debug output
+    alignas(64) double check[8];
+    _mm512_store_pd(check, result);
     printf("  Retrieved vector: [%.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f]\n",
-           values[0], values[1], values[2], values[3],
-           values[4], values[5], values[6], values[7]);
-           
+           check[0], check[1], check[2], check[3],
+           check[4], check[5], check[6], check[7]);
+    
     return result;
 }
 
@@ -215,33 +207,38 @@ void slice_set_sse(sse_slice_t* slice, size_t idx, __m128d value) {
 void slice_set_avx(avx_slice_t* slice, size_t idx, __m512d value) {
     if (!slice || !slice->data || idx >= slice->cap) {
         printf("Invalid slice_set_avx parameters\n");
-        abort();
+        return;
     }
     
-    printf("\nAVX slice_set_avx debug:\n");
+    printf("\n=== AVX slice_set_avx ===\n");
+    printf("Memory details:\n");
     printf("  Slice pointer: %p\n", (void*)slice);
     printf("  Data pointer: %p\n", (void*)slice->data);
-    printf("  Setting index: %zu\n", idx);
+    printf("  Target address: %p\n", (void*)&slice->data[idx]);
+    printf("  Index: %zu\n", idx);
+    printf("  Slice length: %zu\n", slice->len);
+    printf("  Slice capacity: %zu\n", slice->cap);
     
-    // Safely extract values from the vector
-    alignas(64) double values[8];
-    _mm512_store_pd(values, value);
+    // Debug input values before store
+    alignas(64) double input[8];
+    _mm512_store_pd(input, value);
+    printf("Input vector:\n");
+    printf("  [%.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f]\n",
+           input[0], input[1], input[2], input[3],
+           input[4], input[5], input[6], input[7]);
     
-    printf("  Input values: %.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f\n",
-           values[0], values[1], values[2], values[3],
-           values[4], values[5], values[6], values[7]);
-           
-    // Store back using aligned load
-    __m512d aligned_value = _mm512_load_pd(values);
-    slice->data[idx] = aligned_value;
+    // Store the vector
+    _mm512_store_pd((double*)&slice->data[idx], value);
     
     // Verify stored values
-    alignas(64) double stored[8];
-    _mm512_store_pd(stored, slice->data[idx]);
-    printf("  Stored vector: [%.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f]\n",
-           stored[0], stored[1], stored[2], stored[3],
-           stored[4], stored[5], stored[6], stored[7]);
-           
+    alignas(64) double verify[8];
+    _mm512_store_pd(verify, slice->data[idx]);
+    printf("Verified stored values:\n");
+    printf("  [%.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f]\n",
+           verify[0], verify[1], verify[2], verify[3],
+           verify[4], verify[5], verify[6], verify[7]);
+    
+    // Update length if necessary
     if (idx >= slice->len) {
         slice->len = idx + 1;
     }

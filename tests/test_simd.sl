@@ -22,15 +22,15 @@ fn kernel_main(var out_sse SSESlice, var out_avx AVXSlice) {
     var avx1 = make(AVXSlice, 1);
     var avx2 = make(AVXSlice, 1);
     
-    // Initialize with counting patterns
-    avx1[0i] = avx(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0);
-    avx2[0i] = avx(2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0);
+    // Initialize with counting patterns - use all 8 elements for AVX
+    avx1[0i] = avx(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0);  // Full 8-element initialization
+    avx2[0i] = avx(2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0);  // Full 8-element initialization
     
     // Expected results:
     // ADD: [3.0, 5.0, 7.0, 9.0, 11.0, 13.0, 15.0, 17.0]  (each + 2)
     // SUB: [-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]  (each - 2)
-    // MUL: [2.0, 6.0, 10.0, 14.0, 18.0, 22.0, 26.0, 30.0]  (each * 2)
-    // DIV: [0.5, 0.667, 0.75, 0.8, 0.833, 0.857, 0.875, 0.889]  (each / 2)
+    // MUL: [2.0, 6.0, 12.0, 20.0, 30.0, 42.0, 56.0, 72.0]  (each * 2)
+    // DIV: [0.5, 0.67, 0.75, 0.8, 0.83, 0.86, 0.88, 0.89]  (each / 2)
     
     slice_set_avx(out_avx, 0i, slice_get_avx(avx1, 0i) + slice_get_avx(avx2, 0i));
     slice_set_avx(out_avx, 1i, slice_get_avx(avx1, 0i) - slice_get_avx(avx2, 0i));

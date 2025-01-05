@@ -15,7 +15,7 @@ extern "C" int yywrap() { return 1; }
 
 [0-9]+\.[0-9]*        { SAVE_TOKEN; return TFLOAT; }
 [0-9]+                { SAVE_TOKEN; return TINTEGER; }
-[0-9]+"i"             { SAVE_TOKEN; return TINTLIT; }  /* Add integer literal token */
+[0-9]+"i"             { SAVE_TOKEN; return TINTLIT; }
 
 "fn"                  { return TFUNC; }
 "return"              { return TRETURN; }
@@ -27,18 +27,17 @@ extern "C" int yywrap() { return 1; }
 
 "SSESlice"           { return TSSESLICE; }
 "AVXSlice"           { return TAVXSLICE; }
+"sse"                { return TSSE; }
+"avx"                { return TAVX; }
+
 "slice_get_sse"      { SAVE_TOKEN; return TIDENTIFIER; }
 "slice_get_avx"      { SAVE_TOKEN; return TIDENTIFIER; }
 "slice_set_sse"      { SAVE_TOKEN; return TIDENTIFIER; }
 "slice_set_avx"      { SAVE_TOKEN; return TIDENTIFIER; }
-
-"sse"                 { SAVE_TOKEN; return TSSE; }
-"avx"                 { SAVE_TOKEN; return TAVX; }
-
-"simd_add"            { SAVE_TOKEN; return TIDENTIFIER; }
-"simd_mul"            { SAVE_TOKEN; return TIDENTIFIER; }
-"simd_sub"            { SAVE_TOKEN; return TIDENTIFIER; }
-"simd_div"            { SAVE_TOKEN; return TIDENTIFIER; }
+"simd_add"           { SAVE_TOKEN; return TIDENTIFIER; }
+"simd_mul"           { SAVE_TOKEN; return TIDENTIFIER; }
+"simd_sub"           { SAVE_TOKEN; return TIDENTIFIER; }
+"simd_div"           { SAVE_TOKEN; return TIDENTIFIER; }
 
 [a-zA-Z_][a-zA-Z0-9_]* { SAVE_TOKEN; return TIDENTIFIER; }
 
@@ -63,7 +62,6 @@ extern "C" int yywrap() { return 1; }
 "-"                   { return '-'; }
 "*"                   { return '*'; }
 "/"                   { return '/'; }
-
 "%"                   { return TOK_MOD; }
 
 .                     { printf("Unknown token: %s\n", yytext); yyterminate(); }

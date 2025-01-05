@@ -31,7 +31,7 @@ CodeGenContext::CodeGenContext() : builder(context) {
         target->createTargetMachine(
             targetTriple,
             "generic",  // CPU
-            "+avx2",    // Enable AVX2 features
+            "+avx512f,+avx512dq",  // Enable AVX-512 features
             opt,
             RM
         )
@@ -46,7 +46,7 @@ CodeGenContext::CodeGenContext() : builder(context) {
     module->setDataLayout(targetMachine->createDataLayout());
     
     // Initialize SIMD interface using the factory function
-    simdInterface.reset(createSIMDInterface("sse"));  // or "avx" for AVX support
+    simdInterface.reset(createSIMDInterface("avx512"));
     
     // Now initialize runtime functions
     initializeRuntimeFunctions();
@@ -90,25 +90,44 @@ void CodeGenContext::initializeRuntimeFunctions() {
 }
 
 void CodeGenContext::initializeSliceTypes() {
-    // SSE Slice type (4 doubles)
+    // Get vector types for SSE (2 doubles) and AVX (8 doubles)
+    auto sseVecTy = llvm::VectorType::get(llvm::Type::getDoubleTy(context), 2, false);
+    auto avxVecTy = llvm::VectorType::get(llvm::Type::getDoubleTy(context), 8, false);
+
+    // Create slice types with vector pointers
     std::vector<llvm::Type*> sseFields = {
-        llvm::Type::getInt8PtrTy(context),  // data pointer
-        llvm::Type::getInt64Ty(context),    // length
-        llvm::Type::getInt64Ty(context)     // capacity
+        llvm::PointerType::get(sseVecTy, 0),  // sse_vector_t*
+        llvm::Type::getInt64Ty(context),      // size_t size
+        llvm::Type::getInt64Ty(context)       // size_t capacity
     };
     sseSliceType = llvm::StructType::create(context, sseFields, "SSESlice");
 
-    // AVX Slice type (8 doubles)
     std::vector<llvm::Type*> avxFields = {
-        llvm::Type::getInt8PtrTy(context),  // data pointer
-        llvm::Type::getInt64Ty(context),    // length
-        llvm::Type::getInt64Ty(context)     // capacity
+        llvm::PointerType::get(avxVecTy, 0),  // avx_vector_t*
+        llvm::Type::getInt64Ty(context),      // size_t size
+        llvm::Type::getInt64Ty(context)       // size_t capacity
     };
     avxSliceType = llvm::StructType::create(context, avxFields, "AVXSlice");
 }
 
 llvm::Type* CodeGenContext::getSliceType(SliceType type) {
-    return type == SliceType::SSE_SLICE ? sseSliceType : avxSliceType;
+    switch (type) {
+        case SliceType::SSE_SLICE: 
+            if (!sseSliceType) {
+                std::cerr << "SSESlice type not initialized" << std::endl;
+                return nullptr;
+            }
+            return sseSliceType;
+        case SliceType::AVX_SLICE:
+            if (!avxSliceType) {
+                std::cerr << "AVXSlice type not initialized" << std::endl;
+                return nullptr;
+            }
+            return avxSliceType;
+        default:
+            std::cerr << "Unknown slice type" << std::endl;
+            return nullptr;
+    }
 }
 
 llvm::Value* CodeGenContext::createSlice(SliceType type, llvm::Value* len) {
@@ -682,92 +701,132 @@ void CodeGenContext::initializeMallocFree() {
 }
 
 void CodeGenContext::initializeSIMDFunctions() {
-    // Define slice struct types first
-    llvm::StructType* sliceStructTy = llvm::StructType::create(context, "slice_struct");
-    sliceStructTy->setBody({
-        llvm::Type::getInt8PtrTy(context),  // data pointer
-        llvm::Type::getInt64Ty(context)     // length
-    });
-
-    // Register named types for SSE and AVX slices
-    llvm::StructType* sseSliceTy = llvm::StructType::create(context, "sse_slice_t");
-    llvm::StructType* avxSliceTy = llvm::StructType::create(context, "avx_slice_t");
-    sseSliceTy->setBody(sliceStructTy->elements());
-    avxSliceTy->setBody(sliceStructTy->elements());
-
-    // Vector types
+    // Get vector types (already defined in initializeSliceTypes)
     auto sseVecTy = llvm::VectorType::get(llvm::Type::getDoubleTy(context), 2, false);
     auto avxVecTy = llvm::VectorType::get(llvm::Type::getDoubleTy(context), 8, false);
 
-    // SIMD operations (existing code remains the same)
-    std::vector<llvm::Type*> sseArgs = {sseVecTy, sseVecTy};
-    llvm::FunctionType* sseOpType = llvm::FunctionType::get(sseVecTy, sseArgs, false);
-    
-    llvm::Function::Create(sseOpType, llvm::Function::ExternalLinkage, "simd_add", module.get());
-    llvm::Function::Create(sseOpType, llvm::Function::ExternalLinkage, "simd_sub", module.get());
-    llvm::Function::Create(sseOpType, llvm::Function::ExternalLinkage, "simd_mul", module.get());
-    llvm::Function::Create(sseOpType, llvm::Function::ExternalLinkage, "simd_div", module.get());
+    // Declare make functions
+    auto makeSseFuncTy = llvm::FunctionType::get(
+        llvm::PointerType::get(sseSliceType, 0),  // Returns SSESlice*
+        {llvm::Type::getInt64Ty(context)},        // Takes size_t argument
+        false
+    );
 
-    // AVX operations (similar to SSE)
-    std::vector<llvm::Type*> avxArgs = {avxVecTy, avxVecTy};
-    llvm::FunctionType* avxOpType = llvm::FunctionType::get(avxVecTy, avxArgs, false);
-    
-    llvm::Function::Create(avxOpType, llvm::Function::ExternalLinkage, "simd_add_avx", module.get());
-    llvm::Function::Create(avxOpType, llvm::Function::ExternalLinkage, "simd_sub_avx", module.get());
-    llvm::Function::Create(avxOpType, llvm::Function::ExternalLinkage, "simd_mul_avx", module.get());
-    llvm::Function::Create(avxOpType, llvm::Function::ExternalLinkage, "simd_div_avx", module.get());
+    auto makeAvxFuncTy = llvm::FunctionType::get(
+        llvm::PointerType::get(avxSliceType, 0),  // Returns AVXSlice*
+        {llvm::Type::getInt64Ty(context)},        // Takes size_t argument
+        false
+    );
 
-    // Slice creation functions
-    std::vector<llvm::Type*> makeSliceArgs = {llvm::Type::getInt64Ty(context)};
-    
-    llvm::FunctionType* makeSSESliceType = llvm::FunctionType::get(
-        sseSliceTy->getPointerTo(), makeSliceArgs, false);
-    llvm::FunctionType* makeAVXSliceType = llvm::FunctionType::get(
-        avxSliceTy->getPointerTo(), makeSliceArgs, false);
-
-    llvm::Function::Create(makeSSESliceType, llvm::Function::ExternalLinkage, 
+    // Create function declarations
+    llvm::Function::Create(makeSseFuncTy, llvm::Function::ExternalLinkage,
                           "make_sse_slice", module.get());
-    llvm::Function::Create(makeAVXSliceType, llvm::Function::ExternalLinkage, 
+    llvm::Function::Create(makeAvxFuncTy, llvm::Function::ExternalLinkage,
                           "make_avx_slice", module.get());
 
-    // Slice get/set operations
-    std::vector<llvm::Type*> getSliceArgs = {
-        sseSliceTy->getPointerTo(),
-        llvm::Type::getInt64Ty(context)
-    };
+    // Declare slice set functions
+    auto setSSEFuncTy = llvm::FunctionType::get(
+        llvm::Type::getVoidTy(context),
+        {
+            llvm::PointerType::get(sseSliceType, 0),  // SSESlice*
+            llvm::Type::getInt64Ty(context),          // size_t index
+            sseVecTy                                  // sse_vector_t value
+        },
+        false
+    );
 
-    llvm::FunctionType* getSSESliceType = llvm::FunctionType::get(sseVecTy, getSliceArgs, false);
-    getSliceArgs[0] = avxSliceTy->getPointerTo();
-    llvm::FunctionType* getAVXSliceType = llvm::FunctionType::get(avxVecTy, getSliceArgs, false);
+    auto setAVXFuncTy = llvm::FunctionType::get(
+        llvm::Type::getVoidTy(context),
+        {
+            llvm::PointerType::get(avxSliceType, 0),  // AVXSlice*
+            llvm::Type::getInt64Ty(context),          // size_t index
+            avxVecTy                                  // avx_vector_t value
+        },
+        false
+    );
 
-    llvm::Function::Create(getSSESliceType, llvm::Function::ExternalLinkage, 
-                          "slice_get_sse", module.get());
-    llvm::Function::Create(getAVXSliceType, llvm::Function::ExternalLinkage, 
-                          "slice_get_avx", module.get());
-
-    // Set operations
-    std::vector<llvm::Type*> setSSESliceArgs = {
-        sseSliceTy->getPointerTo(),
-        llvm::Type::getInt64Ty(context),
-        sseVecTy
-    };
-    std::vector<llvm::Type*> setAVXSliceArgs = {
-        avxSliceTy->getPointerTo(),
-        llvm::Type::getInt64Ty(context),
-        avxVecTy
-    };
-
-    llvm::FunctionType* setSSESliceType = llvm::FunctionType::get(
-        llvm::Type::getVoidTy(context), setSSESliceArgs, false);
-    llvm::FunctionType* setAVXSliceType = llvm::FunctionType::get(
-        llvm::Type::getVoidTy(context), setAVXSliceArgs, false);
-
-    llvm::Function::Create(setSSESliceType, llvm::Function::ExternalLinkage, 
+    llvm::Function::Create(setSSEFuncTy, llvm::Function::ExternalLinkage,
                           "slice_set_sse", module.get());
-    llvm::Function::Create(setAVXSliceType, llvm::Function::ExternalLinkage, 
+    llvm::Function::Create(setAVXFuncTy, llvm::Function::ExternalLinkage,
                           "slice_set_avx", module.get());
+
+    // Add declarations for slice_get functions
+    auto getSSEFuncTy = llvm::FunctionType::get(
+        sseVecTy,  // Returns sse_vector_t
+        {
+            llvm::PointerType::get(sseSliceType, 0),  // SSESlice*
+            llvm::Type::getInt64Ty(context)           // size_t index
+        },
+        false
+    );
+
+    auto getAVXFuncTy = llvm::FunctionType::get(
+        avxVecTy,  // Returns avx_vector_t
+        {
+            llvm::PointerType::get(avxSliceType, 0),  // AVXSlice*
+            llvm::Type::getInt64Ty(context)           // size_t index
+        },
+        false
+    );
+
+    // Create function declarations for get operations
+    llvm::Function::Create(getSSEFuncTy, llvm::Function::ExternalLinkage,
+                          "slice_get_sse", module.get());
+    llvm::Function::Create(getAVXFuncTy, llvm::Function::ExternalLinkage,
+                          "slice_get_avx", module.get());
 }
 
 llvm::TargetMachine* CodeGenContext::getTargetMachine() {
     return targetMachine.get();
+}
+
+llvm::Value* CodeGenContext::createAVXVector(const std::vector<double>& values) {
+    if (values.size() != 8) {
+        emitError("AVX vector must have exactly 8 elements");
+        return nullptr;
+    }
+
+    // Create vector constant from doubles
+    std::vector<llvm::Constant*> constants;
+    for (double val : values) {
+        constants.push_back(llvm::ConstantFP::get(getDoubleType(), val));
+    }
+    
+    // Create vector type for AVX (8 doubles)
+    auto vectorType = llvm::VectorType::get(getDoubleType(), 8, false);
+    return llvm::ConstantVector::get(constants);
+}
+
+void CodeGenContext::emitSliceSet(llvm::Value* slice, llvm::Value* index, llvm::Value* value) {
+    if (!isVectorType(value->getType())) {
+        emitError("Expected vector type for slice set operation");
+        return;
+    }
+
+    unsigned width = getVectorWidth(value->getType());
+    
+    // Debug output
+    printf("Emitting slice set for vector width %u\n", width);
+    
+    if (width == 2) {
+        // SSE vector (2 doubles)
+        auto func = module->getFunction("slice_set_sse");
+        if (!func) {
+            emitError("slice_set_sse function not found");
+            return;
+        }
+        builder.CreateCall(func, {slice, index, value});
+    } 
+    else if (width == 8) {
+        // AVX vector (8 doubles)
+        auto func = module->getFunction("slice_set_avx");
+        if (!func) {
+            emitError("slice_set_avx function not found");
+            return;
+        }
+        builder.CreateCall(func, {slice, index, value});
+    }
+    else {
+        emitError("Unsupported vector width for slice set operation");
+    }
 }
