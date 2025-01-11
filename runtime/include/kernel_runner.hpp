@@ -6,6 +6,7 @@
 #include <iostream>
 #include <memory>
 #include "simd_types.hpp"
+#include <cstring>  // for strstr
 
 class KernelRunner {
 public:
@@ -44,21 +45,41 @@ public:
         // Clear any existing error
         dlerror();
 
-        // Try to load SIMD kernel first
-        void* simd_symbol = dlsym(handle_, "kernel_main");
-        const char* simd_dlsym_error = dlerror();
+        // First try to load as SIMD kernel
+        void* symbol = dlsym(handle_, "kernel_main");
+        const char* dlsym_error = dlerror();
         
-        if (!simd_dlsym_error) {
-            // SIMD kernel found
-            kernel_main_simd_ = reinterpret_cast<KernelMainSIMDFunc>(simd_symbol);
-            if (!kernel_main_simd_) {
-                dlclose(handle_);
-                throw std::runtime_error("Invalid kernel_main_simd function pointer");
-            }
+        if (!symbol) {
+            dlclose(handle_);
+            throw std::runtime_error("Could not find kernel_main symbol: " + 
+                                   std::string(dlsym_error ? dlsym_error : "Unknown error"));
+        }
+
+        // Try casting to SIMD function first
+        kernel_main_simd_ = reinterpret_cast<KernelMainSIMDFunc>(symbol);
+        
+        // Test if it's a valid SIMD kernel by checking the function signature
+        bool is_simd = false;
+        #ifdef TEST_SIMD
+            is_simd = true;
+        #else
+            #ifdef __GNUC__
+                Dl_info info;
+                if (dladdr(symbol, &info)) {
+                    const char* symbol_name = info.dli_sname;
+                    if (symbol_name && (strstr(symbol_name, "SSESlice") || 
+                                      strstr(symbol_name, "AVXSlice"))) {
+                        is_simd = true;
+                    }
+                }
+            #endif
+        #endif
+
+        if (is_simd) {
             std::cout << "SIMD kernel loaded successfully" << std::endl;
         } else {
-            // No SIMD kernel found
-            kernel_main_ = reinterpret_cast<KernelMainFunc>(simd_symbol);
+            kernel_main_simd_ = nullptr;
+            kernel_main_ = reinterpret_cast<KernelMainFunc>(symbol);
             if (!kernel_main_) {
                 dlclose(handle_);
                 throw std::runtime_error("Invalid kernel_main function pointer");

@@ -6,14 +6,16 @@
 #include <immintrin.h>
 #include <chrono>
 
-// Helper function to print timing results
+// Helper function to print timing results with proper scaling
 void printTimings(const std::string& operation, double time_ms, size_t iterations) {
-    std::cout << std::fixed << std::setprecision(3)
-              << operation << ": "
-              << time_ms << " ms total, "
-              << (time_ms / iterations) << " ms/iter, "
-              << (iterations / (time_ms / 1000.0)) << " ops/sec"
-              << std::endl;
+    double time_per_iter = time_ms / iterations;
+    double ops_per_sec = iterations / (time_ms / 1000.0);
+
+    std::cout << std::fixed 
+              << operation << ":\n"
+              << "  Total time:     " << std::setprecision(3) << time_ms << " ms\n"
+              << "  Time per iter:  " << std::setprecision(6) << time_per_iter << " ms\n"
+              << "  Operations/sec: " << std::setprecision(0) << ops_per_sec << "\n";
 }
 
 void print_vector(const char* label, double* data, size_t elements) {
@@ -46,37 +48,42 @@ int main(int argc, char* argv[]) {
             throw std::runtime_error("Failed to allocate aligned memory");
         }
 
-        // Before slice initialization
-        // Cast the raw double pointers to the appropriate SIMD vector types
+        // Cast to SIMD vector types
         sse_vector_t* sse_vec_data = reinterpret_cast<sse_vector_t*>(sse_data);
         avx_vector_t* avx_vec_data = reinterpret_cast<avx_vector_t*>(avx_data);
 
-        // Initialize slices with properly typed pointers
+        // Initialize slices
         SSESlice sse_slice = {sse_vec_data, VECTOR_SIZE, VECTOR_SIZE};
         AVXSlice avx_slice = {avx_vec_data, VECTOR_SIZE, VECTOR_SIZE};
 
-        // Load kernel
+        // Load and run kernel
         runner.loadLibrary(argv[1]);
         
+        const size_t WARMUP_ITERATIONS = 100;
+        const size_t ITERATIONS = 10000;
+
+        // Warmup runs
+        for (size_t i = 0; i < WARMUP_ITERATIONS; i++) {
+            runner.runKernel(&sse_slice, &avx_slice);
+        }
+        
+        // Timed runs
         auto start = std::chrono::high_resolution_clock::now();
         
-        // Run kernel multiple times
-        const size_t ITERATIONS = 10000;
         for (size_t i = 0; i < ITERATIONS; i++) {
             runner.runKernel(&sse_slice, &avx_slice);
         }
         
         auto end = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-        double time_ms = duration.count() / 1000.0;
+        auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+        double time_ms = duration.count() / 1e6; // Convert ns to ms
         
-        // Print timing results
+        // Print results
         std::cout << "\nPerformance Results:\n"
                   << "==================\n";
-        printTimings("Total kernel execution", time_ms, ITERATIONS);
+        printTimings("Kernel execution", time_ms, ITERATIONS);
         
-        // Verify a few results
-        std::cout << "\nVerifying results (first few elements):\n";
+        // Print sample results
         print_vector("SSE Results", sse_data, 2);
         print_vector("AVX Results", avx_data, 8);
 

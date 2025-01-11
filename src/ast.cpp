@@ -7,17 +7,23 @@
 #include <llvm/IR/Type.h>
 
 llvm::Value* NumberExprAST::codeGen(CodeGenContext& context) {
-    // Always use doubles unless explicitly needed for array indices
-    if (context.isIntegerContext() || isInteger) {
-        return llvm::ConstantInt::get(
-            context.getBuilder().getInt64Ty(), 
-            (int64_t)value
-        );
+    // Debug output
+    llvm::errs() << "Generating number: " << value 
+                 << (isInteger ? " (integer)" : " (double)") << "\n";
+    
+    if (isInteger) {
+        // Integer literal - ensure 64-bit
+        auto intVal = static_cast<int64_t>(value);
+        llvm::errs() << "  Creating i64 constant: " << intVal << "\n";
+        
+        // Create integer type and value
+        auto* type = llvm::Type::getInt64Ty(context.getContext());
+        return llvm::ConstantInt::get(type, intVal, true);
     }
-    return llvm::ConstantFP::get(
-        context.getContext(), 
-        llvm::APFloat(value)
-    );
+    
+    // Double literal (default)
+    llvm::errs() << "  Creating double constant: " << value << "\n";
+    return llvm::ConstantFP::get(context.getContext(), llvm::APFloat(value));
 }
 
 llvm::Value* VariableExprAST::codeGen(CodeGenContext& context) {
@@ -73,69 +79,70 @@ llvm::Value* BinaryExprAST::codeGen(CodeGenContext& context) {
     llvm::Value* rhs = right_->codeGen(context);
     if (!lhs || !rhs) return nullptr;
     
-    // Load from pointers if needed
-    if (lhs->getType()->isPointerTy()) {
-        lhs = context.getBuilder().CreateLoad(
-            lhs->getType()->getPointerElementType(),
-            lhs,
-            "loadtmp"
-        );
-    }
-    if (rhs->getType()->isPointerTy()) {
-        rhs = context.getBuilder().CreateLoad(
-            rhs->getType()->getPointerElementType(),
-            rhs,
-            "loadtmp"
-        );
-    }
+    // Check if either operand is integer
+    bool isIntegerOp = lhs->getType()->isIntegerTy(64) || 
+                      rhs->getType()->isIntegerTy(64);
     
-    // Check if either operand is a vector type
-    bool isSimd = lhs->getType()->isVectorTy() || rhs->getType()->isVectorTy();
-    
-    if (isSimd) {
-        SIMDOp simd_op;
-        switch (op_) {
-            case BinaryOp::OpAdd: simd_op = SIMDOp::ADD; break;
-            case BinaryOp::OpSub: simd_op = SIMDOp::SUB; break;
-            case BinaryOp::OpMul: simd_op = SIMDOp::MUL; break;
-            case BinaryOp::OpDiv: simd_op = SIMDOp::DIV; break;
-            default: 
-                std::cerr << "Invalid SIMD operation" << std::endl;
-                return nullptr;
+    // Convert types if needed
+    if (isIntegerOp) {
+        if (!lhs->getType()->isIntegerTy(64)) {
+            lhs = context.getBuilder().CreateFPToSI(
+                lhs, 
+                llvm::Type::getInt64Ty(context.getContext()),
+                "conv"
+            );
         }
-        
-        auto vecType = lhs->getType()->isVectorTy() ? lhs->getType() : rhs->getType();
-        SIMDWidth width = llvm::cast<llvm::VectorType>(vecType)
-            ->getElementCount().getKnownMinValue() == 8 ? 
-            SIMDWidth::AVX : SIMDWidth::SSE;
-                         
-        return SIMDHelper::performOp(context, lhs, rhs, simd_op, width);
+        if (!rhs->getType()->isIntegerTy(64)) {
+            rhs = context.getBuilder().CreateFPToSI(
+                rhs,
+                llvm::Type::getInt64Ty(context.getContext()),
+                "conv"
+            );
+        }
     }
     
-    // Handle non-SIMD operations
+    // Generate operation based on types
     switch (op_) {
         case BinaryOp::OpAdd:
-            return context.getBuilder().CreateFAdd(lhs, rhs, "addtmp");
+            return isIntegerOp ? 
+                context.getBuilder().CreateAdd(lhs, rhs, "addtmp") :
+                context.getBuilder().CreateFAdd(lhs, rhs, "addtmp");
         case BinaryOp::OpSub:
-            return context.getBuilder().CreateFSub(lhs, rhs, "subtmp");
+            return isIntegerOp ? 
+                context.getBuilder().CreateSub(lhs, rhs, "subtmp") :
+                context.getBuilder().CreateFSub(lhs, rhs, "subtmp");
         case BinaryOp::OpMul:
-            return context.getBuilder().CreateFMul(lhs, rhs, "multmp");
+            return isIntegerOp ? 
+                context.getBuilder().CreateMul(lhs, rhs, "multmp") :
+                context.getBuilder().CreateFMul(lhs, rhs, "multmp");
         case BinaryOp::OpDiv:
-            return context.getBuilder().CreateFDiv(lhs, rhs, "divtmp");
-        case BinaryOp::OpMod:
-            return context.getBuilder().CreateFRem(lhs, rhs, "modtmp");
+            return isIntegerOp ? 
+                context.getBuilder().CreateSDiv(lhs, rhs, "divtmp") :
+                context.getBuilder().CreateFDiv(lhs, rhs, "divtmp");
         case BinaryOp::OpLT:
-            return context.getBuilder().CreateFCmpOLT(lhs, rhs, "cmptmp");
+            return isIntegerOp ? 
+                context.getBuilder().CreateICmpSLT(lhs, rhs, "cmptmp") :
+                context.getBuilder().CreateFCmpULT(lhs, rhs, "cmptmp");
         case BinaryOp::OpGT:
-            return context.getBuilder().CreateFCmpOGT(lhs, rhs, "cmptmp");
+            return isIntegerOp ? 
+                context.getBuilder().CreateICmpSGT(lhs, rhs, "cmptmp") :
+                context.getBuilder().CreateFCmpUGT(lhs, rhs, "cmptmp");
         case BinaryOp::OpLE:
-            return context.getBuilder().CreateFCmpOLE(lhs, rhs, "cmptmp");
+            return isIntegerOp ? 
+                context.getBuilder().CreateICmpSLE(lhs, rhs, "cmptmp") :
+                context.getBuilder().CreateFCmpULE(lhs, rhs, "cmptmp");
         case BinaryOp::OpGE:
-            return context.getBuilder().CreateFCmpOGE(lhs, rhs, "cmptmp");
+            return isIntegerOp ? 
+                context.getBuilder().CreateICmpSGE(lhs, rhs, "cmptmp") :
+                context.getBuilder().CreateFCmpUGE(lhs, rhs, "cmptmp");
         case BinaryOp::OpEQ:
-            return context.getBuilder().CreateFCmpOEQ(lhs, rhs, "cmptmp");
+            return isIntegerOp ? 
+                context.getBuilder().CreateICmpEQ(lhs, rhs, "cmptmp") :
+                context.getBuilder().CreateFCmpUEQ(lhs, rhs, "cmptmp");
         case BinaryOp::OpNE:
-            return context.getBuilder().CreateFCmpONE(lhs, rhs, "cmptmp");
+            return isIntegerOp ? 
+                context.getBuilder().CreateICmpNE(lhs, rhs, "cmptmp") :
+                context.getBuilder().CreateFCmpUNE(lhs, rhs, "cmptmp");
         default:
             std::cerr << "Invalid binary operator" << std::endl;
             return nullptr;
@@ -272,47 +279,42 @@ llvm::Value* BlockAST::codeGen(CodeGenContext& context) {
 llvm::Value* VariableDeclarationAST::codeGen(CodeGenContext& context) {
     std::cout << "Generating variable declaration for " << name << std::endl;
     
-    // Get the appropriate type based on the variable's intended use
-    llvm::Type* type = nullptr;
-    
-    // Check if this variable will store a slice
-    if (auto sliceExpr = dynamic_cast<SliceExprAST*>(assignmentExpr)) {
-        // Get the base slice struct type
-        if (sliceExpr->getType() == SliceType::SSE_SLICE) {
-            type = llvm::StructType::getTypeByName(context.getContext(), "SSESlice");
-        } else {
-            type = llvm::StructType::getTypeByName(context.getContext(), "AVXSlice");
-        }
-        
-        if (!type) {
-            std::cerr << "Error: Slice type not found" << std::endl;
-            return nullptr;
-        }
-        
-        // Create a pointer to the slice struct type
-        type = llvm::PointerType::get(type, 0);
-    } else {
-        // Default to double for non-slice variables
-        type = llvm::Type::getDoubleTy(context.getContext());
+    // Get initial value if it exists
+    llvm::Value* initVal = nullptr;
+    if (assignmentExpr) {
+        initVal = assignmentExpr->codeGen(context);
+        if (!initVal) return nullptr;
     }
     
-    // Create the allocation instruction
+    // Determine variable type
+    llvm::Type* varType;
+    if (initVal && llvm::isa<llvm::ConstantInt>(initVal)) {
+        // For integer literals, use i64
+        varType = llvm::Type::getInt64Ty(context.getContext());
+    } else if (auto* sliceExpr = dynamic_cast<SliceExprAST*>(assignmentExpr)) {
+        // For slices, use the appropriate slice type
+        varType = context.getSliceType(sliceExpr->getType());
+        if (!varType) return nullptr;
+        varType = llvm::PointerType::get(varType, 0);
+    } else {
+        // Default to double
+        varType = llvm::Type::getDoubleTy(context.getContext());
+    }
+    
+    // Create allocation
     llvm::AllocaInst* alloc = context.getBuilder().CreateAlloca(
-        type,  // For slices, this is now a pointer type
+        varType,
         nullptr,
         name.c_str()
     );
     
-    std::cout << "Declaring variable: " << name << std::endl;
-    context.setSymbolValue(name, alloc);
-    
-    if (assignmentExpr != nullptr) {
-        llvm::Value* initVal = assignmentExpr->codeGen(context);
-        if (!initVal) return nullptr;
-        
-        // For slices, initVal is already a pointer to the slice struct
+    // Store initial value if it exists
+    if (initVal) {
         context.getBuilder().CreateStore(initVal, alloc);
     }
+    
+    // Add to symbol table
+    context.setSymbolValue(name, alloc);
     
     return alloc;
 }
@@ -595,7 +597,7 @@ llvm::Value* SIMDTypeExprAST::codeGen(CodeGenContext& context) {
     // Create vector type with correct width
     llvm::VectorType* vecType = llvm::VectorType::get(doubleType, width, false);
     
-    std::cout << "Creating " << width << "-wide vector with values: ";
+    //std::cout << "Creating " << width << "-wide vector with values: ";
     for (size_t i = 0; i < constants.size(); i++) {
         if (auto constFP = llvm::dyn_cast<llvm::ConstantFP>(constants[i])) {
             std::cout << constFP->getValueAPF().convertToDouble();
@@ -659,14 +661,29 @@ llvm::Value* SliceExprAST::codeGen(CodeGenContext& context) {
         return nullptr;
     }
     
-    // Convert double to i64 if needed
-    if (len->getType()->isDoubleTy()) {
-        len = context.getBuilder().CreateFPToSI(
-            len,
-            llvm::Type::getInt64Ty(context.getContext()),
-            "len_i64"
-        );
+    // Convert to i64 if needed
+    if (!len->getType()->isIntegerTy(64)) {
+        if (len->getType()->isDoubleTy()) {
+            len = context.getBuilder().CreateFPToSI(
+                len,
+                llvm::Type::getInt64Ty(context.getContext()),
+                "len_i64"
+            );
+        } else if (len->getType()->isIntegerTy()) {
+            len = context.getBuilder().CreateSExt(
+                len,
+                llvm::Type::getInt64Ty(context.getContext()),
+                "len_i64"
+            );
+        } else {
+            std::cerr << "Invalid length type for slice" << std::endl;
+            return nullptr;
+        }
     }
+    
+    // Debug output
+    std::cout << "Creating slice with length type: " 
+              << len->getType()->getTypeID() << std::endl;
     
     // Get the appropriate make function based on slice type
     std::string makeFuncName = type == SliceType::SSE_SLICE ? 

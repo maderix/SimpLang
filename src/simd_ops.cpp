@@ -191,7 +191,7 @@ llvm::Value* make_avx_slice(llvm::IRBuilder<>& builder, unsigned size) {
 
 void slice_set_avx(llvm::IRBuilder<>& builder, SliceStruct& slice, 
                    unsigned index, llvm::Value* value) {
-    std::cout << "\nAVX slice_set_avx debug:" << std::endl;
+    //std::cout << "\nAVX slice_set_avx debug:" << std::endl;
     
     // Calculate proper byte offset for AVX vectors (8 doubles = 64 bytes)
     llvm::Value* offset = builder.CreateMul(
@@ -208,8 +208,8 @@ void slice_set_avx(llvm::IRBuilder<>& builder, SliceStruct& slice,
     auto store = builder.CreateStore(value, ptr);
     store->setAlignment(llvm::Align(64));  // AVX-512 needs 64-byte alignment
     
-    std::cout << "  Vector width: " << 
-        llvm::dyn_cast<llvm::VectorType>(avxType)->getElementCount().getFixedValue() << std::endl;
-    std::cout << "  Offset in doubles: " << index * 8 << std::endl;
-    std::cout << "  Store operation completed with 64-byte alignment" << std::endl;
+    //std::cout << "  Vector width: " << 
+    //    llvm::dyn_cast<llvm::VectorType>(avxType)->getElementCount().getFixedValue() << std::endl;
+    //std::cout << "  Offset in doubles: " << index * 8 << std::endl;
+    //std::cout << "  Store operation completed with 64-byte alignment" << std::endl;
 } 
