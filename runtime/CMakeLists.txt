@@ -112,3 +112,33 @@ install(DIRECTORY include/
     DESTINATION include
     FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp"
 )
+
+# Add profiler library
+add_library(simplang_profiler
+    src/profiler/execution_metrics.cpp
+    src/profiler/memory_metrics.cpp
+    src/profiler/profiler.cpp
+)
+
+target_include_directories(simplang_profiler
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/include
+)
+
+target_link_libraries(simplang_profiler
+    PRIVATE
+        simplang_runtime
+)
+
+# Add profiler tool
+add_executable(kernel_profiler
+    src/tools/kernel_profiler.cpp
+)
+
+target_link_libraries(kernel_profiler
+    PRIVATE
+        simplang_profiler
+        simplang_runtime
+        ${CMAKE_DL_LIBS}
+)
