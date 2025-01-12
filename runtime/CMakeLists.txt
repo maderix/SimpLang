@@ -118,6 +118,7 @@ add_library(simplang_profiler
     src/profiler/execution_metrics.cpp
     src/profiler/memory_metrics.cpp
     src/profiler/profiler.cpp
+    src/profiler/trace_events.cpp
 )
 
 target_include_directories(simplang_profiler

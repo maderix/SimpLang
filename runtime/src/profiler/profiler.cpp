@@ -6,13 +6,10 @@
 #include <numeric>
 #include <memory>
 
-KernelProfiler::KernelProfiler(const ProfileConfig& cfg) 
-    : config(cfg)
-    , exec_metrics(cfg.warmup_iterations, cfg.total_iterations) {
-    if (config.track_memory) {
-        std::cout << "Memory tracking enabled\n";
-    }
-}
+KernelProfiler::KernelProfiler(const Config& config)
+    : config(config)
+    , exec_metrics(config.warmup_iterations, config.total_iterations)
+    , trace_events(config.enable_tracing ? std::make_unique<TraceEvents>() : nullptr) {}
 
 void KernelProfiler::profileKernel(const std::string& kernel_path) {
     try {
@@ -20,31 +17,44 @@ void KernelProfiler::profileKernel(const std::string& kernel_path) {
             std::cout << "Loading kernel: " << kernel_path << "\n";
         }
         
-        // Check if this is a SIMD kernel by filename
+        if (config.enable_tracing) {
+            trace_events->beginEvent("kernel_profiling", "profile");
+        }
+        
         bool is_simd = kernel_path.find("test_simd") != std::string::npos;
         runner.loadLibrary(kernel_path);
         
-        if (config.verbose) {
-            std::cout << "Running warmup iterations...\n";
+        if (config.enable_tracing) {
+            trace_events->beginEvent("warmup_phase", "profile");
         }
         
         if (is_simd) {
-            runWarmup();  // SIMD version
+            runWarmup();
         } else {
-            runWarmupScalar();  // Non-SIMD version
+            runWarmupScalar();
         }
         
-        if (config.verbose) {
-            std::cout << "Running measurement iterations...\n";
+        if (config.enable_tracing) {
+            trace_events->endEvent("warmup_phase");
+            trace_events->beginEvent("measurement_phase", "profile");
         }
         
         if (is_simd) {
-            runMeasurements();  // SIMD version
+            runMeasurements();
         } else {
-            runMeasurementsScalar();  // Non-SIMD version
+            runMeasurementsScalar();
+        }
+        
+        if (config.enable_tracing) {
+            trace_events->endEvent("measurement_phase");
         }
         
         generateReport();
+        
+        if (config.enable_tracing) {
+            trace_events->endEvent("kernel_profiling");
+            trace_events->writeToFile(config.trace_path);
+        }
         
     } catch (const std::exception& e) {
         std::cerr << "Error during profiling: " << e.what() << "\n";
