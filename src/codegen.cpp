@@ -7,8 +7,10 @@
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm-c/Target.h>
 #include <iostream>
+#include "passes/ProfilingPass.hpp"
 
 CodeGenContext::CodeGenContext() : builder(context) {
+    llvm::errs() << "Initializing CodeGenContext\n";
     module = std::make_unique<llvm::Module>("simple-lang", context);
     
     // Enable SIMD by default
@@ -51,9 +53,12 @@ CodeGenContext::CodeGenContext() : builder(context) {
     // Now initialize runtime functions
     initializeRuntimeFunctions();
     
-    // Initialize optimization passes
+    // Initialize legacy pass manager
+    llvm::errs() << "Initializing pass manager\n";
     fpm = std::make_unique<llvm::legacy::FunctionPassManager>(module.get());
+    fpm->add(new ProfilingPass());
     fpm->doInitialization();
+    llvm::errs() << "Pass manager initialization complete\n";
 }
 
 CodeGenContext::~CodeGenContext() {
@@ -65,6 +70,7 @@ CodeGenContext::~CodeGenContext() {
 
 
 void CodeGenContext::initializeRuntimeFunctions() {
+    llvm::errs() << "Initializing runtime functions\n";
     // Always initialize basic runtime functions
     initializeMallocFree();
     
@@ -529,6 +535,11 @@ void CodeGenContext::generateCode(BlockAST& root) {
     LLVMInitializeNativeTarget();
     LLVMInitializeNativeAsmParser();
     LLVMInitializeNativeAsmPrinter();
+
+    // Run the pass on each function
+    for (auto &F : *module) {
+        fpm->run(F);
+    }
 }
 
 void CodeGenContext::pushBlock(llvm::DIScope* debugScope) {

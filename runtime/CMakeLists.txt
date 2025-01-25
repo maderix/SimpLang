@@ -127,6 +127,15 @@ target_include_directories(simplang_profiler
         ${CMAKE_SOURCE_DIR}/include
 )
 
+# Add LLVM IR generation flags
+target_compile_options(simplang_profiler
+    PRIVATE
+        -Wall
+        -Wextra
+        -save-temps        # This will save .ll files
+        -emit-llvm        # This ensures LLVM IR is generated
+)
+
 target_link_libraries(simplang_profiler
     PRIVATE
         simplang_runtime
@@ -143,3 +152,6 @@ target_link_libraries(kernel_profiler
         simplang_runtime
         ${CMAKE_DL_LIBS}
 )
+
+# Link against dl for dladdr
+target_link_libraries(simplang_runtime PRIVATE dl)

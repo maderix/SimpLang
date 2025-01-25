@@ -7,6 +7,7 @@ void printUsage(const char* program) {
               << "Options:\n"
               << "  --trace             Enable execution tracing\n"
               << "  --trace-file <path> Specify trace output file (default: kernel_trace.json)\n"
+              << "  --ir-file <path>    Specify LLVM IR file for enhanced tracing\n"
               << "  --warmup <n>        Number of warmup iterations (default: 100)\n"
               << "  --iterations <n>    Number of measurement iterations (default: 1000)\n"
               << "  --track-memory      Enable memory tracking\n"
@@ -29,6 +30,10 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i], "--trace-file") == 0 && i + 1 < argc) {
             config.trace_path = argv[++i];
             config.enable_tracing = true;
+        }
+        else if (strcmp(argv[i], "--ir-file") == 0 && i + 1 < argc) {
+            config.ir_file = argv[++i];
+            config.enable_tracing = true;  // Enable tracing when IR file is provided
         }
         else if (strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) {
             config.warmup_iterations = std::stoul(argv[++i]);

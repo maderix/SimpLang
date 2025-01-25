@@ -256,7 +256,7 @@ llvm::Value* ExpressionStmtAST::codeGen(CodeGenContext& context) {
 }
 
 llvm::Value* BlockAST::codeGen(CodeGenContext& context) {
-    std::cout << "Generating block..." << std::endl;
+    llvm::errs() << "Generating code for block with " << statements.size() << " statements\n";
     llvm::Value* last = nullptr;
     
     context.pushBlock();
@@ -320,6 +320,7 @@ llvm::Value* VariableDeclarationAST::codeGen(CodeGenContext& context) {
 }
 
 llvm::Value* FunctionAST::codeGen(CodeGenContext& context) {
+    llvm::errs() << "Generating code for function: " << name << "\n";
     std::vector<llvm::Type*> argTypes;
     
     // Convert parameter types
@@ -527,6 +528,7 @@ llvm::Value* WhileAST::codeGen(CodeGenContext& context) {
 }
 
 llvm::Value* ReturnAST::codeGen(CodeGenContext& context) {
+    llvm::errs() << "Generating return statement\n";
     std::cout << "Generating return statement" << std::endl;
     
     llvm::Value* returnValue = nullptr;
