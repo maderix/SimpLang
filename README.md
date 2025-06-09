@@ -4,12 +4,72 @@ SimpLang is a domain-specific language (DSL) designed to facilitate SIMD hardwar
 
 ## Getting Started
 
-### Prerequisites
+### Quick Start with Docker (Recommended)
+
+The easiest way to get started is using our development helper script:
+
+```bash
+# One-time setup (builds container and compiles project)
+./dev.sh setup
+
+# Daily development workflow
+./dev.sh build           # Rebuild after code changes
+./dev.sh test            # Run all tests
+./dev.sh debug           # Start interactive debugger
+./dev.sh shell           # Open development shell
+
+# Additional commands
+./dev.sh clean           # Clean build artifacts
+./dev.sh rebuild         # Clean and rebuild everything
+```
+
+**Benefits of this approach:**
+- ✅ **No rebuilds needed** - Files are live-mounted via Docker volumes
+- ✅ **Instant compilation** - Create new `.sl` files and compile immediately
+- ✅ **Persistent build cache** - Incremental builds are fast
+- ✅ **Easy debugging** - Interactive debugger with live source files
+
+**Legacy Docker commands (still work):**
+```bash
+# Build and run tests manually
+docker build -t simplang . && docker run --rm simplang
+
+# Run individual tests
+docker run --rm simplang ./build/tests/test_arithmetic_runner ./build/tests/obj/test_arithmetic.so
+```
+
+### Development with VS Code Dev Container
+
+For the best development experience with full IDE support:
+
+1. **Install VS Code extensions:**
+   - Dev Containers extension
+   - C/C++ extension pack
+
+2. **Open in container:**
+   ```bash
+   # Clone and open
+   git clone <repo-url>
+   cd simple-lang
+   code .
+   # Click "Reopen in Container" when prompted
+   ```
+
+3. **Build and test inside container:**
+   ```bash
+   ./build.sh
+   ./run_tests.sh
+   ```
+
+### Local Installation (Manual Setup)
+
+If you prefer local development, install these prerequisites:
 
 - LLVM 14 or later
 - CMake 3.20+
 - C++17 compatible compiler
 - Boost libraries
+- readline library
 
 ```bash
 # Ubuntu/Debian
@@ -18,7 +78,8 @@ sudo apt install -y \
     llvm-14-dev \
     clang-14 \
     cmake \
-    libboost-dev
+    libboost-dev \
+    libreadline-dev
 ```
 
 ### Building SimpLang

@@ -1,0 +1,47 @@
+{
+  "name": "SimpLang Development",
+  "image": "mcr.microsoft.com/devcontainers/cpp:1-ubuntu-22.04",
+  
+  "features": {
+    "ghcr.io/devcontainers/features/cmake:1": {
+      "version": "3.25"
+    }
+  },
+
+  "onCreateCommand": "bash .devcontainer/setup.sh",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-vscode.cpptools-extension-pack",
+        "ms-vscode.cmake-tools",
+        "llvm-vs-code-extensions.vscode-clangd",
+        "vadimcn.vscode-lldb",
+        "ms-vscode.hexdump",
+        "twxs.cmake"
+      ],
+      "settings": {
+        "C_Cpp.default.cppStandard": "c++17",
+        "C_Cpp.default.compilerPath": "/usr/bin/clang++-14",
+        "cmake.configureOnOpen": true,
+        "cmake.buildDirectory": "${workspaceFolder}/build",
+        "files.associations": {
+          "*.sl": "c",
+          "*.y": "yacc",
+          "*.l": "lex"
+        }
+      }
+    }
+  },
+
+  "forwardPorts": [],
+
+  "postCreateCommand": "git config --global --add safe.directory ${containerWorkspaceFolder}",
+
+  "remoteUser": "vscode",
+  
+  "mounts": [
+    "source=${localWorkspaceFolder}/.git,target=${containerWorkspaceFolder}/.git,type=bind,consistency=cached"
+  ]
+}

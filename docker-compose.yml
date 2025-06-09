@@ -1,0 +1,60 @@
+version: '3.8'
+
+services:
+  simplang-dev:
+    build: .
+    container_name: simplang-dev
+    working_dir: /app
+    volumes:
+      # Mount source code for live editing
+      - ./src:/app/src
+      - ./tests:/app/tests
+      - ./include:/app/include
+      - ./runtime:/app/runtime
+      - ./docs:/app/docs
+      # Mount project files
+      - ./CMakeLists.txt:/app/CMakeLists.txt
+      - ./build.sh:/app/build.sh
+      - ./run_tests.sh:/app/run_tests.sh
+      # Mount any new scripts we create
+      - ./test_debugger_demo.sh:/app/test_debugger_demo.sh
+      - ./build_debug_test.sh:/app/build_debug_test.sh
+      - ./test_debugger_simple.cpp:/app/test_debugger_simple.cpp
+      # Keep build directory persistent but separate
+      - simplang-build:/app/build
+    environment:
+      - LD_LIBRARY_PATH=/app/build/runtime:/usr/local/lib
+    stdin_open: true
+    tty: true
+    command: /bin/bash
+
+  # Service for running tests quickly
+  simplang-test:
+    build: .
+    volumes:
+      - ./src:/app/src
+      - ./tests:/app/tests
+      - ./include:/app/include
+      - ./runtime:/app/runtime
+      - simplang-build:/app/build
+    environment:
+      - LD_LIBRARY_PATH=/app/build/runtime:/usr/local/lib
+    command: ./run_tests.sh
+
+  # Service for running the debugger
+  simplang-debug:
+    build: .
+    volumes:
+      - ./src:/app/src
+      - ./tests:/app/tests
+      - ./include:/app/include
+      - ./runtime:/app/runtime
+      - simplang-build:/app/build
+    environment:
+      - LD_LIBRARY_PATH=/app/build/runtime:/usr/local/lib
+    stdin_open: true
+    tty: true
+    command: ./build/tests/debug_test_runner
+
+volumes:
+  simplang-build:
