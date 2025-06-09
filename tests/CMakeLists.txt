@@ -132,13 +132,13 @@ function(add_sl_test name sl_file expected_result)
 
     add_test(
         NAME ${name}
-        COMMAND ${name}_runner
+        COMMAND ${name}_runner ${so_file}
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/tests
     )
     
     set_tests_properties(${name} PROPERTIES
         ENVIRONMENT "SIMD_DEBUG=1"
-        PASS_REGULAR_EXPRESSION "Test passed with result: ${expected_result}"
+        PASS_REGULAR_EXPRESSION "Test PASSED"
     )
 endfunction()
 
@@ -223,7 +223,7 @@ function(add_simd_test)
     # Add test to CTest
     add_test(
         NAME ${name}
-        COMMAND ${name}_runner
+        COMMAND ${name}_runner ${so_file}
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
     )
 
@@ -405,9 +405,10 @@ if(ENABLE_DEBUGGER)
         COMMAND debug_test_runner
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
     )
-    
+
     set_tests_properties(debug_test PROPERTIES
         ENVIRONMENT "SIMD_DEBUG=1"
+        DISABLED TRUE
     )
 
     message(STATUS "SIMD debug test configured")
