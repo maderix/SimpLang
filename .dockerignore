@@ -1,0 +1,26 @@
+# Build artifacts
+build/
+*.so
+*.ll
+*.o
+
+# Development files
+.git/
+.vscode/
+.devcontainer/
+
+# Temporary files
+tmp/
+profile_output/
+*.png
+*.json
+*.csv
+
+# Exclude specific temp files but keep important .txt files
+.codetracking.txt
+profiler_diff.txt
+test_diff
+builder
+ir_analysis.png
+kernel_trace.json
+profile_results.csv
