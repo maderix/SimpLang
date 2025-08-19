@@ -87,9 +87,6 @@ void CodeGenContext::initializeRuntimeFunctions() {
         initializeSliceTypes();
         initializeSIMDFunctions();
     }
-    
-    // Initialize SimpBLAS functions
-    initializeSimpBlasFunctions();
 }
 
 void CodeGenContext::initializeSliceTypes() {
@@ -777,58 +774,6 @@ void CodeGenContext::initializeSIMDFunctions() {
                           "slice_get_sse", module.get());
     llvm::Function::Create(getAVXFuncTy, llvm::Function::ExternalLinkage,
                           "slice_get_avx", module.get());
-}
-
-void CodeGenContext::initializeSimpBlasFunctions() {
-    // Element-wise addition: void sb_ew_add_f32(const float* A, const float* B, float* C, size_t elems)
-    std::vector<llvm::Type*> ewAddArgs = {
-        llvm::Type::getFloatPtrTy(context),  // const float* A
-        llvm::Type::getFloatPtrTy(context),  // const float* B  
-        llvm::Type::getFloatPtrTy(context),  // float* C
-        llvm::Type::getInt64Ty(context)      // size_t elems
-    };
-    llvm::FunctionType* ewAddType = llvm::FunctionType::get(
-        llvm::Type::getVoidTy(context), ewAddArgs, false);
-    simpblasEwAddF32Func = llvm::Function::Create(
-        ewAddType, llvm::Function::ExternalLinkage, "sb_ew_add_f32", module.get());
-
-    // Element-wise multiplication: void sb_ew_mul_f32(const float* A, const float* B, float* C, size_t elems)
-    simpblasEwMulF32Func = llvm::Function::Create(
-        ewAddType, llvm::Function::ExternalLinkage, "sb_ew_mul_f32", module.get());
-
-    // Element-wise ReLU: void sb_ew_relu_f32(const float* A, float* C, size_t elems)
-    std::vector<llvm::Type*> ewReluArgs = {
-        llvm::Type::getFloatPtrTy(context),  // const float* A
-        llvm::Type::getFloatPtrTy(context),  // float* C
-        llvm::Type::getInt64Ty(context)      // size_t elems
-    };
-    llvm::FunctionType* ewReluType = llvm::FunctionType::get(
-        llvm::Type::getVoidTy(context), ewReluArgs, false);
-    simpblasEwReluF32Func = llvm::Function::Create(
-        ewReluType, llvm::Function::ExternalLinkage, "sb_ew_relu_f32", module.get());
-
-    // GEMM: void sb_gemm_f32(int M, int N, int K, const float* A, int lda, const float* B, int ldb, float* C, int ldc)
-    std::vector<llvm::Type*> gemmArgs = {
-        llvm::Type::getInt32Ty(context),     // int M
-        llvm::Type::getInt32Ty(context),     // int N
-        llvm::Type::getInt32Ty(context),     // int K
-        llvm::Type::getFloatPtrTy(context),  // const float* A
-        llvm::Type::getInt32Ty(context),     // int lda
-        llvm::Type::getFloatPtrTy(context),  // const float* B
-        llvm::Type::getInt32Ty(context),     // int ldb
-        llvm::Type::getFloatPtrTy(context),  // float* C
-        llvm::Type::getInt32Ty(context)      // int ldc
-    };
-    llvm::FunctionType* gemmType = llvm::FunctionType::get(
-        llvm::Type::getVoidTy(context), gemmArgs, false);
-    simpblasGemmF32Func = llvm::Function::Create(
-        gemmType, llvm::Function::ExternalLinkage, "sb_gemm_f32", module.get());
-
-    // Initialize simpblas: int sb_init(void)
-    llvm::FunctionType* initType = llvm::FunctionType::get(
-        llvm::Type::getInt32Ty(context), {}, false);
-    llvm::Function::Create(
-        initType, llvm::Function::ExternalLinkage, "sb_init", module.get());
 }
 
 llvm::TargetMachine* CodeGenContext::getTargetMachine() {

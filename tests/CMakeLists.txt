@@ -83,20 +83,14 @@ function(add_sl_test name sl_file expected_result)
     add_dependencies(all_test_runners ${name}_runner)
 
     # Link with runtime library and dynamic linker
-    set(LINK_LIBRARIES
-        simplang_runtime
-        ${CMAKE_DL_LIBS}
-        ${READLINE_LIBRARIES}
-        readline
-        history
+    target_link_libraries(${name}_runner
+        PRIVATE 
+            simplang_runtime
+            ${CMAKE_DL_LIBS}
+            ${READLINE_LIBRARIES}
+            readline
+            history
     )
-    
-    # Add simpblas for the simpblas demo test
-    if(${name} STREQUAL "test_simpblas_demo")
-        list(APPEND LINK_LIBRARIES simpblas)
-    endif()
-    
-    target_link_libraries(${name}_runner PRIVATE ${LINK_LIBRARIES})
 
     # Add the object file to linker command
     target_link_options(${name}_runner
@@ -333,7 +327,6 @@ add_sl_test(test_main test_main.sl "30.0")
 add_sl_test(test_loop test_loop.sl "135.0")
 add_sl_test(test_fibonacci test_fibonacci.sl "110.0")
 add_sl_test(test_return test_return.sl "85.0")
-add_sl_test(test_simpblas_demo test_simpblas_demo.sl "15.0")
 
 # Add SIMD test
 add_simd_test()

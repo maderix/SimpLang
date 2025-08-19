@@ -48,7 +48,6 @@ private:
     bool simd_enabled = false;
     void initializeMallocFree();
     void initializeSIMDFunctions();
-    void initializeSimpBlasFunctions();
     std::unique_ptr<SIMDInterface> simdInterface;
 
     // Cache for commonly used types
@@ -57,12 +56,6 @@ private:
     llvm::Function* mallocFunc;
     llvm::Function* freeFunc;
     llvm::Function* errorFunc;
-    
-    // SimpBLAS function declarations
-    llvm::Function* simpblasEwAddF32Func;
-    llvm::Function* simpblasEwMulF32Func;
-    llvm::Function* simpblasEwReluF32Func;
-    llvm::Function* simpblasGemmF32Func;
 
     // Private initialization methods
     void initializeModuleAndPassManager();
