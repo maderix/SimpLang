@@ -30,7 +30,7 @@ double cpp_array_kernel() {
     double random_sum = 0.0;
     for (int iter = 0; iter < iterations; iter++) {
         for (int i = 0; i < size; i++) {
-            int random_idx = (size - 1) - i;  // Simple reverse pattern
+            int random_idx = (i * 7919) % size;  // 7919 is a prime
             random_sum += large_array[random_idx];
         }
     }

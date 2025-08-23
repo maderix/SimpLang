@@ -290,8 +290,8 @@ call_args : /* empty */ { $$ = new std::vector<ExprAST*>(); }
 ident : TIDENTIFIER { $$ = new VariableExprAST(*$1); }
       ;
 
-numeric : TINTEGER { $$ = new NumberExprAST(atof($1->c_str())); }
-        | TFLOAT { $$ = new NumberExprAST(atof($1->c_str())); }
+numeric : TINTEGER { $$ = new NumberExprAST(atof($1->c_str()), true); }  // Mark as integer
+        | TFLOAT { $$ = new NumberExprAST(atof($1->c_str()), false); }  // Mark as float
         | TINTLIT {
             std::string val = *$1;
             val.pop_back(); // Remove the 'i' suffix

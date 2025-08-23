@@ -27,9 +27,9 @@ int main(int argc, char* argv[]) {
         // offset_sum = 150 + 250 + 350 + 450 = 1200
         // boundary_result = 111 + 444 + 333 = 888
         // final_result = 1031.25 + 20.75 + 84.0 + 24.0 + 6.0 + 60 + 1000 + 1200 + 888 = 4314.0
-        // But actual result is 4313, likely due to integer truncation in mixed arithmetic
+        // With mixed arithmetic fix, we now get the correct precision
         
-        double expected = 4313.0;
+        double expected = 4314.0;
         
         // Use small epsilon for floating point comparison
         double epsilon = 0.001;

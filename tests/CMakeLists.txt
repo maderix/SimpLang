@@ -327,7 +327,7 @@ add_sl_test(test_main test_main.sl "30.0")
 add_sl_test(test_loop test_loop.sl "135.0")
 add_sl_test(test_fibonacci test_fibonacci.sl "110.0")
 add_sl_test(test_return test_return.sl "85.0")
-add_sl_test(test_array_comprehensive test_array_comprehensive.sl "4313.0")
+add_sl_test(test_array_comprehensive test_array_comprehensive.sl "4314.0")
 
 # Add SIMD test
 add_simd_test()

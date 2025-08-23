@@ -111,13 +111,18 @@ llvm::Value* NumberExprAST::codeGen(CodeGenContext& context) {
     LOG_TRACE("Generating number: ", value, (isInteger ? " (integer)" : " (double)"));
     
     if (isInteger) {
-        // Integer literal - ensure 64-bit
         auto intVal = static_cast<int64_t>(value);
-        LOG_TRACE("Creating i64 constant: ", intVal);
         
-        // Create integer type and value
-        auto* type = llvm::Type::getInt64Ty(context.getContext());
-        return llvm::ConstantInt::get(type, intVal, true);
+        // Use i32 for small integers (common in loops), i64 for larger ones
+        if (intVal >= INT32_MIN && intVal <= INT32_MAX) {
+            LOG_TRACE("Creating i32 constant: ", intVal);
+            auto* type = llvm::Type::getInt32Ty(context.getContext());
+            return llvm::ConstantInt::get(type, static_cast<int32_t>(intVal), true);
+        } else {
+            LOG_TRACE("Creating i64 constant: ", intVal);
+            auto* type = llvm::Type::getInt64Ty(context.getContext());
+            return llvm::ConstantInt::get(type, intVal, true);
+        }
     }
     
     // Double literal (default)
@@ -166,7 +171,12 @@ llvm::Value* UnaryExprAST::codeGen(CodeGenContext& context) {
 
     switch (op_) {
         case OpNeg:
-            return context.getBuilder().CreateFNeg(operandV, "negtmp");
+            // Use integer negation for integer types, float negation for float types
+            if (operandV->getType()->isIntegerTy()) {
+                return context.getBuilder().CreateNeg(operandV, "negtmp");
+            } else {
+                return context.getBuilder().CreateFNeg(operandV, "negtmp");
+            }
         default:
             LOG_ERROR("Invalid unary operator");
             return nullptr;
@@ -178,35 +188,32 @@ llvm::Value* BinaryExprAST::codeGen(CodeGenContext& context) {
     llvm::Value* rhs = right_->codeGen(context);
     if (!lhs || !rhs) return nullptr;
     
-    // Check if either operand is integer (any integer type)
-    bool isIntegerOp = lhs->getType()->isIntegerTy() || 
-                      rhs->getType()->isIntegerTy();
+    // Check operand types
+    bool lhsIsInt = lhs->getType()->isIntegerTy();
+    bool rhsIsInt = rhs->getType()->isIntegerTy();
     
-    // Convert types if needed for mixed operations
-    if (isIntegerOp) {
-        // If both are already integers and same type, no conversion needed
-        if (lhs->getType()->isIntegerTy() && rhs->getType()->isIntegerTy()) {
-            if (lhs->getType() != rhs->getType()) {
-                // Different integer types - promote to larger type
-                llvm::Type* targetType;
-                if (lhs->getType()->getIntegerBitWidth() > rhs->getType()->getIntegerBitWidth()) {
-                    targetType = lhs->getType();
-                    rhs = context.getBuilder().CreateSExtOrTrunc(rhs, targetType, "conv");
-                } else {
-                    targetType = rhs->getType();
-                    lhs = context.getBuilder().CreateSExtOrTrunc(lhs, targetType, "conv");
-                }
-            }
-        } else {
-            // Mixed integer/float - convert float to integer
-            llvm::Type* targetType = lhs->getType()->isIntegerTy() ? lhs->getType() : rhs->getType();
-            if (!lhs->getType()->isIntegerTy()) {
-                lhs = context.getBuilder().CreateFPToSI(lhs, targetType, "conv");
-            }
-            if (!rhs->getType()->isIntegerTy()) {
-                rhs = context.getBuilder().CreateFPToSI(rhs, targetType, "conv");
+    // Handle type conversions
+    if (lhsIsInt && rhsIsInt) {
+        // Both integers - ensure same integer type
+        if (lhs->getType() != rhs->getType()) {
+            // Different integer types - promote to larger type
+            llvm::Type* targetType;
+            if (lhs->getType()->getIntegerBitWidth() > rhs->getType()->getIntegerBitWidth()) {
+                targetType = lhs->getType();
+                rhs = context.getBuilder().CreateSExtOrTrunc(rhs, targetType, "conv");
+            } else {
+                targetType = rhs->getType();
+                lhs = context.getBuilder().CreateSExtOrTrunc(lhs, targetType, "conv");
             }
         }
+    } else if (lhsIsInt && !rhsIsInt) {
+        // LHS is integer, RHS is float - convert LHS to float
+        lhs = context.getBuilder().CreateSIToFP(lhs, rhs->getType(), "intToFloat");
+        lhsIsInt = false;  // Now both are floats
+    } else if (!lhsIsInt && rhsIsInt) {
+        // LHS is float, RHS is integer - convert RHS to float
+        rhs = context.getBuilder().CreateSIToFP(rhs, lhs->getType(), "intToFloat");
+        rhsIsInt = false;  // Now both are floats
     } else {
         // Both floating point - ensure same floating point type
         if (lhs->getType() != rhs->getType()) {
@@ -221,46 +228,52 @@ llvm::Value* BinaryExprAST::codeGen(CodeGenContext& context) {
         }
     }
     
-    // Generate operation based on types
+    // Generate operation based on final types (after conversion)
+    bool useIntegerOps = lhs->getType()->isIntegerTy() && rhs->getType()->isIntegerTy();
+    
     switch (op_) {
         case BinaryOp::OpAdd:
-            return isIntegerOp ? 
+            return useIntegerOps ? 
                 context.getBuilder().CreateAdd(lhs, rhs, "addtmp") :
                 context.getBuilder().CreateFAdd(lhs, rhs, "addtmp");
         case BinaryOp::OpSub:
-            return isIntegerOp ? 
+            return useIntegerOps ? 
                 context.getBuilder().CreateSub(lhs, rhs, "subtmp") :
                 context.getBuilder().CreateFSub(lhs, rhs, "subtmp");
         case BinaryOp::OpMul:
-            return isIntegerOp ? 
+            return useIntegerOps ? 
                 context.getBuilder().CreateMul(lhs, rhs, "multmp") :
                 context.getBuilder().CreateFMul(lhs, rhs, "multmp");
         case BinaryOp::OpDiv:
-            return isIntegerOp ? 
+            return useIntegerOps ? 
                 context.getBuilder().CreateSDiv(lhs, rhs, "divtmp") :
                 context.getBuilder().CreateFDiv(lhs, rhs, "divtmp");
+        case BinaryOp::OpMod:
+            return useIntegerOps ? 
+                context.getBuilder().CreateSRem(lhs, rhs, "modtmp") :
+                context.getBuilder().CreateFRem(lhs, rhs, "modtmp");
         case BinaryOp::OpLT:
-            return isIntegerOp ? 
+            return useIntegerOps ? 
                 context.getBuilder().CreateICmpSLT(lhs, rhs, "cmptmp") :
                 context.getBuilder().CreateFCmpULT(lhs, rhs, "cmptmp");
         case BinaryOp::OpGT:
-            return isIntegerOp ? 
+            return useIntegerOps ? 
                 context.getBuilder().CreateICmpSGT(lhs, rhs, "cmptmp") :
                 context.getBuilder().CreateFCmpUGT(lhs, rhs, "cmptmp");
         case BinaryOp::OpLE:
-            return isIntegerOp ? 
+            return useIntegerOps ? 
                 context.getBuilder().CreateICmpSLE(lhs, rhs, "cmptmp") :
                 context.getBuilder().CreateFCmpULE(lhs, rhs, "cmptmp");
         case BinaryOp::OpGE:
-            return isIntegerOp ? 
+            return useIntegerOps ? 
                 context.getBuilder().CreateICmpSGE(lhs, rhs, "cmptmp") :
                 context.getBuilder().CreateFCmpUGE(lhs, rhs, "cmptmp");
         case BinaryOp::OpEQ:
-            return isIntegerOp ? 
+            return useIntegerOps ? 
                 context.getBuilder().CreateICmpEQ(lhs, rhs, "cmptmp") :
                 context.getBuilder().CreateFCmpUEQ(lhs, rhs, "cmptmp");
         case BinaryOp::OpNE:
-            return isIntegerOp ? 
+            return useIntegerOps ? 
                 context.getBuilder().CreateICmpNE(lhs, rhs, "cmptmp") :
                 context.getBuilder().CreateFCmpUNE(lhs, rhs, "cmptmp");
         default:
@@ -412,9 +425,6 @@ llvm::Value* VariableDeclarationAST::codeGen(CodeGenContext& context) {
             varType = staticType->getLLVMType(context.getContext());
         }
         LOG_DEBUG("Using static type: ", staticType->toString());
-    } else if (initVal && llvm::isa<llvm::ConstantInt>(initVal)) {
-        // For integer literals, use i64
-        varType = llvm::Type::getInt64Ty(context.getContext());
     } else if (auto* sliceExpr = dynamic_cast<SliceExprAST*>(assignmentExpr)) {
         // For slices, use the appropriate slice type
         varType = context.getSliceType(sliceExpr->getType());
@@ -429,6 +439,15 @@ llvm::Value* VariableDeclarationAST::codeGen(CodeGenContext& context) {
     } else if (initVal) {
         // Infer type from initialization value
         varType = initVal->getType();
+        
+        // Ensure consistency: if we get i32, use i32 for the variable
+        // This avoids type mismatches when storing integer literals
+        if (varType && varType->isIntegerTy(32)) {
+            varType = llvm::Type::getInt32Ty(context.getContext());
+        } else if (varType && varType->isIntegerTy(64)) {
+            varType = llvm::Type::getInt64Ty(context.getContext());
+        }
+        
         LOG_DEBUG("Inferred variable type from init value: ", varType->getTypeID());
     } else {
         // Default to double
@@ -545,6 +564,11 @@ llvm::Value* FunctionAST::codeGen(CodeGenContext& context) {
         
         // Verify function
         llvm::verifyFunction(*function);
+        
+        // Run optimization passes on the function
+        if (context.getFPM()) {
+            context.getFPM()->run(*function);
+        }
         
         context.popBlock();
         return function;
@@ -903,9 +927,21 @@ llvm::Value* SliceStoreExprAST::codeGen(CodeGenContext& context) {
                     return nullptr;
                 }
                 
-                // Convert index to i64 if needed
-                if (idx->getType() != builder.getInt64Ty()) {
-                    idx = convertType(idx, builder.getInt64Ty(), context, "array_idx");
+                // Optimize index type - prefer i32 for better performance, only convert to i64 if necessary
+                llvm::Type* targetIdxType;
+                if (idx->getType()->isIntegerTy(32)) {
+                    // Keep i32 indices as-is for better performance
+                    targetIdxType = builder.getInt32Ty();
+                } else if (idx->getType()->isIntegerTy(64)) {
+                    // Keep i64 if already 64-bit
+                    targetIdxType = builder.getInt64Ty();
+                } else {
+                    // Convert other types to i32 (most common case)
+                    targetIdxType = builder.getInt32Ty();
+                }
+                
+                if (idx->getType() != targetIdxType) {
+                    idx = convertType(idx, targetIdxType, context, "array_idx");
                 }
                 
                 // Generate value to store
@@ -1013,9 +1049,18 @@ llvm::Value* SliceAccessExprAST::codeGen(CodeGenContext& context) {
                     return nullptr;
                 }
                 
-                // Convert index to i64 if needed
-                if (idx->getType() != builder.getInt64Ty()) {
-                    idx = convertType(idx, builder.getInt64Ty(), context, "array_access_idx");
+                // Optimize index type - prefer i32 for better performance
+                llvm::Type* targetIdxType;
+                if (idx->getType()->isIntegerTy(32)) {
+                    targetIdxType = builder.getInt32Ty();
+                } else if (idx->getType()->isIntegerTy(64)) {
+                    targetIdxType = builder.getInt64Ty();
+                } else {
+                    targetIdxType = builder.getInt32Ty();
+                }
+                
+                if (idx->getType() != targetIdxType) {
+                    idx = convertType(idx, targetIdxType, context, "array_access_idx");
                 }
                 
                 // Create GEP and load

@@ -6,6 +6,12 @@
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Support/Host.h>
 #include <llvm/IR/LegacyPassManager.h>
+#include <llvm/Transforms/Scalar.h>
+#include <llvm/Transforms/Utils.h>
+#include <llvm/Transforms/InstCombine/InstCombine.h>
+#include <llvm/Analysis/BasicAliasAnalysis.h>
+#include <llvm/Analysis/AssumptionCache.h>
+#include <llvm/Analysis/TargetTransformInfo.h>
 #include <llvm-c/Target.h>
 #include <iostream>
 
@@ -54,6 +60,13 @@ CodeGenContext::CodeGenContext() : builder(context) {
     
     // Initialize optimization passes
     fpm = std::make_unique<llvm::legacy::FunctionPassManager>(module.get());
+    
+    // Add essential optimization passes for performance (conservative approach)
+    fpm->add(llvm::createPromoteMemoryToRegisterPass());      // mem2reg - most critical for register allocation
+    fpm->add(llvm::createInstructionCombiningPass());         // instcombine - combine redundant instructions  
+    fpm->add(llvm::createReassociatePass());                  // reassociate - expression reordering
+    fpm->add(llvm::createCFGSimplificationPass());            // simplifycfg - control flow cleanup
+    
     fpm->doInitialization();
 }
 

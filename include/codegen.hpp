@@ -119,6 +119,7 @@ public:
     llvm::IRBuilder<>& getBuilder() { return builder; }
     llvm::DIBuilder* getDebugBuilder() { return debugBuilder.get(); }
     MemoryTracker* getMemoryTracker() { return memoryTracker.get(); }
+    llvm::legacy::FunctionPassManager* getFPM() { return fpm.get(); }
     
     void setMemoryTracker(std::shared_ptr<MemoryTracker> tracker) {
         memoryTracker = tracker;
