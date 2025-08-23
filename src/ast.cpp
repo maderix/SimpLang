@@ -6,6 +6,105 @@
 #include "simd_ops.hpp"
 #include <llvm/IR/Type.h>
 
+// Generic type conversion utility
+static llvm::Value* convertType(llvm::Value* value, llvm::Type* targetType, 
+                                CodeGenContext& context, const std::string& name = "conv") {
+    if (!value || !targetType) return nullptr;
+    
+    llvm::Type* sourceType = value->getType();
+    if (sourceType == targetType) return value; // No conversion needed
+    
+    auto& builder = context.getBuilder();
+    
+    // Both are integers
+    if (sourceType->isIntegerTy() && targetType->isIntegerTy()) {
+        unsigned sourceBits = sourceType->getIntegerBitWidth();
+        unsigned targetBits = targetType->getIntegerBitWidth();
+        
+        if (targetBits > sourceBits) {
+            // Sign extend to larger integer
+            return builder.CreateSExt(value, targetType, name);
+        } else if (targetBits < sourceBits) {
+            // Truncate to smaller integer
+            return builder.CreateTrunc(value, targetType, name);
+        }
+        return value; // Same size
+    }
+    
+    // Both are floating point
+    if (sourceType->isFloatingPointTy() && targetType->isFloatingPointTy()) {
+        if (targetType->isDoubleTy() && sourceType->isFloatTy()) {
+            // Float to double
+            return builder.CreateFPExt(value, targetType, name);
+        } else if (targetType->isFloatTy() && sourceType->isDoubleTy()) {
+            // Double to float
+            return builder.CreateFPTrunc(value, targetType, name);
+        }
+        return value; // Same type
+    }
+    
+    // Integer to floating point
+    if (sourceType->isIntegerTy() && targetType->isFloatingPointTy()) {
+        return builder.CreateSIToFP(value, targetType, name);
+    }
+    
+    // Floating point to integer
+    if (sourceType->isFloatingPointTy() && targetType->isIntegerTy()) {
+        return builder.CreateFPToSI(value, targetType, name);
+    }
+    
+    // Pointer types - no conversion
+    if (sourceType->isPointerTy() && targetType->isPointerTy()) {
+        // Could add pointer cast if needed
+        return value;
+    }
+    
+    // Default: return unchanged if we can't convert
+    std::cerr << "Warning: Unable to convert between types" << std::endl;
+    return value;
+}
+
+// TypeInfo implementations
+llvm::Type* TypeInfo::getLLVMType(llvm::LLVMContext& ctx) const {
+    switch (kind) {
+        case TypeKind::F32:     return llvm::Type::getFloatTy(ctx);
+        case TypeKind::F64:     return llvm::Type::getDoubleTy(ctx);
+        case TypeKind::I8:      return llvm::Type::getInt8Ty(ctx);
+        case TypeKind::I16:     return llvm::Type::getInt16Ty(ctx);
+        case TypeKind::I32:     return llvm::Type::getInt32Ty(ctx);
+        case TypeKind::I64:     return llvm::Type::getInt64Ty(ctx);
+        case TypeKind::U8:      return llvm::Type::getInt8Ty(ctx);   // LLVM treats as signed
+        case TypeKind::U16:     return llvm::Type::getInt16Ty(ctx);  // LLVM treats as signed
+        case TypeKind::U32:     return llvm::Type::getInt32Ty(ctx);  // LLVM treats as signed
+        case TypeKind::U64:     return llvm::Type::getInt64Ty(ctx);  // LLVM treats as signed
+        case TypeKind::Bool:    return llvm::Type::getInt1Ty(ctx);
+        case TypeKind::Void:    return llvm::Type::getVoidTy(ctx);
+        case TypeKind::Dynamic: return llvm::Type::getDoubleTy(ctx); // Default to double
+        case TypeKind::Array:   return nullptr; // Handled by ArrayTypeInfo
+        default:                return llvm::Type::getDoubleTy(ctx);
+    }
+}
+
+std::string TypeInfo::toString() const {
+    switch (kind) {
+        case TypeKind::F32:     return "f32";
+        case TypeKind::F64:     return "f64";
+        case TypeKind::I8:      return "i8";
+        case TypeKind::I16:     return "i16";
+        case TypeKind::I32:     return "i32";
+        case TypeKind::I64:     return "i64";
+        case TypeKind::U8:      return "u8";
+        case TypeKind::U16:     return "u16";
+        case TypeKind::U32:     return "u32";
+        case TypeKind::U64:     return "u64";
+        case TypeKind::Bool:    return "bool";
+        case TypeKind::Void:    return "void";
+        case TypeKind::Dynamic: return "var";
+        case TypeKind::Array:   return "array";
+        default:                return "unknown";
+    }
+}
+
 llvm::Value* NumberExprAST::codeGen(CodeGenContext& context) {
     // Debug output
     llvm::errs() << "Generating number: " << value 
@@ -79,25 +178,46 @@ llvm::Value* BinaryExprAST::codeGen(CodeGenContext& context) {
     llvm::Value* rhs = right_->codeGen(context);
     if (!lhs || !rhs) return nullptr;
     
-    // Check if either operand is integer
-    bool isIntegerOp = lhs->getType()->isIntegerTy(64) || 
-                      rhs->getType()->isIntegerTy(64);
+    // Check if either operand is integer (any integer type)
+    bool isIntegerOp = lhs->getType()->isIntegerTy() || 
+                      rhs->getType()->isIntegerTy();
     
-    // Convert types if needed
+    // Convert types if needed for mixed operations
     if (isIntegerOp) {
-        if (!lhs->getType()->isIntegerTy(64)) {
-            lhs = context.getBuilder().CreateFPToSI(
-                lhs, 
-                llvm::Type::getInt64Ty(context.getContext()),
-                "conv"
-            );
+        // If both are already integers and same type, no conversion needed
+        if (lhs->getType()->isIntegerTy() && rhs->getType()->isIntegerTy()) {
+            if (lhs->getType() != rhs->getType()) {
+                // Different integer types - promote to larger type
+                llvm::Type* targetType;
+                if (lhs->getType()->getIntegerBitWidth() > rhs->getType()->getIntegerBitWidth()) {
+                    targetType = lhs->getType();
+                    rhs = context.getBuilder().CreateSExtOrTrunc(rhs, targetType, "conv");
+                } else {
+                    targetType = rhs->getType();
+                    lhs = context.getBuilder().CreateSExtOrTrunc(lhs, targetType, "conv");
+                }
+            }
+        } else {
+            // Mixed integer/float - convert float to integer
+            llvm::Type* targetType = lhs->getType()->isIntegerTy() ? lhs->getType() : rhs->getType();
+            if (!lhs->getType()->isIntegerTy()) {
+                lhs = context.getBuilder().CreateFPToSI(lhs, targetType, "conv");
+            }
+            if (!rhs->getType()->isIntegerTy()) {
+                rhs = context.getBuilder().CreateFPToSI(rhs, targetType, "conv");
+            }
         }
-        if (!rhs->getType()->isIntegerTy(64)) {
-            rhs = context.getBuilder().CreateFPToSI(
-                rhs,
-                llvm::Type::getInt64Ty(context.getContext()),
-                "conv"
-            );
+    } else {
+        // Both floating point - ensure same floating point type
+        if (lhs->getType() != rhs->getType()) {
+            // Promote to double for mixed float operations
+            llvm::Type* doubleType = llvm::Type::getDoubleTy(context.getContext());
+            if (lhs->getType()->isFloatTy()) {
+                lhs = context.getBuilder().CreateFPExt(lhs, doubleType, "conv");
+            }
+            if (rhs->getType()->isFloatTy()) {
+                rhs = context.getBuilder().CreateFPExt(rhs, doubleType, "conv");
+            }
         }
     }
     
@@ -165,29 +285,9 @@ llvm::Value* AssignmentExprAST::codeGen(CodeGenContext& context) {
         return nullptr;
     }
 
-    // Check types match
+    // Check types and convert if needed
     llvm::Type* varType = variable->getType()->getPointerElementType();
-    llvm::Type* rhsType = rhsValue->getType();
-    
-    if (varType != rhsType) {
-        // Try to convert types if possible
-        if (varType->isDoubleTy() && rhsType->isIntegerTy()) {
-            rhsValue = context.getBuilder().CreateSIToFP(
-                rhsValue,
-                llvm::Type::getDoubleTy(context.getContext()),
-                "conv"
-            );
-        } else if (varType->isIntegerTy() && rhsType->isDoubleTy()) {
-            rhsValue = context.getBuilder().CreateFPToSI(
-                rhsValue,
-                llvm::Type::getInt64Ty(context.getContext()),
-                "conv"
-            );
-        } else {
-            std::cerr << "Error: Type mismatch in assignment to " << lhs_->getName() << std::endl;
-            return nullptr;
-        }
-    }
+    rhsValue = convertType(rhsValue, varType, context, "assignconv");
 
     // Create the store instruction
     context.getBuilder().CreateStore(rhsValue, variable);
@@ -214,6 +314,11 @@ llvm::Value* CallExprAST::codeGen(CodeGenContext& context) {
         llvm::Value* argVal = arguments[i]->codeGen(context);
         if (!argVal)
             return nullptr;
+        
+        // Convert argument to match function parameter type
+        llvm::Type* expectedType = calleeF->getFunctionType()->getParamType(i);
+        argVal = convertType(argVal, expectedType, context, "argconv");
+        
         argsV.push_back(argVal);
     }
 
@@ -288,7 +393,26 @@ llvm::Value* VariableDeclarationAST::codeGen(CodeGenContext& context) {
     
     // Determine variable type
     llvm::Type* varType;
-    if (initVal && llvm::isa<llvm::ConstantInt>(initVal)) {
+    if (isStaticallyTyped()) {
+        // Use the static type information
+        if (staticType->kind == TypeKind::Array) {
+            // For arrays, handle specially
+            auto* arrayType = static_cast<ArrayTypeInfo*>(staticType.get());
+            if (arrayType->size > 0) {
+                // Fixed-size array
+                llvm::Type* elemType = arrayType->elementType->getLLVMType(context.getContext());
+                varType = llvm::ArrayType::get(elemType, arrayType->size);
+            } else {
+                // Dynamic array - use pointer for now
+                llvm::Type* elemType = arrayType->elementType->getLLVMType(context.getContext());
+                varType = llvm::PointerType::get(elemType, 0);
+            }
+        } else {
+            // Basic static type
+            varType = staticType->getLLVMType(context.getContext());
+        }
+        std::cout << "Using static type: " << staticType->toString() << std::endl;
+    } else if (initVal && llvm::isa<llvm::ConstantInt>(initVal)) {
         // For integer literals, use i64
         varType = llvm::Type::getInt64Ty(context.getContext());
     } else if (auto* sliceExpr = dynamic_cast<SliceExprAST*>(assignmentExpr)) {
@@ -310,7 +434,15 @@ llvm::Value* VariableDeclarationAST::codeGen(CodeGenContext& context) {
     
     // Store initial value if it exists
     if (initVal) {
-        context.getBuilder().CreateStore(initVal, alloc);
+        llvm::Value* storeValue = initVal;
+        
+        // Use generic type converter for static types
+        if (isStaticallyTyped() && staticType->kind != TypeKind::Array) {
+            llvm::Type* targetType = staticType->getLLVMType(context.getContext());
+            storeValue = convertType(initVal, targetType, context, "initconv");
+        }
+        
+        context.getBuilder().CreateStore(storeValue, alloc);
     }
     
     // Add to symbol table
@@ -337,14 +469,35 @@ llvm::Value* FunctionAST::codeGen(CodeGenContext& context) {
             
             // Add pointer to the slice struct type
             argTypes.push_back(llvm::PointerType::get(structType, 0));
+        } else if (arg->isStaticallyTyped()) {
+            // Use static type information
+            if (arg->getStaticType()->kind == TypeKind::Array) {
+                auto* arrayType = static_cast<const ArrayTypeInfo*>(arg->getStaticType());
+                llvm::Type* elemType = arrayType->elementType->getLLVMType(context.getContext());
+                // For array parameters, use pointer to element type
+                argTypes.push_back(llvm::PointerType::get(elemType, 0));
+            } else {
+                argTypes.push_back(arg->getStaticType()->getLLVMType(context.getContext()));
+            }
         } else {
+            // Default to double for dynamic typing
             argTypes.push_back(llvm::Type::getDoubleTy(context.getContext()));
         }
     }
     
+    // Determine function return type
+    llvm::Type* returnType;
+    if (hasStaticReturnType()) {
+        returnType = this->returnType->getLLVMType(context.getContext());
+        std::cout << "Using static return type: " << this->returnType->toString() << std::endl;
+    } else {
+        // Default to double for dynamic typing
+        returnType = llvm::Type::getDoubleTy(context.getContext());
+    }
+    
     // Create function type
     llvm::FunctionType* functionType = llvm::FunctionType::get(
-        llvm::Type::getDoubleTy(context.getContext()),
+        returnType,
         argTypes,
         false
     );
@@ -538,6 +691,11 @@ llvm::Value* ReturnAST::codeGen(CodeGenContext& context) {
     } else {
         returnValue = llvm::ConstantFP::get(context.getContext(), llvm::APFloat(0.0));
     }
+    
+    // Get the current function's return type and convert if needed
+    llvm::Function* currentFunction = context.getBuilder().GetInsertBlock()->getParent();
+    llvm::Type* expectedReturnType = currentFunction->getReturnType();
+    returnValue = convertType(returnValue, expectedReturnType, context, "retconv");
     
     // Only create return instruction if we don't already have a terminator
     if (!context.getBuilder().GetInsertBlock()->getTerminator()) {

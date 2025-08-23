@@ -45,12 +45,14 @@
     std::vector<VariableDeclarationAST*> *varvec;
     std::string *string;
     SliceTypeAST *slice_type;
+    TypeInfo *type_info;
     int token;
 }
 
 %token <string> TIDENTIFIER TINTEGER TFLOAT TINTLIT
-%token TCEQ TCNE TCLE TCGE
+%token TCEQ TCNE TCLE TCGE TARROW
 %token TVAR TFUNC TIF TELSE TWHILE TRETURN
+%token TF32 TF64 TI8 TI16 TI32 TI64 TU8 TU16 TU32 TU64 TBOOL TVOID
 %token TSSE TAVX    /* Vector creation tokens */
 %token TLPAREN TRPAREN TLBRACE TRBRACE
 %token TCOMMA TSEMICOLON
@@ -74,6 +76,7 @@
 %type <varvec> func_decl_args
 %type <var_decl> var_decl param_decl
 %type <slice_type> slice_type
+%type <type_info> type_spec array_type
 
 %%
 
@@ -148,14 +151,49 @@ block : TLBRACE stmts TRBRACE { $$ = $2; }
 
 var_decl : TVAR TIDENTIFIER { $$ = new VariableDeclarationAST(*$2, nullptr); }
          | TVAR TIDENTIFIER '=' expr { $$ = new VariableDeclarationAST(*$2, $4); }
-         | TVAR TIDENTIFIER slice_type { $$ = new VariableDeclarationAST(*$2, nullptr, $3); }
+         | TVAR TIDENTIFIER slice_type { $$ = new VariableDeclarationAST(*$2, nullptr, nullptr, $3); }
          | TVAR TIDENTIFIER slice_type '=' slice_expr 
-           { $$ = new VariableDeclarationAST(*$2, $5, $3); }
+           { $$ = new VariableDeclarationAST(*$2, $5, nullptr, $3); }
+         | type_spec TIDENTIFIER { 
+             $$ = new VariableDeclarationAST(*$2, nullptr, std::unique_ptr<TypeInfo>($1)); 
+           }
+         | type_spec TIDENTIFIER '=' expr { 
+             $$ = new VariableDeclarationAST(*$2, $4, std::unique_ptr<TypeInfo>($1)); 
+           }
+         | array_type TIDENTIFIER { 
+             $$ = new VariableDeclarationAST(*$2, nullptr, std::unique_ptr<TypeInfo>($1)); 
+           }
+         | array_type TIDENTIFIER '=' expr { 
+             $$ = new VariableDeclarationAST(*$2, $4, std::unique_ptr<TypeInfo>($1)); 
+           }
          ;
 
 slice_type : TSSESLICE { $$ = new SliceTypeAST(SliceType::SSE_SLICE); }
           | TAVXSLICE { $$ = new SliceTypeAST(SliceType::AVX_SLICE); }
           ;
+
+type_spec : TF32 { $$ = new TypeInfo(TypeKind::F32); }
+         | TF64 { $$ = new TypeInfo(TypeKind::F64); }
+         | TI8 { $$ = new TypeInfo(TypeKind::I8); }
+         | TI16 { $$ = new TypeInfo(TypeKind::I16); }
+         | TI32 { $$ = new TypeInfo(TypeKind::I32); }
+         | TI64 { $$ = new TypeInfo(TypeKind::I64); }
+         | TU8 { $$ = new TypeInfo(TypeKind::U8); }
+         | TU16 { $$ = new TypeInfo(TypeKind::U16); }
+         | TU32 { $$ = new TypeInfo(TypeKind::U32); }
+         | TU64 { $$ = new TypeInfo(TypeKind::U64); }
+         | TBOOL { $$ = new TypeInfo(TypeKind::Bool); }
+         | TVOID { $$ = new TypeInfo(TypeKind::Void); }
+         | TVAR { $$ = new TypeInfo(TypeKind::Dynamic); }
+         ;
+
+array_type : type_spec TLBRACKET TINTEGER TRBRACKET { 
+             $$ = new ArrayTypeInfo(std::unique_ptr<TypeInfo>($1), atoi($3->c_str())); 
+           }
+           | type_spec TLBRACKET TRBRACKET { 
+             $$ = new ArrayTypeInfo(std::unique_ptr<TypeInfo>($1), -1); /* Dynamic size */
+           }
+           ;
 
 expr_list 
     : expr { 
@@ -184,11 +222,19 @@ call_expr : ident TLPAREN call_args TRPAREN {
           ;
 
 param_decl : TVAR TIDENTIFIER { $$ = new VariableDeclarationAST(*$2, nullptr); }
-           | TVAR TIDENTIFIER slice_type { $$ = new VariableDeclarationAST(*$2, nullptr, $3); }
+           | TVAR TIDENTIFIER slice_type { $$ = new VariableDeclarationAST(*$2, nullptr, nullptr, $3); }
+           | type_spec TIDENTIFIER { 
+               $$ = new VariableDeclarationAST(*$2, nullptr, std::unique_ptr<TypeInfo>($1)); 
+             }
+           | array_type TIDENTIFIER { 
+               $$ = new VariableDeclarationAST(*$2, nullptr, std::unique_ptr<TypeInfo>($1)); 
+             }
            ;
 
 func_decl : TFUNC TIDENTIFIER TLPAREN func_decl_args TRPAREN block 
             { $$ = new FunctionAST(*$2, $4, $6); }
+          | TFUNC TIDENTIFIER TLPAREN func_decl_args TRPAREN TARROW type_spec block 
+            { $$ = new FunctionAST(*$2, $4, $8, std::unique_ptr<TypeInfo>($7)); }
           ;
 
 func_decl_args : /* empty */ { $$ = new std::vector<VariableDeclarationAST*>(); }

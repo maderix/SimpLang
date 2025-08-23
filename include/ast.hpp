@@ -12,6 +12,52 @@
 
 class CodeGenContext;
 
+// Type system for static typing
+enum class TypeKind {
+    Dynamic,    // Current 'var' behavior
+    F32, F64,   // Floating point
+    I8, I16, I32, I64,   // Signed integers
+    U8, U16, U32, U64,   // Unsigned integers  
+    Bool,       // Boolean
+    Void,       // Function returns
+    Array       // Array/tensor types
+};
+
+class TypeInfo {
+public:
+    TypeKind kind;
+    
+    TypeInfo(TypeKind k) : kind(k) {}
+    virtual ~TypeInfo() = default;
+    
+    bool isStaticallyTyped() const { return kind != TypeKind::Dynamic; }
+    bool isInteger() const { 
+        return kind >= TypeKind::I8 && kind <= TypeKind::U64; 
+    }
+    bool isFloat() const { 
+        return kind == TypeKind::F32 || kind == TypeKind::F64; 
+    }
+    bool isSigned() const {
+        return kind >= TypeKind::I8 && kind <= TypeKind::I64;
+    }
+    bool isUnsigned() const {
+        return kind >= TypeKind::U8 && kind <= TypeKind::U64;
+    }
+    
+    llvm::Type* getLLVMType(llvm::LLVMContext& ctx) const;
+    std::string toString() const;
+};
+
+class ArrayTypeInfo : public TypeInfo {
+public:
+    std::unique_ptr<TypeInfo> elementType;
+    int size; // -1 for dynamic size
+    std::vector<int> dimensions; // For multi-dim arrays
+    
+    ArrayTypeInfo(std::unique_ptr<TypeInfo> elemType, int sz = -1) 
+        : TypeInfo(TypeKind::Array), elementType(std::move(elemType)), size(sz) {}
+};
+
 enum UnaryOp {
     OpNeg = '-'  // Unary minus
 };
@@ -189,19 +235,32 @@ class VariableDeclarationAST : public StmtAST {
     std::string name;
     ExprAST* assignmentExpr;
     SliceTypeAST* sliceType;
+    std::unique_ptr<TypeInfo> staticType;  // NEW: Optional static type
     unsigned lineNo;
     bool isGlobal;
     std::string typeName;  // For debug info
 
 public:
+    // Constructor for static typing
     VariableDeclarationAST(const std::string& name, 
                           ExprAST* expr = nullptr,
+                          std::unique_ptr<TypeInfo> type = nullptr,
                           SliceTypeAST* slice = nullptr,
                           unsigned line = 0,
-                          bool global = false,
-                          const std::string& type = "double")
+                          bool global = false)
         : name(name), assignmentExpr(expr), sliceType(slice), 
-          lineNo(line), isGlobal(global), typeName(type) {}
+          staticType(std::move(type)), lineNo(line), isGlobal(global), 
+          typeName(staticType ? staticType->toString() : "double") {}
+
+    // Legacy constructor for backward compatibility  
+    VariableDeclarationAST(const std::string& name, 
+                          ExprAST* expr,
+                          SliceTypeAST* slice,
+                          unsigned line,
+                          bool global,
+                          const std::string& type)
+        : name(name), assignmentExpr(expr), sliceType(slice), 
+          staticType(nullptr), lineNo(line), isGlobal(global), typeName(type) {}
           
     virtual ~VariableDeclarationAST() {
         delete assignmentExpr;
@@ -217,6 +276,11 @@ public:
     bool isGlobalVariable() const { return isGlobal; }
     const std::string& getTypeName() const { return typeName; }
     ExprAST* getAssignmentExpr() const { return assignmentExpr; }
+    
+    // New methods for static typing
+    bool isStaticallyTyped() const { return staticType && staticType->isStaticallyTyped(); }
+    TypeKind getTypeKind() const { return staticType ? staticType->kind : TypeKind::Dynamic; }
+    const TypeInfo* getStaticType() const { return staticType.get(); }
     
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
 };
@@ -242,11 +306,18 @@ class FunctionAST : public StmtAST {
     std::string name;
     std::vector<VariableDeclarationAST*> arguments;
     BlockAST* body;
+    std::unique_ptr<TypeInfo> returnType;  // NEW: Optional static return type
 public:
     FunctionAST(const std::string& name,
                 std::vector<VariableDeclarationAST*>* arguments,
-                BlockAST* body)
-        : name(name), arguments(*arguments), body(body) {}
+                BlockAST* body,
+                std::unique_ptr<TypeInfo> retType = nullptr)
+        : name(name), arguments(*arguments), body(body), returnType(std::move(retType)) {}
+    
+    bool hasStaticReturnType() const { return returnType && returnType->isStaticallyTyped(); }
+    TypeKind getReturnTypeKind() const { return returnType ? returnType->kind : TypeKind::Dynamic; }
+    const TypeInfo* getReturnType() const { return returnType.get(); }
+    
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
 };
 

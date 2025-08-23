@@ -25,6 +25,19 @@ extern "C" int yywrap() { return 1; }
 "var"                 { return TVAR; }
 "make"                { return TMAKE; }
 
+"f32"                 { return TF32; }
+"f64"                 { return TF64; }
+"i8"                  { return TI8; }
+"i16"                 { return TI16; }
+"i32"                 { return TI32; }
+"i64"                 { return TI64; }
+"u8"                  { return TU8; }
+"u16"                 { return TU16; }
+"u32"                 { return TU32; }
+"u64"                 { return TU64; }
+"bool"                { return TBOOL; }
+"void"                { return TVOID; }
+
 "SSESlice"           { return TSSESLICE; }
 "AVXSlice"           { return TAVXSLICE; }
 "sse"                { return TSSE; }
@@ -45,6 +58,7 @@ extern "C" int yywrap() { return 1; }
 "!="                  { return TCNE; }
 "<="                  { return TCLE; }
 ">="                  { return TCGE; }
+"->"                  { return TARROW; }
 
 "("                   { return TLPAREN; }
 ")"                   { return TRPAREN; }
