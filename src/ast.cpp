@@ -1,3 +1,4 @@
+#include "logger.hpp"
 #include "ast.hpp"
 #include "codegen.hpp"
 #include <llvm/IR/Value.h>
@@ -60,7 +61,7 @@ static llvm::Value* convertType(llvm::Value* value, llvm::Type* targetType,
     }
     
     // Default: return unchanged if we can't convert
-    std::cerr << "Warning: Unable to convert between types" << std::endl;
+    LOG_WARNING("Unable to convert between types");
     return value;
 }
 
@@ -107,13 +108,12 @@ std::string TypeInfo::toString() const {
 
 llvm::Value* NumberExprAST::codeGen(CodeGenContext& context) {
     // Debug output
-    llvm::errs() << "Generating number: " << value 
-                 << (isInteger ? " (integer)" : " (double)") << "\n";
+    LOG_TRACE("Generating number: ", value, (isInteger ? " (integer)" : " (double)"));
     
     if (isInteger) {
         // Integer literal - ensure 64-bit
         auto intVal = static_cast<int64_t>(value);
-        llvm::errs() << "  Creating i64 constant: " << intVal << "\n";
+        LOG_TRACE("Creating i64 constant: ", intVal);
         
         // Create integer type and value
         auto* type = llvm::Type::getInt64Ty(context.getContext());
@@ -121,16 +121,16 @@ llvm::Value* NumberExprAST::codeGen(CodeGenContext& context) {
     }
     
     // Double literal (default)
-    llvm::errs() << "  Creating double constant: " << value << "\n";
+    LOG_TRACE("Creating double constant: ", value);
     return llvm::ConstantFP::get(context.getContext(), llvm::APFloat(value));
 }
 
 llvm::Value* VariableExprAST::codeGen(CodeGenContext& context) {
-    std::cout << "Creating variable reference: " << name << std::endl;
+    LOG_DEBUG("Creating variable reference: ", name);
     
     llvm::Value* value = context.getSymbolValue(name);
     if (!value) {
-        std::cerr << "Unknown variable name: " << name << std::endl;
+        LOG_ERROR("Unknown variable name: ", name);
         return nullptr;
     }
 
@@ -168,7 +168,7 @@ llvm::Value* UnaryExprAST::codeGen(CodeGenContext& context) {
         case OpNeg:
             return context.getBuilder().CreateFNeg(operandV, "negtmp");
         default:
-            std::cerr << "Invalid unary operator" << std::endl;
+            LOG_ERROR("Invalid unary operator");
             return nullptr;
     }
 }
@@ -264,24 +264,24 @@ llvm::Value* BinaryExprAST::codeGen(CodeGenContext& context) {
                 context.getBuilder().CreateICmpNE(lhs, rhs, "cmptmp") :
                 context.getBuilder().CreateFCmpUNE(lhs, rhs, "cmptmp");
         default:
-            std::cerr << "Invalid binary operator" << std::endl;
+            LOG_ERROR("Invalid binary operator");
             return nullptr;
     }
 }
 
 llvm::Value* AssignmentExprAST::codeGen(CodeGenContext& context) {
-    std::cout << "Generating assignment for " << lhs_->getName() << std::endl;
+    LOG_DEBUG("Generating assignment for ", lhs_->getName());
 
     llvm::Value* rhsValue = rhs_->codeGen(context);
     if (!rhsValue) {
-        std::cerr << "Error: Invalid right-hand side in assignment" << std::endl;
+        LOG_ERROR("Invalid right-hand side in assignment");
         return nullptr;
     }
 
     // Get the variable from the symbol table
     llvm::Value* variable = context.getSymbolValue(lhs_->getName());
     if (!variable) {
-        std::cerr << "Error: Undefined variable " << lhs_->getName() << std::endl;
+        LOG_ERROR("Undefined variable ", lhs_->getName());
         return nullptr;
     }
 
@@ -300,12 +300,12 @@ llvm::Value* AssignmentExprAST::codeGen(CodeGenContext& context) {
 llvm::Value* CallExprAST::codeGen(CodeGenContext& context) {
     llvm::Function* calleeF = context.getModule()->getFunction(callee);
     if (!calleeF) {
-        std::cerr << "Unknown function: " << callee << std::endl;
+        LOG_ERROR("Unknown function: ", callee);
         return nullptr;
     }
 
     if (calleeF->arg_size() != arguments.size()) {
-        std::cerr << "Incorrect number of arguments passed" << std::endl;
+        LOG_ERROR("Incorrect number of arguments passed");
         return nullptr;
     }
 
@@ -334,10 +334,10 @@ llvm::Value* CallExprAST::codeGen(CodeGenContext& context) {
 }
 
 llvm::Value* ExpressionStmtAST::codeGen(CodeGenContext& context) {
-    std::cout << "Generating expression statement..." << std::endl;
+    LOG_TRACE("Generating expression statement...");
     
     if (!expression) {
-        std::cerr << "Null expression" << std::endl;
+        LOG_ERROR("Null expression");
         return nullptr;
     }
 
@@ -348,12 +348,12 @@ llvm::Value* ExpressionStmtAST::codeGen(CodeGenContext& context) {
         dynamic_cast<SliceStoreExprAST*>(expression) ||
         dynamic_cast<CallExprAST*>(expression)  // Add this for void function calls
     )) {
-        std::cout << "Void expression completed successfully" << std::endl;
+        LOG_TRACE("Void expression completed successfully");
         return llvm::ConstantInt::get(context.getBuilder().getInt32Ty(), 0);
     }
     
     if (!exprVal) {
-        std::cerr << "Expression generation failed" << std::endl;
+        LOG_ERROR("Expression generation failed");
         return nullptr;
     }
     
@@ -361,7 +361,7 @@ llvm::Value* ExpressionStmtAST::codeGen(CodeGenContext& context) {
 }
 
 llvm::Value* BlockAST::codeGen(CodeGenContext& context) {
-    std::cout << "Generating block..." << std::endl;
+    LOG_TRACE("Generating block...");
     llvm::Value* last = nullptr;
     
     context.pushBlock();
@@ -382,7 +382,7 @@ llvm::Value* BlockAST::codeGen(CodeGenContext& context) {
 }
 
 llvm::Value* VariableDeclarationAST::codeGen(CodeGenContext& context) {
-    std::cout << "Generating variable declaration for " << name << std::endl;
+    LOG_DEBUG("Generating variable declaration for ", name);
     
     // Get initial value if it exists
     llvm::Value* initVal = nullptr;
@@ -411,7 +411,7 @@ llvm::Value* VariableDeclarationAST::codeGen(CodeGenContext& context) {
             // Basic static type
             varType = staticType->getLLVMType(context.getContext());
         }
-        std::cout << "Using static type: " << staticType->toString() << std::endl;
+        LOG_DEBUG("Using static type: ", staticType->toString());
     } else if (initVal && llvm::isa<llvm::ConstantInt>(initVal)) {
         // For integer literals, use i64
         varType = llvm::Type::getInt64Ty(context.getContext());
@@ -489,7 +489,7 @@ llvm::Value* FunctionAST::codeGen(CodeGenContext& context) {
     llvm::Type* returnType;
     if (hasStaticReturnType()) {
         returnType = this->returnType->getLLVMType(context.getContext());
-        std::cout << "Using static return type: " << this->returnType->toString() << std::endl;
+        LOG_DEBUG("Using static return type: ", this->returnType->toString());
     } else {
         // Default to double for dynamic typing
         returnType = llvm::Type::getDoubleTy(context.getContext());
@@ -680,7 +680,7 @@ llvm::Value* WhileAST::codeGen(CodeGenContext& context) {
 }
 
 llvm::Value* ReturnAST::codeGen(CodeGenContext& context) {
-    std::cout << "Generating return statement" << std::endl;
+    LOG_TRACE("Generating return statement");
     
     llvm::Value* returnValue = nullptr;
     if (expression) {
@@ -709,21 +709,21 @@ llvm::Value* SIMDTypeExprAST::codeGen(CodeGenContext& context) {
     auto& builder = context.getBuilder();
     unsigned width = isAVX ? 8 : 2;
     
-    std::cout << "\nParsing " << (isAVX ? "AVX" : "SSE") << " vector initialization:" << std::endl;
-    std::cout << "Number of elements provided: " << elements.size() << std::endl;
-    std::cout << "Values: ";
+    LOG_DEBUG("Parsing ", (isAVX ? "AVX" : "SSE"), " vector initialization:");
+    LOG_DEBUG("Number of elements provided: ", elements.size());
+    LOG_DEBUG("Values: ", [this]() -> std::string { std::ostringstream oss;
     
     // Print the actual values being parsed
     for (size_t i = 0; i < elements.size(); i++) {
         if (auto* num = dynamic_cast<NumberExprAST*>(elements[i])) {
-            std::cout << num->getValue();
-            if (i < elements.size() - 1) std::cout << ", ";
+            oss << num->getValue();
+            if (i < elements.size() - 1) oss << ", ";
         } else {
-            std::cout << "<non-constant>";
-            if (i < elements.size() - 1) std::cout << ", ";
+            oss << "<non-constant>";
+            if (i < elements.size() - 1) oss << ", ";
         }
     }
-    std::cout << std::endl;
+    return oss.str(); }());
     
     // Verify we have the right number of elements
     if (elements.size() != width) {
@@ -755,7 +755,7 @@ llvm::Value* SIMDTypeExprAST::codeGen(CodeGenContext& context) {
     // Create vector type with correct width
     llvm::VectorType* vecType = llvm::VectorType::get(doubleType, width, false);
     
-    //std::cout << "Creating " << width << "-wide vector with values: ";
+    //LOG_TRACE("Creating ", width << "-wide vector with values: ";
     for (size_t i = 0; i < constants.size(); i++) {
         if (auto constFP = llvm::dyn_cast<llvm::ConstantFP>(constants[i])) {
             std::cout << constFP->getValueAPF().convertToDouble();

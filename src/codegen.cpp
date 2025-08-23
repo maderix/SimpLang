@@ -1,3 +1,4 @@
+#include "logger.hpp"
 #include "codegen.hpp"
 #include "ast.hpp"
 #include <llvm/IR/Verifier.h>
@@ -532,7 +533,7 @@ void CodeGenContext::generateCode(BlockAST& root) {
 }
 
 void CodeGenContext::pushBlock(llvm::DIScope* debugScope) {
-    std::cout << "Pushing new block" << std::endl;
+    LOG_TRACE("Pushing new block");
     blocks.push_back(new CodeGenBlock(debugScope));
     if (debugScope) {
         currentDebugScope = debugScope;
@@ -540,7 +541,7 @@ void CodeGenContext::pushBlock(llvm::DIScope* debugScope) {
 }
 
 void CodeGenContext::popBlock() {
-    std::cout << "Popping block" << std::endl;
+    LOG_TRACE("Popping block");
     if (!blocks.empty()) {
         CodeGenBlock* top = blocks.back();
         blocks.pop_back();
@@ -561,7 +562,7 @@ void CodeGenContext::popBlock() {
 }
 
 void CodeGenContext::setSymbolValue(const std::string& name, llvm::Value* value) {
-        std::cout << "Setting symbol: " << name << std::endl;
+        LOG_TRACE("Setting symbol: ", name);
         blocks.back()->locals[name] = value;
 }
 
@@ -569,7 +570,7 @@ llvm::Value* CodeGenContext::getSymbolValue(const std::string& name) {
         for (auto it = blocks.rbegin(); it != blocks.rend(); ++it) {
             auto value = (*it)->locals.find(name);
             if (value != (*it)->locals.end()) {
-                std::cout << "Found symbol: " << name << std::endl;
+                LOG_TRACE("Found symbol: ", name);
                 return value->second;
             }
         }
