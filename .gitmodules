@@ -1,0 +1,3 @@
+[submodule "simpblas"]
+	path = simpblas
+	url = https://github.com/ByteInfer-Labs/simpblas.git
