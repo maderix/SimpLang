@@ -20,7 +20,7 @@ enum class TypeKind {
     U8, U16, U32, U64,   // Unsigned integers  
     Bool,       // Boolean
     Void,       // Function returns
-    Array       // Array/tensor types
+    Array       // Multi-dimensional array types
 };
 
 class TypeInfo {
@@ -36,6 +36,9 @@ public:
     }
     bool isFloat() const { 
         return kind == TypeKind::F32 || kind == TypeKind::F64; 
+    }
+    bool isArray() const {
+        return kind == TypeKind::Array;
     }
     bool isSigned() const {
         return kind >= TypeKind::I8 && kind <= TypeKind::I64;
@@ -372,6 +375,52 @@ public:
             throw std::runtime_error(msg);
         }
     }
+        
+    virtual llvm::Value* codeGen(CodeGenContext& context) override;
+};
+
+// ================== Array Operations ==================
+
+// Array creation: array<f32>([10, 20, 30])
+class ArrayCreateExprAST : public ExprAST {
+    std::unique_ptr<TypeInfo> elementType;
+    std::vector<std::unique_ptr<ExprAST>> dimensionExprs; // Runtime dimensions
+    
+public:
+    ArrayCreateExprAST(std::unique_ptr<TypeInfo> elemType, 
+                      std::vector<std::unique_ptr<ExprAST>> dimensions)
+        : elementType(std::move(elemType)), dimensionExprs(std::move(dimensions)) {}
+        
+    virtual llvm::Value* codeGen(CodeGenContext& context) override;
+    
+    TypeInfo* getElementType() const { return elementType.get(); }
+    size_t getDimensionCount() const { return dimensionExprs.size(); }
+};
+
+// Multi-dimensional array access: arr[i, j, k]
+class ArrayAccessExprAST : public ExprAST {
+    std::unique_ptr<ExprAST> array;
+    std::vector<std::unique_ptr<ExprAST>> indices;
+    
+public:
+    ArrayAccessExprAST(std::unique_ptr<ExprAST> arrayExpr,
+                      std::vector<std::unique_ptr<ExprAST>> idxExprs)
+        : array(std::move(arrayExpr)), indices(std::move(idxExprs)) {}
+        
+    virtual llvm::Value* codeGen(CodeGenContext& context) override;
+};
+
+// Array element assignment: arr[i, j, k] = value
+class ArrayStoreExprAST : public ExprAST {
+    std::unique_ptr<ExprAST> array;
+    std::vector<std::unique_ptr<ExprAST>> indices;
+    std::unique_ptr<ExprAST> value;
+    
+public:
+    ArrayStoreExprAST(std::unique_ptr<ExprAST> arrayExpr,
+                     std::vector<std::unique_ptr<ExprAST>> idxExprs,
+                     std::unique_ptr<ExprAST> val)
+        : array(std::move(arrayExpr)), indices(std::move(idxExprs)), value(std::move(val)) {}
         
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
 };

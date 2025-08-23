@@ -24,6 +24,7 @@ extern "C" int yywrap() { return 1; }
 "while"               { return TWHILE; }
 "var"                 { return TVAR; }
 "make"                { return TMAKE; }
+"array"               { return TARRAY; }
 
 "f32"                 { return TF32; }
 "f64"                 { return TF64; }

@@ -420,13 +420,26 @@ llvm::Value* VariableDeclarationAST::codeGen(CodeGenContext& context) {
         varType = context.getSliceType(sliceExpr->getType());
         if (!varType) return nullptr;
         varType = llvm::PointerType::get(varType, 0);
+    } else if (auto* arrayExpr = dynamic_cast<ArrayCreateExprAST*>(assignmentExpr)) {
+        // For array expressions, use pointer to element type
+        // The variable stores a pointer to the array data
+        llvm::Type* elemType = arrayExpr->getElementType()->getLLVMType(context.getContext());
+        varType = llvm::PointerType::get(elemType, 0);
+        LOG_DEBUG("Inferred array variable type: pointer to ", elemType->getTypeID());
+    } else if (initVal) {
+        // Infer type from initialization value
+        varType = initVal->getType();
+        LOG_DEBUG("Inferred variable type from init value: ", varType->getTypeID());
     } else {
         // Default to double
         varType = llvm::Type::getDoubleTy(context.getContext());
     }
     
-    // Create allocation
-    llvm::AllocaInst* alloc = context.getBuilder().CreateAlloca(
+    // Create allocation in entry block to prevent stack overflow in loops
+    llvm::Function* function = context.getBuilder().GetInsertBlock()->getParent();
+    llvm::IRBuilder<> entryBuilder(&function->getEntryBlock(), 
+                                   function->getEntryBlock().begin());
+    llvm::AllocaInst* alloc = entryBuilder.CreateAlloca(
         varType,
         nullptr,
         name.c_str()
@@ -858,108 +871,188 @@ llvm::Value* SliceExprAST::codeGen(CodeGenContext& context) {
 }
 
 llvm::Value* SliceStoreExprAST::codeGen(CodeGenContext& context) {
-    std::cout << "Generating slice store for " << slice_name_ << std::endl;
+    LOG_DEBUG("Generating slice/array store for ", slice_name_);
     
-    // Get the slice pointer
-    llvm::Value* slicePtrPtr = context.getSymbolValue(slice_name_);
-    if (!slicePtrPtr) {
-        std::cerr << "Unknown slice: " << slice_name_ << std::endl;
+    // Get the variable
+    llvm::Value* varPtr = context.getSymbolValue(slice_name_);
+    if (!varPtr) {
+        LOG_ERROR("Unknown variable: ", slice_name_);
         return nullptr;
     }
     
-    // Load the actual slice pointer
     auto& builder = context.getBuilder();
-    llvm::Value* slicePtr = builder.CreateLoad(
-        slicePtrPtr->getType()->getPointerElementType(),
-        slicePtrPtr,
-        slice_name_ + ".loaded"
-    );
+    llvm::Type* varType = varPtr->getType();
     
-    // Determine slice type (SSE or AVX)
-    llvm::Type* sliceType = slicePtr->getType()->getPointerElementType();
-    std::string typeName = sliceType->getStructName().str();
-    std::cout << "Slice type: " << typeName << std::endl;
-    bool isAVX = (typeName == "AVXSlice");
-    
-    std::cout << "Storing to " << typeName << " at " << slice_name_ 
-              << " (pointer: " << slicePtr << ")" << std::endl;
-    
-    // Generate index
-    llvm::Value* idx = index_->codeGen(context);
-    if (!idx) return nullptr;
-    
-    // Generate value
-    llvm::Value* value = value_->codeGen(context);
-    if (!value) return nullptr;
-    
-    // Verify vector type
-    auto vecType = llvm::dyn_cast<llvm::FixedVectorType>(value->getType());
-    if (!vecType) {
-        std::cerr << "Value is not a vector type" << std::endl;
-        return nullptr;
+    // Check if this is a simple array (direct pointer to elements) or a slice struct
+    if (varType->isPointerTy()) {
+        llvm::Type* pointeeType = varType->getPointerElementType();
+        
+        // If it points to a pointer to basic type (f32*, i32*, etc.), treat as array
+        if (pointeeType->isPointerTy()) {
+            llvm::Type* elemType = pointeeType->getPointerElementType();
+            if (elemType->isFloatTy() || elemType->isIntegerTy() || elemType->isDoubleTy()) {
+                LOG_DEBUG("Handling as array (pointer to ", elemType->isFloatTy() ? "float" : "int", ")");
+                
+                // Load the array data pointer from the variable
+                llvm::Value* arrayDataPtr = builder.CreateLoad(pointeeType, varPtr, "array_data_ptr");
+                
+                // Generate index
+                llvm::Value* idx = index_->codeGen(context);
+                if (!idx) {
+                    LOG_ERROR("Failed to generate array index");
+                    return nullptr;
+                }
+                
+                // Convert index to i64 if needed
+                if (idx->getType() != builder.getInt64Ty()) {
+                    idx = convertType(idx, builder.getInt64Ty(), context, "array_idx");
+                }
+                
+                // Generate value to store
+                llvm::Value* storeValue = value_->codeGen(context);
+                if (!storeValue) {
+                    LOG_ERROR("Failed to generate value for array store");
+                    return nullptr;
+                }
+                
+                // Convert value type if needed
+                if (storeValue->getType() != elemType) {
+                    storeValue = convertType(storeValue, elemType, context, "array_store_val");
+                }
+                
+                // Create GEP and store
+                llvm::Value* elementPtr = builder.CreateGEP(elemType, arrayDataPtr, idx, "array_elem_ptr");
+                builder.CreateStore(storeValue, elementPtr);
+                
+                LOG_DEBUG("Array element store completed");
+                return storeValue;
+            }
+        }
+        
+        // Otherwise, treat as slice struct - load the slice pointer
+        llvm::Value* slicePtr = builder.CreateLoad(pointeeType, varPtr, slice_name_ + ".loaded");
+        llvm::Type* sliceType = slicePtr->getType()->getPointerElementType();
+        std::string typeName = sliceType->getStructName().str();
+        LOG_DEBUG("Slice type: ", typeName);
+        bool isAVX = (typeName == "AVXSlice");
+        
+        LOG_DEBUG("Storing to ", typeName, " at ", slice_name_);
+        
+        // Generate index
+        llvm::Value* idx = index_->codeGen(context);
+        if (!idx) return nullptr;
+        
+        // Generate value
+        llvm::Value* value = value_->codeGen(context);
+        if (!value) return nullptr;
+        
+        // Verify vector type
+        auto vecType = llvm::dyn_cast<llvm::FixedVectorType>(value->getType());
+        if (!vecType) {
+            LOG_ERROR("Value is not a vector type");
+            return nullptr;
+        }
+        
+        unsigned width = vecType->getElementCount().getFixedValue();
+        unsigned expectedWidth = isAVX ? 8 : 2;
+        
+        if (width != expectedWidth) {
+            LOG_ERROR("Vector width mismatch. Got ", width, " but expected ", expectedWidth);
+            return nullptr;
+        }
+        
+        // Call appropriate set function
+        llvm::Function* setFunc = context.getModule()->getFunction(
+            isAVX ? "slice_set_avx" : "slice_set_sse"
+        );
+        
+        if (!setFunc) {
+            LOG_ERROR("Failed to find slice set function: ", (isAVX ? "slice_set_avx" : "slice_set_sse"));
+            return nullptr;
+        }
+        
+        LOG_DEBUG("Calling ", (isAVX ? "slice_set_avx" : "slice_set_sse"), " with slice pointer and vector width ", width);
+        
+        return builder.CreateCall(setFunc, {slicePtr, idx, value});
     }
     
-    unsigned width = vecType->getElementCount().getFixedValue();
-    unsigned expectedWidth = isAVX ? 8 : 2;
-    
-    if (width != expectedWidth) {
-        std::cerr << "Vector width mismatch. Got " << width 
-                  << " but expected " << expectedWidth << std::endl;
-        return nullptr;
-    }
-    
-    // Call appropriate set function
-    llvm::Function* setFunc = context.getModule()->getFunction(
-        isAVX ? "slice_set_avx" : "slice_set_sse"
-    );
-    
-    if (!setFunc) {
-        std::cerr << "Failed to find slice set function: " 
-                  << (isAVX ? "slice_set_avx" : "slice_set_sse") << std::endl;
-        return nullptr;
-    }
-    
-    std::cout << "Calling " << (isAVX ? "slice_set_avx" : "slice_set_sse") 
-              << " with slice pointer " << slicePtr 
-              << " and vector width " << width << std::endl;
-    
-    return builder.CreateCall(setFunc, {slicePtr, idx, value});
+    LOG_ERROR("Unknown variable type for slice/array store");
+    return nullptr;
 }
 
 llvm::Value* SliceAccessExprAST::codeGen(CodeGenContext& context) {
-    // Get the slice pointer
-    llvm::Value* slicePtrPtr = context.getSymbolValue(slice_name);
-    if (!slicePtrPtr) {
-        std::cerr << "Unknown slice: " << slice_name << std::endl;
+    LOG_DEBUG("Generating slice/array access for ", slice_name);
+    
+    // Get the variable
+    llvm::Value* varPtr = context.getSymbolValue(slice_name);
+    if (!varPtr) {
+        LOG_ERROR("Unknown variable: ", slice_name);
         return nullptr;
     }
     
-    // Load the slice struct
     auto& builder = context.getBuilder();
-    llvm::Value* slicePtr = builder.CreateLoad(
-        slicePtrPtr->getType()->getPointerElementType(),
-        slicePtrPtr
-    );
+    llvm::Type* varType = varPtr->getType();
     
-    // Generate index
-    llvm::Value* idx = index->codeGen(context);
-    if (!idx) return nullptr;
-    
-    // Determine if this is an AVX or SSE slice and call appropriate get function
-    llvm::Type* sliceType = slicePtr->getType()->getPointerElementType();
-    std::string typeName = sliceType->getStructName().str();
-    
-    llvm::Function* getFunc;
-    if (typeName == "SSESlice") {
-        getFunc = context.getModule()->getFunction("slice_get_sse");
-    } else if (typeName == "AVXSlice") {
-        getFunc = context.getModule()->getFunction("slice_get_avx");
-    } else {
-        std::cerr << "Unknown slice type: " << typeName << std::endl;
-        return nullptr;
+    // Check if this is a simple array (direct pointer to elements) or a slice struct
+    if (varType->isPointerTy()) {
+        llvm::Type* pointeeType = varType->getPointerElementType();
+        
+        // If it points to a pointer to basic type (f32*, i32*, etc.), treat as array
+        if (pointeeType->isPointerTy()) {
+            llvm::Type* elemType = pointeeType->getPointerElementType();
+            if (elemType->isFloatTy() || elemType->isIntegerTy() || elemType->isDoubleTy()) {
+                LOG_DEBUG("Handling as array access (pointer to ", elemType->isFloatTy() ? "float" : "int", ")");
+                
+                // Load the array data pointer from the variable
+                llvm::Value* arrayDataPtr = builder.CreateLoad(pointeeType, varPtr, "array_data_ptr");
+                
+                // Generate index
+                llvm::Value* idx = index->codeGen(context);
+                if (!idx) {
+                    LOG_ERROR("Failed to generate array index");
+                    return nullptr;
+                }
+                
+                // Convert index to i64 if needed
+                if (idx->getType() != builder.getInt64Ty()) {
+                    idx = convertType(idx, builder.getInt64Ty(), context, "array_access_idx");
+                }
+                
+                // Create GEP and load
+                llvm::Value* elementPtr = builder.CreateGEP(elemType, arrayDataPtr, idx, "array_elem_ptr");
+                llvm::Value* element = builder.CreateLoad(elemType, elementPtr, "array_element");
+                
+                LOG_DEBUG("Array element access completed");
+                return element;
+            }
+        }
+        
+        // Otherwise, treat as slice struct - load the slice pointer
+        llvm::Value* slicePtr = builder.CreateLoad(pointeeType, varPtr);
+        
+        // Generate index
+        llvm::Value* idx = index->codeGen(context);
+        if (!idx) return nullptr;
+        
+        // Determine if this is an AVX or SSE slice and call appropriate get function
+        llvm::Type* sliceType = slicePtr->getType()->getPointerElementType();
+        std::string typeName = sliceType->getStructName().str();
+        
+        llvm::Function* getFunc;
+        if (typeName == "SSESlice") {
+            getFunc = context.getModule()->getFunction("slice_get_sse");
+        } else if (typeName == "AVXSlice") {
+            getFunc = context.getModule()->getFunction("slice_get_avx");
+        } else {
+            LOG_ERROR("Unknown slice type: ", typeName);
+            return nullptr;
+        }
+        
+        return builder.CreateCall(getFunc, {slicePtr, idx});
     }
     
-    return builder.CreateCall(getFunc, {slicePtr, idx});
+    LOG_ERROR("Unknown variable type for slice/array access");
+    return nullptr;
 }
 
 llvm::Value* VectorCreationExprAST::codeGen(CodeGenContext& context) {
@@ -988,4 +1081,165 @@ llvm::Value* VectorCreationExprAST::codeGen(CodeGenContext& context) {
     }
     
     return result;
+}
+
+// ================== Array Operations Implementation ==================
+
+llvm::Value* ArrayCreateExprAST::codeGen(CodeGenContext& context) {
+    LOG_DEBUG("Creating array with element type: ", elementType->toString());
+    
+    // Get element type
+    llvm::Type* elemType = elementType->getLLVMType(context.getContext());
+    if (!elemType) {
+        LOG_ERROR("Invalid array element type");
+        return nullptr;
+    }
+    
+    // Calculate total size by multiplying all dimensions
+    llvm::Value* totalSize = llvm::ConstantInt::get(context.getBuilder().getInt64Ty(), 1);
+    
+    for (auto& dimExpr : dimensionExprs) {
+        llvm::Value* dim = dimExpr->codeGen(context);
+        if (!dim) {
+            LOG_ERROR("Failed to generate array dimension expression");
+            return nullptr;
+        }
+        // Convert dimension to i64 if needed
+        if (dim->getType() != context.getBuilder().getInt64Ty()) {
+            dim = convertType(dim, context.getBuilder().getInt64Ty(), context, "dim_conv");
+        }
+        totalSize = context.getBuilder().CreateMul(totalSize, dim, "array_size_mul");
+    }
+    
+    LOG_DEBUG("Array total size calculation generated");
+    
+    // Allocate memory for array data (aligned for SIMD operations)
+    llvm::Value* elementSize = llvm::ConstantInt::get(context.getBuilder().getInt64Ty(), 
+        context.getModule()->getDataLayout().getTypeAllocSize(elemType));
+    llvm::Value* totalBytes = context.getBuilder().CreateMul(totalSize, elementSize, "total_bytes");
+    
+    // Use malloc for memory allocation
+    llvm::Function* mallocFunc = context.getModule()->getFunction("malloc");
+    if (!mallocFunc) {
+        LOG_ERROR("malloc function not found");
+        return nullptr;
+    }
+    
+    llvm::Value* rawPtr = context.getBuilder().CreateCall(mallocFunc, {totalBytes}, "array_raw_ptr");
+    llvm::Value* typedPtr = context.getBuilder().CreateBitCast(rawPtr, 
+        llvm::PointerType::get(elemType, 0), "array_data_ptr");
+    
+    LOG_DEBUG("Array memory allocated successfully");
+    return typedPtr;
+}
+
+llvm::Value* ArrayAccessExprAST::codeGen(CodeGenContext& context) {
+    LOG_DEBUG("Generating array element access");
+    
+    // Generate array pointer
+    llvm::Value* arrayPtr = array->codeGen(context);
+    if (!arrayPtr) {
+        LOG_ERROR("Failed to generate array pointer");
+        return nullptr;
+    }
+    
+    // For now, do simple linear indexing (assumes row-major order)
+    // Real implementation would need to know the array dimensions
+    
+    if (indices.size() == 1) {
+        // Single dimension - straightforward
+        llvm::Value* index = indices[0]->codeGen(context);
+        if (!index) {
+            LOG_ERROR("Failed to generate array index");
+            return nullptr;
+        }
+        
+        // Convert to i64 if needed
+        if (index->getType() != context.getBuilder().getInt64Ty()) {
+            index = convertType(index, context.getBuilder().getInt64Ty(), context, "idx_conv");
+        }
+        
+        // Create GEP and load
+        llvm::Type* elemType = arrayPtr->getType()->getPointerElementType();
+        llvm::Value* elementPtr = context.getBuilder().CreateGEP(
+            elemType, arrayPtr, index, "element_ptr");
+        
+        llvm::Value* element = context.getBuilder().CreateLoad(
+            elemType, elementPtr, "array_element");
+        
+        LOG_DEBUG("Single-dimension array element access generated");
+        return element;
+    } else {
+        // Multi-dimensional - for now, just use first index
+        // Real implementation would need array metadata for proper indexing
+        LOG_DEBUG("Multi-dimensional array access (simplified to first index)");
+        llvm::Value* index = indices[0]->codeGen(context);
+        if (!index) {
+            LOG_ERROR("Failed to generate multi-dimensional array index");
+            return nullptr;
+        }
+        
+        if (index->getType() != context.getBuilder().getInt64Ty()) {
+            index = convertType(index, context.getBuilder().getInt64Ty(), context, "multi_idx_conv");
+        }
+        
+        llvm::Type* elemType = arrayPtr->getType()->getPointerElementType();
+        llvm::Value* elementPtr = context.getBuilder().CreateGEP(
+            elemType, arrayPtr, index, "multi_element_ptr");
+        
+        llvm::Value* element = context.getBuilder().CreateLoad(
+            elemType, elementPtr, "multi_array_element");
+        
+        return element;
+    }
+}
+
+llvm::Value* ArrayStoreExprAST::codeGen(CodeGenContext& context) {
+    LOG_DEBUG("Generating array element store");
+    
+    // Generate array pointer
+    llvm::Value* arrayPtr = array->codeGen(context);
+    if (!arrayPtr) {
+        LOG_ERROR("Failed to generate array pointer for store");
+        return nullptr;
+    }
+    
+    // Generate value to store
+    llvm::Value* storeValue = value->codeGen(context);
+    if (!storeValue) {
+        LOG_ERROR("Failed to generate value for array store");
+        return nullptr;
+    }
+    
+    // Generate index (simplified to first index for now)
+    llvm::Value* index;
+    if (indices.size() >= 1) {
+        index = indices[0]->codeGen(context);
+        if (!index) {
+            LOG_ERROR("Failed to generate array store index");
+            return nullptr;
+        }
+        if (index->getType() != context.getBuilder().getInt64Ty()) {
+            index = convertType(index, context.getBuilder().getInt64Ty(), context, "store_idx_conv");
+        }
+    } else {
+        LOG_ERROR("Array store requires at least one index");
+        return nullptr;
+    }
+    
+    // Create GEP and store
+    llvm::Type* elemType = arrayPtr->getType()->getPointerElementType();
+    llvm::Value* elementPtr = context.getBuilder().CreateGEP(
+        elemType, arrayPtr, index, "store_element_ptr");
+    
+    // Convert value type if needed
+    llvm::Type* targetType = elemType;
+    if (storeValue->getType() != targetType) {
+        storeValue = convertType(storeValue, targetType, context, "array_store_conv");
+    }
+    
+    context.getBuilder().CreateStore(storeValue, elementPtr);
+    
+    LOG_DEBUG("Array element store generated");
+    return storeValue; // Return stored value
 }

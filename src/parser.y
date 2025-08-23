@@ -56,7 +56,7 @@
 %token TSSE TAVX    /* Vector creation tokens */
 %token TLPAREN TRPAREN TLBRACE TRBRACE
 %token TCOMMA TSEMICOLON
-%token TMAKE TSSESLICE TAVXSLICE TLBRACKET TRBRACKET
+%token TMAKE TARRAY TSSESLICE TAVXSLICE TLBRACKET TRBRACKET
 %token UNARY_MINUS  /* Add this token for unary minus */
 %token TOK_MOD
 %token <string> IDENTIFIER
@@ -72,11 +72,12 @@
 %type <stmt> stmt func_decl if_stmt while_stmt return_stmt
 %type <expr> expr numeric slice_expr slice_access call_expr vector_expr  /* Add vector_expr here */
 %type <var_expr> ident
-%type <exprvec> call_args expr_list
+%type <exprvec> call_args expr_list multi_index
 %type <varvec> func_decl_args
 %type <var_decl> var_decl param_decl
 %type <slice_type> slice_type
 %type <type_info> type_spec array_type
+%type <expr> array_expr array_access
 
 %%
 
@@ -116,12 +117,21 @@ expr : expr '+' expr   { $$ = new BinaryExprAST(static_cast<BinaryOp>('+'), make
              makeUnique($3)
          ); 
      }
+     | ident TLBRACKET multi_index TRBRACKET '=' expr {
+         $$ = new ArrayStoreExprAST(
+             std::make_unique<VariableExprAST>($1->getName()),
+             makeUniqueVector(*$3),
+             makeUnique($6)
+         );
+     }
      | call_expr       { $$ = $1; }
      | slice_access    { $$ = $1; }
      | ident           { $$ = $1; }
      | numeric         { $$ = $1; }
      | slice_expr      { $$ = $1; }
      | vector_expr     { $$ = $1; }
+     | array_expr      { $$ = $1; }
+     | array_access    { $$ = $1; }
      ;
 
 vector_expr 
@@ -214,6 +224,26 @@ slice_expr : TMAKE TLPAREN slice_type TCOMMA expr TRPAREN
 
 slice_access : ident TLBRACKET expr TRBRACKET 
              { $$ = new SliceAccessExprAST($1->getName(), $3); }
+          ;
+
+array_expr : TARRAY '<' type_spec '>' TLPAREN TLBRACKET expr_list TRBRACKET TRPAREN {
+             $$ = new ArrayCreateExprAST(std::unique_ptr<TypeInfo>($3), makeUniqueVector(*$7));
+           }
+          ;
+
+array_access : ident TLBRACKET multi_index TRBRACKET {
+             $$ = new ArrayAccessExprAST(std::make_unique<VariableExprAST>($1->getName()), makeUniqueVector(*$3));
+           }
+          ;
+
+multi_index : expr { 
+            $$ = new std::vector<ExprAST*>(); 
+            $$->push_back($1); 
+          }
+          | multi_index TCOMMA expr { 
+            $1->push_back($3); 
+            $$ = $1; 
+          }
           ;
 
 call_expr : ident TLPAREN call_args TRPAREN { 
