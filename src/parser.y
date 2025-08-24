@@ -4,6 +4,7 @@
     #include <vector>
     #include <iostream>
     #include "ast.hpp"
+    #include "simd_backend.hpp"
 
     BlockAST *programBlock;
 
@@ -54,6 +55,7 @@
 %token TVAR TFUNC TIF TELSE TWHILE TRETURN TINCLUDE TIMPORT
 %token TF32 TF64 TI8 TI16 TI32 TI64 TU8 TU16 TU32 TU64 TBOOL TVOID
 %token TSSE TAVX    /* Vector creation tokens */
+%token TSIMD TAUTO TAVX512 TNEON TSVE
 %token TLPAREN TRPAREN TLBRACE TRBRACE
 %token TCOMMA TSEMICOLON
 %token TMAKE TARRAY TSSESLICE TAVXSLICE TLBRACKET TRBRACKET
@@ -78,6 +80,7 @@
 %type <slice_type> slice_type
 %type <type_info> type_spec array_type
 %type <expr> array_expr array_access
+%type <token> simd_option
 
 %%
 
@@ -230,7 +233,18 @@ slice_access : ident TLBRACKET expr TRBRACKET
 array_expr : TARRAY '<' type_spec '>' TLPAREN TLBRACKET expr_list TRBRACKET TRPAREN {
              $$ = new ArrayCreateExprAST(std::unique_ptr<TypeInfo>($3), makeUniqueVector(*$7));
            }
+           | TARRAY '<' type_spec TCOMMA TSIMD '=' simd_option '>' TLPAREN TLBRACKET expr_list TRBRACKET TRPAREN {
+             $$ = new SIMDArrayCreateExprAST(std::unique_ptr<TypeInfo>($3), (SIMDType)$7, makeUniqueVector(*$11));
+           }
           ;
+
+simd_option : TAUTO { $$ = (int)SIMDType::Auto; }
+           | TAVX { $$ = (int)SIMDType::AVX; }
+           | TAVX512 { $$ = (int)SIMDType::AVX512; }
+           | TSSE { $$ = (int)SIMDType::SSE; }
+           | TNEON { $$ = (int)SIMDType::NEON; }
+           | TSVE { $$ = (int)SIMDType::SVE; }
+           ;
 
 array_access : ident TLBRACKET multi_index TRBRACKET {
              $$ = new ArrayAccessExprAST(std::make_unique<VariableExprAST>($1->getName()), makeUniqueVector(*$3));

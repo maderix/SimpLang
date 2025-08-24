@@ -48,6 +48,12 @@ extern "C" int yywrap() { return 1; }
 "sse"                { return TSSE; }
 "avx"                { return TAVX; }
 
+"simd"               { return TSIMD; }
+"auto"               { return TAUTO; }
+"avx512"             { return TAVX512; }
+"neon"               { return TNEON; }
+"sve"                { return TSVE; }
+
 "slice_get_sse"      { SAVE_TOKEN; return TIDENTIFIER; }
 "slice_get_avx"      { SAVE_TOKEN; return TIDENTIFIER; }
 "slice_set_sse"      { SAVE_TOKEN; return TIDENTIFIER; }
