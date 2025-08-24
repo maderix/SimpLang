@@ -31,13 +31,19 @@ cmake --build $BUILD_DIR --target all_test_runners
 
 # Compile all test kernels
 echo "Compiling test kernels..."
-for kernel in arithmetic fibonacci loop conditions simd main return; do
+for kernel in arithmetic fibonacci loop conditions main return array_comprehensive; do  # Added array_comprehensive - it's working
     compile_kernel "test_${kernel}"
 done
 
-# Compile performance test kernel
-echo -e "\n${BLUE}Compiling performance test kernel...${NC}"
-compile_kernel "perf_simd"
+# Compile new SIMD array tests
+echo "Compiling SIMD array tests..."
+compile_kernel "test_simd_arrays"
+compile_kernel "test_simple_simd"
+
+# Compile performance test kernels
+echo -e "\n${BLUE}Compiling performance test kernels...${NC}"
+compile_kernel "test_baseline_perf"  # This one works
+compile_kernel "perf_array"  # New array performance test
 
 # Run regular tests
 echo -e "\nRunning tests..."

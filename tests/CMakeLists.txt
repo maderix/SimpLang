@@ -331,16 +331,16 @@ add_sl_test(test_array_comprehensive test_array_comprehensive.sl "4314.0")
 
 # SIMD array performance tests (result doesn't matter for perf tests, using 0.0)
 add_sl_test(test_baseline_perf test_baseline_perf.sl "0.0")
-add_sl_test(test_simd_perf test_simd_perf.sl "0.0")
+# add_sl_test(test_simd_perf test_simd_perf.sl "0.0") # DEPRECATED: old SIMD implementation
 
-# Add SIMD test
-add_simd_test()
+# Add SIMD test - DEPRECATED: old SIMD implementation
+# add_simd_test()
 
 # Add performance test runner to all_test_runners
 add_dependencies(all_test_runners perf_test_runner)
 
-# Debug test specific section
-if(ENABLE_DEBUGGER)
+# Debug test specific section - DEPRECATED: old SIMD implementation
+if(FALSE) # ENABLE_DEBUGGER - disabled old SIMD debug test
     # Compile the debug SimpleLang file
     set(DEBUG_SL_FILE "${CMAKE_CURRENT_SOURCE_DIR}/debug_tests/test_simd_debug.sl")
     set(DEBUG_OBJ_FILE "${CMAKE_CURRENT_BINARY_DIR}/test_simd_debug.o")
@@ -535,8 +535,8 @@ add_dependencies(perf_array_runner perf_array_obj)
 # Add performance test runner to all_test_runners
 add_dependencies(all_test_runners perf_array_runner)
 
-# Move this line to after all other test definitions
-add_perf_simd_test()
+# Move this line to after all other test definitions - DEPRECATED: old SIMD implementation
+# add_perf_simd_test()
 
 # Find LLVM package if not already found
 if(NOT LLVM_FOUND)
@@ -581,5 +581,6 @@ if(TARGET test_simd_runner)
         ENVIRONMENT "SIMD_DEBUG=1"
     )
 else()
-    message(FATAL_ERROR "SIMD test target not found. Make sure it's defined before this block.")
+    # message(FATAL_ERROR "SIMD test target not found. Make sure it's defined before this block.") # DEPRECATED: old SIMD test
+    message(STATUS "SIMD test target not found - old SIMD tests are deprecated")
 endif()

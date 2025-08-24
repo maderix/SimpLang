@@ -742,6 +742,27 @@ llvm::Value* ReturnAST::codeGen(CodeGenContext& context) {
     return returnValue;
 }
 
+llvm::Value* IncludeStmtAST::codeGen(CodeGenContext& context) {
+    LOG_TRACE("Processing include statement: ", filename);
+    
+    // Remove quotes from filename
+    std::string cleanFilename = filename;
+    if (cleanFilename.front() == '"' && cleanFilename.back() == '"') {
+        cleanFilename = cleanFilename.substr(1, cleanFilename.length() - 2);
+    }
+    
+    LOG_INFO("Including file: ", cleanFilename);
+    
+    // Use the context's include method
+    if (!context.includeFile(cleanFilename)) {
+        LOG_ERROR("Failed to include file: ", cleanFilename);
+        return nullptr;
+    }
+    
+    // Include statements don't generate values
+    return llvm::ConstantFP::get(context.getContext(), llvm::APFloat(0.0));
+}
+
 llvm::Value* SIMDTypeExprAST::codeGen(CodeGenContext& context) {
     auto& builder = context.getBuilder();
     unsigned width = isAVX ? 8 : 2;

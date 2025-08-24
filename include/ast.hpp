@@ -383,6 +383,14 @@ public:
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
 };
 
+class IncludeStmtAST : public StmtAST {
+    std::string filename;
+public:
+    IncludeStmtAST(const std::string& file) : filename(file) {}
+    const std::string& getFilename() const { return filename; }
+    virtual llvm::Value* codeGen(CodeGenContext& context) override;
+};
+
 class VectorCreationExprAST : public ExprAST {
     std::vector<std::unique_ptr<ExprAST>> elements_;
     bool isAVX_;

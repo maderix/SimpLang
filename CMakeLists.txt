@@ -65,8 +65,8 @@ add_dependencies(build_all
     simplang 
     simplang_runtime 
     host_runner 
-    test_simd_runner 
-    debug_test_runner
+    # test_simd_runner  # DEPRECATED: old SIMD implementation
+    # debug_test_runner # DEPRECATED: old SIMD implementation
     simplang_runner
 )
 

@@ -17,6 +17,7 @@
 #include "ast.hpp"
 #include "memory_tracker.hpp"
 #include <map>
+#include <set>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -84,6 +85,10 @@ private:
     std::map<std::string, llvm::Value*> globalDebugValues;
 
     bool integerContextFlag = false;
+
+    // Include file tracking
+    std::set<std::string> includedFiles;
+    std::vector<std::string> includeStack;
 
     llvm::Value* createSliceWithCap(SliceType type, llvm::Value* len, llvm::Value* cap);
 
@@ -163,6 +168,9 @@ public:
     void generateCode(BlockAST& root);
     void pushBlock(llvm::DIScope* debugScope = nullptr);
     void popBlock();
+    
+    // File inclusion
+    bool includeFile(const std::string& filename);
     
     // Symbol table management
     void setSymbolValue(const std::string& name, llvm::Value* value);
