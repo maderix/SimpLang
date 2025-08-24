@@ -12,6 +12,8 @@
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/Host.h>
 #include <llvm/IR/LegacyPassManager.h>
+#include <llvm/Transforms/Vectorize.h>
+#include <llvm/Analysis/TargetTransformInfo.h>
 #include <llvm/Target/TargetMachine.h>
 
 extern BlockAST* programBlock;
@@ -137,6 +139,19 @@ int main(int argc, char** argv) {
     context.getModule()->print(dest, nullptr);
     dest.flush();
     std::cout << "LLVM IR written to: " << llFile << std::endl;
+
+    // Run module-level optimization passes including vectorization
+    llvm::legacy::PassManager modulePM;
+    
+    // Add target transform info for vectorizer
+    modulePM.add(llvm::createTargetTransformInfoWrapperPass(context.getTargetMachine()->getTargetIRAnalysis()));
+    
+    // Add vectorization passes directly
+    modulePM.add(llvm::createLoopVectorizePass());        // Loop vectorizer
+    modulePM.add(llvm::createSLPVectorizerPass());        // SLP vectorizer
+    
+    // Run the optimization passes
+    modulePM.run(*context.getModule());
 
     // Generate object code
     llvm::legacy::PassManager pass;

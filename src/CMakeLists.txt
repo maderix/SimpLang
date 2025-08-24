@@ -14,6 +14,7 @@ add_executable(simplang
     codegen.cpp
     simd_ops.cpp
     simd_interface.cpp
+    avx512_backend.cpp
     logger.cpp
     
     ${BISON_Parser_OUTPUTS}
@@ -44,6 +45,7 @@ llvm_map_components_to_libnames(llvm_libs
     MC
     Object
     BitWriter
+    Vectorize
 )
 
 target_link_libraries(simplang ${llvm_libs} simplang_runtime)

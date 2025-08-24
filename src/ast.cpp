@@ -80,9 +80,9 @@ llvm::Type* TypeInfo::getLLVMType(llvm::LLVMContext& ctx) const {
         case TypeKind::U64:     return llvm::Type::getInt64Ty(ctx);  // LLVM treats as signed
         case TypeKind::Bool:    return llvm::Type::getInt1Ty(ctx);
         case TypeKind::Void:    return llvm::Type::getVoidTy(ctx);
-        case TypeKind::Dynamic: return llvm::Type::getDoubleTy(ctx); // Default to double
+        case TypeKind::Dynamic: return llvm::Type::getFloatTy(ctx); // Default to float for performance
         case TypeKind::Array:   return nullptr; // Handled by ArrayTypeInfo
-        default:                return llvm::Type::getDoubleTy(ctx);
+        default:                return llvm::Type::getFloatTy(ctx);
     }
 }
 
@@ -125,9 +125,9 @@ llvm::Value* NumberExprAST::codeGen(CodeGenContext& context) {
         }
     }
     
-    // Double literal (default)
-    LOG_TRACE("Creating double constant: ", value);
-    return llvm::ConstantFP::get(context.getContext(), llvm::APFloat(value));
+    // Float literal (for better vectorization performance)
+    LOG_TRACE("Creating float constant: ", value);
+    return llvm::ConstantFP::get(llvm::Type::getFloatTy(context.getContext()), static_cast<float>(value));
 }
 
 llvm::Value* VariableExprAST::codeGen(CodeGenContext& context) {
@@ -217,13 +217,13 @@ llvm::Value* BinaryExprAST::codeGen(CodeGenContext& context) {
     } else {
         // Both floating point - ensure same floating point type
         if (lhs->getType() != rhs->getType()) {
-            // Promote to double for mixed float operations
-            llvm::Type* doubleType = llvm::Type::getDoubleTy(context.getContext());
-            if (lhs->getType()->isFloatTy()) {
-                lhs = context.getBuilder().CreateFPExt(lhs, doubleType, "conv");
+            // Promote to float for mixed float operations (better for vectorization)
+            llvm::Type* floatType = llvm::Type::getFloatTy(context.getContext());
+            if (lhs->getType()->isDoubleTy()) {
+                lhs = context.getBuilder().CreateFPTrunc(lhs, floatType, "conv");
             }
-            if (rhs->getType()->isFloatTy()) {
-                rhs = context.getBuilder().CreateFPExt(rhs, doubleType, "conv");
+            if (rhs->getType()->isDoubleTy()) {
+                rhs = context.getBuilder().CreateFPTrunc(rhs, floatType, "conv");
             }
         }
     }
@@ -450,8 +450,8 @@ llvm::Value* VariableDeclarationAST::codeGen(CodeGenContext& context) {
         
         LOG_DEBUG("Inferred variable type from init value: ", varType->getTypeID());
     } else {
-        // Default to double
-        varType = llvm::Type::getDoubleTy(context.getContext());
+        // Default to float
+        varType = llvm::Type::getFloatTy(context.getContext());
     }
     
     // Create allocation in entry block to prevent stack overflow in loops
@@ -512,8 +512,8 @@ llvm::Value* FunctionAST::codeGen(CodeGenContext& context) {
                 argTypes.push_back(arg->getStaticType()->getLLVMType(context.getContext()));
             }
         } else {
-            // Default to double for dynamic typing
-            argTypes.push_back(llvm::Type::getDoubleTy(context.getContext()));
+            // Default to float for dynamic typing
+            argTypes.push_back(llvm::Type::getFloatTy(context.getContext()));
         }
     }
     
@@ -523,8 +523,8 @@ llvm::Value* FunctionAST::codeGen(CodeGenContext& context) {
         returnType = this->returnType->getLLVMType(context.getContext());
         LOG_DEBUG("Using static return type: ", this->returnType->toString());
     } else {
-        // Default to double for dynamic typing
-        returnType = llvm::Type::getDoubleTy(context.getContext());
+        // Default to float for dynamic typing
+        returnType = llvm::Type::getFloatTy(context.getContext());
     }
     
     // Create function type
@@ -771,7 +771,7 @@ llvm::Value* SIMDTypeExprAST::codeGen(CodeGenContext& context) {
     
     // Convert expressions to constants
     std::vector<llvm::Constant*> constants;
-    llvm::Type* doubleType = llvm::Type::getDoubleTy(context.getContext());
+    llvm::Type* floatType = llvm::Type::getFloatTy(context.getContext());
     
     for (auto& expr : elements) {
         llvm::Value* val = expr->codeGen(context);
@@ -781,8 +781,8 @@ llvm::Value* SIMDTypeExprAST::codeGen(CodeGenContext& context) {
         if (auto constFP = llvm::dyn_cast<llvm::ConstantFP>(val)) {
             constants.push_back(constFP);
         } else if (auto constInt = llvm::dyn_cast<llvm::ConstantInt>(val)) {
-            constants.push_back(llvm::ConstantFP::get(doubleType, 
-                static_cast<double>(constInt->getSExtValue())));
+            constants.push_back(llvm::ConstantFP::get(floatType, 
+                static_cast<float>(constInt->getSExtValue())));
         } else {
             std::cerr << "Non-constant value in vector initialization" << std::endl;
             return nullptr;
@@ -790,7 +790,7 @@ llvm::Value* SIMDTypeExprAST::codeGen(CodeGenContext& context) {
     }
     
     // Create vector type with correct width
-    llvm::VectorType* vecType = llvm::VectorType::get(doubleType, width, false);
+    llvm::VectorType* vecType = llvm::VectorType::get(floatType, width, false);
     
     //LOG_TRACE("Creating ", width << "-wide vector with values: ";
     for (size_t i = 0; i < constants.size(); i++) {
@@ -1133,7 +1133,46 @@ llvm::Value* VectorCreationExprAST::codeGen(CodeGenContext& context) {
 llvm::Value* ArrayCreateExprAST::codeGen(CodeGenContext& context) {
     LOG_DEBUG("Creating array with element type: ", elementType->toString());
     
-    // Get element type
+    // Check if this is a SIMD array
+    auto* arrayTypeInfo = dynamic_cast<ArrayTypeInfo*>(elementType.get());
+    if (arrayTypeInfo && arrayTypeInfo->vectorizable) {
+        LOG_DEBUG("Creating SIMD array with hint: ", static_cast<int>(arrayTypeInfo->simdHint));
+        
+        // Get the SIMD backend
+        auto* backend = context.getSIMDBackend(arrayTypeInfo->simdHint);
+        if (!backend) {
+            LOG_ERROR("SIMD backend not available for requested type");
+            // Fall back to regular array
+        } else {
+            // Use SIMD backend to create aligned array
+            llvm::Type* elemType = arrayTypeInfo->elementType->getLLVMType(context.getContext());
+            if (!elemType) {
+                LOG_ERROR("Invalid SIMD array element type");
+                return nullptr;
+            }
+            
+            // Calculate total size
+            llvm::Value* totalSize = llvm::ConstantInt::get(context.getBuilder().getInt64Ty(), 1);
+            for (auto& dimExpr : dimensionExprs) {
+                llvm::Value* dim = dimExpr->codeGen(context);
+                if (!dim) {
+                    LOG_ERROR("Failed to generate array dimension expression");
+                    return nullptr;
+                }
+                if (dim->getType() != context.getBuilder().getInt64Ty()) {
+                    dim = convertType(dim, context.getBuilder().getInt64Ty(), context, "dim_conv");
+                }
+                totalSize = context.getBuilder().CreateMul(totalSize, dim, "simd_array_size");
+            }
+            
+            // Use SIMD backend for aligned allocation
+            llvm::Value* simdArrayPtr = backend->createAlignedAlloc(context.getBuilder(), elemType, totalSize);
+            LOG_DEBUG("SIMD array created with alignment: ", backend->getAlignment());
+            return simdArrayPtr;
+        }
+    }
+    
+    // Regular array creation (fallback or non-SIMD)
     llvm::Type* elemType = elementType->getLLVMType(context.getContext());
     if (!elemType) {
         LOG_ERROR("Invalid array element type");
@@ -1176,6 +1215,43 @@ llvm::Value* ArrayCreateExprAST::codeGen(CodeGenContext& context) {
     
     LOG_DEBUG("Array memory allocated successfully");
     return typedPtr;
+}
+
+llvm::Value* SIMDArrayCreateExprAST::codeGen(CodeGenContext& context) {
+    LOG_DEBUG("Creating SIMD array with hint: ", static_cast<int>(simdHint));
+    
+    // Get the SIMD backend
+    auto* backend = context.getSIMDBackend(simdHint);
+    if (!backend) {
+        LOG_ERROR("SIMD backend not available for requested type");
+        return nullptr;
+    }
+    
+    // Get element type
+    llvm::Type* elemType = elementType->getLLVMType(context.getContext());
+    if (!elemType) {
+        LOG_ERROR("Invalid SIMD array element type");
+        return nullptr;
+    }
+    
+    // Calculate total size
+    llvm::Value* totalSize = llvm::ConstantInt::get(context.getBuilder().getInt64Ty(), 1);
+    for (auto& dimExpr : dimensionExprs) {
+        llvm::Value* dim = dimExpr->codeGen(context);
+        if (!dim) {
+            LOG_ERROR("Failed to generate SIMD array dimension expression");
+            return nullptr;
+        }
+        if (dim->getType() != context.getBuilder().getInt64Ty()) {
+            dim = convertType(dim, context.getBuilder().getInt64Ty(), context, "dim_conv");
+        }
+        totalSize = context.getBuilder().CreateMul(totalSize, dim, "simd_array_size");
+    }
+    
+    // Use SIMD backend for aligned allocation
+    llvm::Value* simdArrayPtr = backend->createAlignedAlloc(context.getBuilder(), elemType, totalSize);
+    LOG_DEBUG("SIMD array created with alignment: ", backend->getAlignment());
+    return simdArrayPtr;
 }
 
 llvm::Value* ArrayAccessExprAST::codeGen(CodeGenContext& context) {
@@ -1237,6 +1313,34 @@ llvm::Value* ArrayAccessExprAST::codeGen(CodeGenContext& context) {
         
         return element;
     }
+}
+
+bool ArrayAccessExprAST::hasVectorSlice() const {
+    for (const auto& index : indices) {
+        if (dynamic_cast<const VectorSliceExprAST*>(index.get())) {
+            return true;
+        }
+    }
+    return false;
+}
+
+llvm::Value* VectorSliceExprAST::codeGen(CodeGenContext& context) {
+    // This should not be called directly - handled by ArrayAccessExprAST
+    LOG_ERROR("VectorSliceExprAST::codeGen called directly");
+    return nullptr;
+}
+
+int VectorSliceExprAST::getSliceWidth(CodeGenContext& context) const {
+    // Try to evaluate start and end as constants
+    auto* startConst = dynamic_cast<const NumberExprAST*>(start.get());
+    auto* endConst = dynamic_cast<const NumberExprAST*>(end.get());
+    
+    if (startConst && endConst) {
+        return static_cast<int>(endConst->getValue()) - static_cast<int>(startConst->getValue());
+    }
+    
+    // Default to AVX-512 width for f32 (16 elements)
+    return 16;
 }
 
 llvm::Value* ArrayStoreExprAST::codeGen(CodeGenContext& context) {

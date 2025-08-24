@@ -68,6 +68,9 @@ CodeGenContext::CodeGenContext() : builder(context) {
     fpm->add(llvm::createCFGSimplificationPass());            // simplifycfg - control flow cleanup
     
     fpm->doInitialization();
+    
+    // Initialize SIMD backends
+    initializeSIMDBackends();
 }
 
 CodeGenContext::~CodeGenContext() {
@@ -843,4 +846,31 @@ void CodeGenContext::emitSliceSet(llvm::Value* slice, llvm::Value* index, llvm::
     else {
         emitError("Unsupported vector width for slice set operation");
     }
+}
+
+void CodeGenContext::initializeSIMDBackends() {
+    // Initialize available SIMD backends
+    auto avx512Backend = SIMDBackendFactory::createBackend(SIMDType::AVX512);
+    if (avx512Backend && avx512Backend->supportsTarget()) {
+        activeSIMDBackend = avx512Backend.get();
+        simdBackends[SIMDType::AVX512] = std::move(avx512Backend);
+        LOG_INFO("AVX-512 backend initialized");
+    }
+}
+
+SIMDBackend* CodeGenContext::getSIMDBackend(SIMDType hint) {
+    if (hint == SIMDType::Auto && activeSIMDBackend) {
+        return activeSIMDBackend;
+    }
+    
+    auto it = simdBackends.find(hint);
+    if (it != simdBackends.end()) {
+        return it->second.get();
+    }
+    
+    return nullptr;
+}
+
+bool CodeGenContext::hasSIMDBackend(SIMDType type) const {
+    return simdBackends.find(type) != simdBackends.end();
 }

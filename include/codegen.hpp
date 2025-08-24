@@ -3,6 +3,7 @@
 
 #include "slice_type.hpp"
 #include "simd_interface.hpp"
+#include "simd_backend.hpp"
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
@@ -49,6 +50,10 @@ private:
     void initializeMallocFree();
     void initializeSIMDFunctions();
     std::unique_ptr<SIMDInterface> simdInterface;
+    
+    // SIMD Backend support
+    std::map<SIMDType, std::unique_ptr<SIMDBackend>> simdBackends;
+    SIMDBackend* activeSIMDBackend = nullptr;
 
     // Cache for commonly used types
     llvm::StructType* sseSliceType;
@@ -89,6 +94,11 @@ public:
     // SIMD control methods
     void enableSIMD() { simd_enabled = true; }
     bool isSIMDEnabled() const { return simd_enabled; }
+    
+    // SIMD Backend methods
+    SIMDBackend* getSIMDBackend(SIMDType hint = SIMDType::Auto);
+    void initializeSIMDBackends();
+    bool hasSIMDBackend(SIMDType type) const;
 
     // Debug info methods
     void initializeDebugInfo(const std::string& filename);

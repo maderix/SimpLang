@@ -329,6 +329,10 @@ add_sl_test(test_fibonacci test_fibonacci.sl "110.0")
 add_sl_test(test_return test_return.sl "85.0")
 add_sl_test(test_array_comprehensive test_array_comprehensive.sl "4314.0")
 
+# SIMD array performance tests (result doesn't matter for perf tests, using 0.0)
+add_sl_test(test_baseline_perf test_baseline_perf.sl "0.0")
+add_sl_test(test_simd_perf test_simd_perf.sl "0.0")
+
 # Add SIMD test
 add_simd_test()
 

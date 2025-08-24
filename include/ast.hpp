@@ -9,6 +9,7 @@
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Module.h>
 #include "slice_type.hpp"
+#include "simd_backend.hpp"
 
 class CodeGenContext;
 
@@ -57,8 +58,32 @@ public:
     int size; // -1 for dynamic size
     std::vector<int> dimensions; // For multi-dim arrays
     
-    ArrayTypeInfo(std::unique_ptr<TypeInfo> elemType, int sz = -1) 
-        : TypeInfo(TypeKind::Array), elementType(std::move(elemType)), size(sz) {}
+    // SIMD Extensions
+    SIMDType simdHint;
+    int alignment;        // 16=SSE, 32=AVX, 64=AVX512
+    bool vectorizable;    // Can use vector operations
+    
+    ArrayTypeInfo(std::unique_ptr<TypeInfo> elemType, int sz = -1, SIMDType simd = SIMDType::None) 
+        : TypeInfo(TypeKind::Array), 
+          elementType(std::move(elemType)), 
+          size(sz),
+          simdHint(simd) {
+        
+        vectorizable = (simd != SIMDType::None) && 
+                      (elementType->isFloat() || elementType->isInteger());
+        alignment = getSIMDAlignment(simd);
+    }
+    
+private:
+    int getSIMDAlignment(SIMDType simd) const {
+        switch (simd) {
+            case SIMDType::AVX512: return 64;
+            case SIMDType::AVX:    return 32;
+            case SIMDType::SSE:    return 16;
+            case SIMDType::NEON:   return 16;
+            default:               return 8;  // Regular alignment
+        }
+    }
 };
 
 enum UnaryOp {
@@ -397,6 +422,24 @@ public:
     size_t getDimensionCount() const { return dimensionExprs.size(); }
 };
 
+class SIMDArrayCreateExprAST : public ExprAST {
+    std::unique_ptr<TypeInfo> elementType;
+    SIMDType simdHint;
+    std::vector<std::unique_ptr<ExprAST>> dimensionExprs;
+    
+public:
+    SIMDArrayCreateExprAST(std::unique_ptr<TypeInfo> elemType, 
+                          SIMDType simd,
+                          std::vector<std::unique_ptr<ExprAST>> dimensions)
+        : elementType(std::move(elemType)), simdHint(simd), dimensionExprs(std::move(dimensions)) {}
+        
+    virtual llvm::Value* codeGen(CodeGenContext& context) override;
+    
+    TypeInfo* getElementType() const { return elementType.get(); }
+    SIMDType getSIMDHint() const { return simdHint; }
+    size_t getDimensionCount() const { return dimensionExprs.size(); }
+};
+
 // Multi-dimensional array access: arr[i, j, k]
 class ArrayAccessExprAST : public ExprAST {
     std::unique_ptr<ExprAST> array;
@@ -408,6 +451,23 @@ public:
         : array(std::move(arrayExpr)), indices(std::move(idxExprs)) {}
         
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
+    
+    bool hasVectorSlice() const;
+};
+
+class VectorSliceExprAST : public ExprAST {
+    std::unique_ptr<ExprAST> start;
+    std::unique_ptr<ExprAST> end;
+    
+public:
+    VectorSliceExprAST(std::unique_ptr<ExprAST> startExpr, std::unique_ptr<ExprAST> endExpr)
+        : start(std::move(startExpr)), end(std::move(endExpr)) {}
+        
+    virtual llvm::Value* codeGen(CodeGenContext& context) override;
+    
+    ExprAST* getStart() const { return start.get(); }
+    ExprAST* getEnd() const { return end.get(); }
+    int getSliceWidth(CodeGenContext& context) const;
 };
 
 // Array element assignment: arr[i, j, k] = value
