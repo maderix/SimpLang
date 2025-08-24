@@ -327,6 +327,11 @@ add_sl_test(test_main test_main.sl "30.0")
 add_sl_test(test_loop test_loop.sl "135.0")
 add_sl_test(test_fibonacci test_fibonacci.sl "110.0")
 add_sl_test(test_return test_return.sl "85.0")
+add_sl_test(test_array_comprehensive test_array_comprehensive.sl "4314.0")
+
+# SIMD array performance tests (result doesn't matter for perf tests, using 0.0)
+add_sl_test(test_baseline_perf test_baseline_perf.sl "0.0")
+add_sl_test(test_simd_perf test_simd_perf.sl "0.0")
 
 # Add SIMD test
 add_simd_test()
@@ -472,6 +477,63 @@ target_compile_options(perf_test_runner
 )
 
 add_dependencies(perf_test_runner perf_test_obj)
+
+# Compile array performance test kernel
+set(PERF_ARRAY_OBJ_FILE "${CMAKE_BINARY_DIR}/tests/obj/perf_array.o")
+add_custom_command(
+    OUTPUT ${PERF_ARRAY_OBJ_FILE}
+    COMMAND ${CMAKE_BINARY_DIR}/src/simplang 
+            ${CMAKE_CURRENT_SOURCE_DIR}/perf_array.sl
+            -o ${PERF_ARRAY_OBJ_FILE}
+            -v
+    DEPENDS simplang ${CMAKE_CURRENT_SOURCE_DIR}/perf_array.sl
+    COMMENT "Compiling array performance test kernel"
+    VERBATIM
+)
+
+# Create shared library for array perf test
+set(PERF_ARRAY_SO_FILE "${CMAKE_BINARY_DIR}/tests/obj/perf_array.so")
+add_custom_command(
+    OUTPUT ${PERF_ARRAY_SO_FILE}
+    COMMAND ${CMAKE_C_COMPILER} -shared ${PERF_ARRAY_OBJ_FILE} -o ${PERF_ARRAY_SO_FILE}
+            -Wl,--version-script=${CMAKE_BINARY_DIR}/tests/kernel.version
+            -Wl,--export-dynamic-symbol=kernel_main
+    DEPENDS ${PERF_ARRAY_OBJ_FILE} ${CMAKE_BINARY_DIR}/tests/kernel.version
+    COMMENT "Creating shared library for array performance test"
+    VERBATIM
+)
+
+add_custom_target(perf_array_obj DEPENDS ${PERF_ARRAY_SO_FILE})
+
+# Add array performance test executable
+add_executable(perf_array_runner 
+    ${CMAKE_CURRENT_SOURCE_DIR}/perf_array_host.cpp
+)
+
+target_link_libraries(perf_array_runner
+    PRIVATE 
+        simplang_runtime
+        ${CMAKE_DL_LIBS}
+        ${READLINE_LIBRARIES}
+)
+
+target_include_directories(perf_array_runner
+    PRIVATE 
+        ${CMAKE_SOURCE_DIR}/runtime/include
+        ${CMAKE_SOURCE_DIR}/include
+        ${READLINE_INCLUDE_DIRS}
+)
+
+target_compile_options(perf_array_runner
+    PRIVATE 
+        -O3  # Use optimization for fair comparison
+        -g
+)
+
+add_dependencies(perf_array_runner perf_array_obj)
+
+# Add performance test runner to all_test_runners
+add_dependencies(all_test_runners perf_array_runner)
 
 # Move this line to after all other test definitions
 add_perf_simd_test()

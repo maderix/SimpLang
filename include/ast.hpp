@@ -9,8 +9,82 @@
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Module.h>
 #include "slice_type.hpp"
+#include "simd_backend.hpp"
 
 class CodeGenContext;
+
+// Type system for static typing
+enum class TypeKind {
+    Dynamic,    // Current 'var' behavior
+    F32, F64,   // Floating point
+    I8, I16, I32, I64,   // Signed integers
+    U8, U16, U32, U64,   // Unsigned integers  
+    Bool,       // Boolean
+    Void,       // Function returns
+    Array       // Multi-dimensional array types
+};
+
+class TypeInfo {
+public:
+    TypeKind kind;
+    
+    TypeInfo(TypeKind k) : kind(k) {}
+    virtual ~TypeInfo() = default;
+    
+    bool isStaticallyTyped() const { return kind != TypeKind::Dynamic; }
+    bool isInteger() const { 
+        return kind >= TypeKind::I8 && kind <= TypeKind::U64; 
+    }
+    bool isFloat() const { 
+        return kind == TypeKind::F32 || kind == TypeKind::F64; 
+    }
+    bool isArray() const {
+        return kind == TypeKind::Array;
+    }
+    bool isSigned() const {
+        return kind >= TypeKind::I8 && kind <= TypeKind::I64;
+    }
+    bool isUnsigned() const {
+        return kind >= TypeKind::U8 && kind <= TypeKind::U64;
+    }
+    
+    llvm::Type* getLLVMType(llvm::LLVMContext& ctx) const;
+    std::string toString() const;
+};
+
+class ArrayTypeInfo : public TypeInfo {
+public:
+    std::unique_ptr<TypeInfo> elementType;
+    int size; // -1 for dynamic size
+    std::vector<int> dimensions; // For multi-dim arrays
+    
+    // SIMD Extensions
+    SIMDType simdHint;
+    int alignment;        // 16=SSE, 32=AVX, 64=AVX512
+    bool vectorizable;    // Can use vector operations
+    
+    ArrayTypeInfo(std::unique_ptr<TypeInfo> elemType, int sz = -1, SIMDType simd = SIMDType::None) 
+        : TypeInfo(TypeKind::Array), 
+          elementType(std::move(elemType)), 
+          size(sz),
+          simdHint(simd) {
+        
+        vectorizable = (simd != SIMDType::None) && 
+                      (elementType->isFloat() || elementType->isInteger());
+        alignment = getSIMDAlignment(simd);
+    }
+    
+private:
+    int getSIMDAlignment(SIMDType simd) const {
+        switch (simd) {
+            case SIMDType::AVX512: return 64;
+            case SIMDType::AVX:    return 32;
+            case SIMDType::SSE:    return 16;
+            case SIMDType::NEON:   return 16;
+            default:               return 8;  // Regular alignment
+        }
+    }
+};
 
 enum UnaryOp {
     OpNeg = '-'  // Unary minus
@@ -189,19 +263,32 @@ class VariableDeclarationAST : public StmtAST {
     std::string name;
     ExprAST* assignmentExpr;
     SliceTypeAST* sliceType;
+    std::unique_ptr<TypeInfo> staticType;  // NEW: Optional static type
     unsigned lineNo;
     bool isGlobal;
     std::string typeName;  // For debug info
 
 public:
+    // Constructor for static typing
     VariableDeclarationAST(const std::string& name, 
                           ExprAST* expr = nullptr,
+                          std::unique_ptr<TypeInfo> type = nullptr,
                           SliceTypeAST* slice = nullptr,
                           unsigned line = 0,
-                          bool global = false,
-                          const std::string& type = "double")
+                          bool global = false)
         : name(name), assignmentExpr(expr), sliceType(slice), 
-          lineNo(line), isGlobal(global), typeName(type) {}
+          staticType(std::move(type)), lineNo(line), isGlobal(global), 
+          typeName(staticType ? staticType->toString() : "double") {}
+
+    // Legacy constructor for backward compatibility  
+    VariableDeclarationAST(const std::string& name, 
+                          ExprAST* expr,
+                          SliceTypeAST* slice,
+                          unsigned line,
+                          bool global,
+                          const std::string& type)
+        : name(name), assignmentExpr(expr), sliceType(slice), 
+          staticType(nullptr), lineNo(line), isGlobal(global), typeName(type) {}
           
     virtual ~VariableDeclarationAST() {
         delete assignmentExpr;
@@ -217,6 +304,11 @@ public:
     bool isGlobalVariable() const { return isGlobal; }
     const std::string& getTypeName() const { return typeName; }
     ExprAST* getAssignmentExpr() const { return assignmentExpr; }
+    
+    // New methods for static typing
+    bool isStaticallyTyped() const { return staticType && staticType->isStaticallyTyped(); }
+    TypeKind getTypeKind() const { return staticType ? staticType->kind : TypeKind::Dynamic; }
+    const TypeInfo* getStaticType() const { return staticType.get(); }
     
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
 };
@@ -242,11 +334,18 @@ class FunctionAST : public StmtAST {
     std::string name;
     std::vector<VariableDeclarationAST*> arguments;
     BlockAST* body;
+    std::unique_ptr<TypeInfo> returnType;  // NEW: Optional static return type
 public:
     FunctionAST(const std::string& name,
                 std::vector<VariableDeclarationAST*>* arguments,
-                BlockAST* body)
-        : name(name), arguments(*arguments), body(body) {}
+                BlockAST* body,
+                std::unique_ptr<TypeInfo> retType = nullptr)
+        : name(name), arguments(*arguments), body(body), returnType(std::move(retType)) {}
+    
+    bool hasStaticReturnType() const { return returnType && returnType->isStaticallyTyped(); }
+    TypeKind getReturnTypeKind() const { return returnType ? returnType->kind : TypeKind::Dynamic; }
+    const TypeInfo* getReturnType() const { return returnType.get(); }
+    
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
 };
 
@@ -301,6 +400,87 @@ public:
             throw std::runtime_error(msg);
         }
     }
+        
+    virtual llvm::Value* codeGen(CodeGenContext& context) override;
+};
+
+// ================== Array Operations ==================
+
+// Array creation: array<f32>([10, 20, 30])
+class ArrayCreateExprAST : public ExprAST {
+    std::unique_ptr<TypeInfo> elementType;
+    std::vector<std::unique_ptr<ExprAST>> dimensionExprs; // Runtime dimensions
+    
+public:
+    ArrayCreateExprAST(std::unique_ptr<TypeInfo> elemType, 
+                      std::vector<std::unique_ptr<ExprAST>> dimensions)
+        : elementType(std::move(elemType)), dimensionExprs(std::move(dimensions)) {}
+        
+    virtual llvm::Value* codeGen(CodeGenContext& context) override;
+    
+    TypeInfo* getElementType() const { return elementType.get(); }
+    size_t getDimensionCount() const { return dimensionExprs.size(); }
+};
+
+class SIMDArrayCreateExprAST : public ExprAST {
+    std::unique_ptr<TypeInfo> elementType;
+    SIMDType simdHint;
+    std::vector<std::unique_ptr<ExprAST>> dimensionExprs;
+    
+public:
+    SIMDArrayCreateExprAST(std::unique_ptr<TypeInfo> elemType, 
+                          SIMDType simd,
+                          std::vector<std::unique_ptr<ExprAST>> dimensions)
+        : elementType(std::move(elemType)), simdHint(simd), dimensionExprs(std::move(dimensions)) {}
+        
+    virtual llvm::Value* codeGen(CodeGenContext& context) override;
+    
+    TypeInfo* getElementType() const { return elementType.get(); }
+    SIMDType getSIMDHint() const { return simdHint; }
+    size_t getDimensionCount() const { return dimensionExprs.size(); }
+};
+
+// Multi-dimensional array access: arr[i, j, k]
+class ArrayAccessExprAST : public ExprAST {
+    std::unique_ptr<ExprAST> array;
+    std::vector<std::unique_ptr<ExprAST>> indices;
+    
+public:
+    ArrayAccessExprAST(std::unique_ptr<ExprAST> arrayExpr,
+                      std::vector<std::unique_ptr<ExprAST>> idxExprs)
+        : array(std::move(arrayExpr)), indices(std::move(idxExprs)) {}
+        
+    virtual llvm::Value* codeGen(CodeGenContext& context) override;
+    
+    bool hasVectorSlice() const;
+};
+
+class VectorSliceExprAST : public ExprAST {
+    std::unique_ptr<ExprAST> start;
+    std::unique_ptr<ExprAST> end;
+    
+public:
+    VectorSliceExprAST(std::unique_ptr<ExprAST> startExpr, std::unique_ptr<ExprAST> endExpr)
+        : start(std::move(startExpr)), end(std::move(endExpr)) {}
+        
+    virtual llvm::Value* codeGen(CodeGenContext& context) override;
+    
+    ExprAST* getStart() const { return start.get(); }
+    ExprAST* getEnd() const { return end.get(); }
+    int getSliceWidth(CodeGenContext& context) const;
+};
+
+// Array element assignment: arr[i, j, k] = value
+class ArrayStoreExprAST : public ExprAST {
+    std::unique_ptr<ExprAST> array;
+    std::vector<std::unique_ptr<ExprAST>> indices;
+    std::unique_ptr<ExprAST> value;
+    
+public:
+    ArrayStoreExprAST(std::unique_ptr<ExprAST> arrayExpr,
+                     std::vector<std::unique_ptr<ExprAST>> idxExprs,
+                     std::unique_ptr<ExprAST> val)
+        : array(std::move(arrayExpr)), indices(std::move(idxExprs)), value(std::move(val)) {}
         
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
 };

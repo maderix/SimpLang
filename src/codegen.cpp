@@ -1,3 +1,4 @@
+#include "logger.hpp"
 #include "codegen.hpp"
 #include "ast.hpp"
 #include <llvm/IR/Verifier.h>
@@ -5,6 +6,12 @@
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Support/Host.h>
 #include <llvm/IR/LegacyPassManager.h>
+#include <llvm/Transforms/Scalar.h>
+#include <llvm/Transforms/Utils.h>
+#include <llvm/Transforms/InstCombine/InstCombine.h>
+#include <llvm/Analysis/BasicAliasAnalysis.h>
+#include <llvm/Analysis/AssumptionCache.h>
+#include <llvm/Analysis/TargetTransformInfo.h>
 #include <llvm-c/Target.h>
 #include <iostream>
 
@@ -53,7 +60,17 @@ CodeGenContext::CodeGenContext() : builder(context) {
     
     // Initialize optimization passes
     fpm = std::make_unique<llvm::legacy::FunctionPassManager>(module.get());
+    
+    // Add essential optimization passes for performance (conservative approach)
+    fpm->add(llvm::createPromoteMemoryToRegisterPass());      // mem2reg - most critical for register allocation
+    fpm->add(llvm::createInstructionCombiningPass());         // instcombine - combine redundant instructions  
+    fpm->add(llvm::createReassociatePass());                  // reassociate - expression reordering
+    fpm->add(llvm::createCFGSimplificationPass());            // simplifycfg - control flow cleanup
+    
     fpm->doInitialization();
+    
+    // Initialize SIMD backends
+    initializeSIMDBackends();
 }
 
 CodeGenContext::~CodeGenContext() {
@@ -532,7 +549,7 @@ void CodeGenContext::generateCode(BlockAST& root) {
 }
 
 void CodeGenContext::pushBlock(llvm::DIScope* debugScope) {
-    std::cout << "Pushing new block" << std::endl;
+    LOG_TRACE("Pushing new block");
     blocks.push_back(new CodeGenBlock(debugScope));
     if (debugScope) {
         currentDebugScope = debugScope;
@@ -540,7 +557,7 @@ void CodeGenContext::pushBlock(llvm::DIScope* debugScope) {
 }
 
 void CodeGenContext::popBlock() {
-    std::cout << "Popping block" << std::endl;
+    LOG_TRACE("Popping block");
     if (!blocks.empty()) {
         CodeGenBlock* top = blocks.back();
         blocks.pop_back();
@@ -561,7 +578,7 @@ void CodeGenContext::popBlock() {
 }
 
 void CodeGenContext::setSymbolValue(const std::string& name, llvm::Value* value) {
-        std::cout << "Setting symbol: " << name << std::endl;
+        LOG_TRACE("Setting symbol: ", name);
         blocks.back()->locals[name] = value;
 }
 
@@ -569,7 +586,7 @@ llvm::Value* CodeGenContext::getSymbolValue(const std::string& name) {
         for (auto it = blocks.rbegin(); it != blocks.rend(); ++it) {
             auto value = (*it)->locals.find(name);
             if (value != (*it)->locals.end()) {
-                std::cout << "Found symbol: " << name << std::endl;
+                LOG_TRACE("Found symbol: ", name);
                 return value->second;
             }
         }
@@ -829,4 +846,31 @@ void CodeGenContext::emitSliceSet(llvm::Value* slice, llvm::Value* index, llvm::
     else {
         emitError("Unsupported vector width for slice set operation");
     }
+}
+
+void CodeGenContext::initializeSIMDBackends() {
+    // Initialize available SIMD backends
+    auto avx512Backend = SIMDBackendFactory::createBackend(SIMDType::AVX512);
+    if (avx512Backend && avx512Backend->supportsTarget()) {
+        activeSIMDBackend = avx512Backend.get();
+        simdBackends[SIMDType::AVX512] = std::move(avx512Backend);
+        LOG_INFO("AVX-512 backend initialized");
+    }
+}
+
+SIMDBackend* CodeGenContext::getSIMDBackend(SIMDType hint) {
+    if (hint == SIMDType::Auto && activeSIMDBackend) {
+        return activeSIMDBackend;
+    }
+    
+    auto it = simdBackends.find(hint);
+    if (it != simdBackends.end()) {
+        return it->second.get();
+    }
+    
+    return nullptr;
+}
+
+bool CodeGenContext::hasSIMDBackend(SIMDType type) const {
+    return simdBackends.find(type) != simdBackends.end();
 }

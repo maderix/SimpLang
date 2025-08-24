@@ -45,16 +45,18 @@
     std::vector<VariableDeclarationAST*> *varvec;
     std::string *string;
     SliceTypeAST *slice_type;
+    TypeInfo *type_info;
     int token;
 }
 
 %token <string> TIDENTIFIER TINTEGER TFLOAT TINTLIT
-%token TCEQ TCNE TCLE TCGE
+%token TCEQ TCNE TCLE TCGE TARROW
 %token TVAR TFUNC TIF TELSE TWHILE TRETURN
+%token TF32 TF64 TI8 TI16 TI32 TI64 TU8 TU16 TU32 TU64 TBOOL TVOID
 %token TSSE TAVX    /* Vector creation tokens */
 %token TLPAREN TRPAREN TLBRACE TRBRACE
 %token TCOMMA TSEMICOLON
-%token TMAKE TSSESLICE TAVXSLICE TLBRACKET TRBRACKET
+%token TMAKE TARRAY TSSESLICE TAVXSLICE TLBRACKET TRBRACKET
 %token UNARY_MINUS  /* Add this token for unary minus */
 %token TOK_MOD
 %token <string> IDENTIFIER
@@ -70,10 +72,12 @@
 %type <stmt> stmt func_decl if_stmt while_stmt return_stmt
 %type <expr> expr numeric slice_expr slice_access call_expr vector_expr  /* Add vector_expr here */
 %type <var_expr> ident
-%type <exprvec> call_args expr_list
+%type <exprvec> call_args expr_list multi_index
 %type <varvec> func_decl_args
 %type <var_decl> var_decl param_decl
 %type <slice_type> slice_type
+%type <type_info> type_spec array_type
+%type <expr> array_expr array_access
 
 %%
 
@@ -113,12 +117,21 @@ expr : expr '+' expr   { $$ = new BinaryExprAST(static_cast<BinaryOp>('+'), make
              makeUnique($3)
          ); 
      }
+     | ident TLBRACKET multi_index TRBRACKET '=' expr {
+         $$ = new ArrayStoreExprAST(
+             std::make_unique<VariableExprAST>($1->getName()),
+             makeUniqueVector(*$3),
+             makeUnique($6)
+         );
+     }
      | call_expr       { $$ = $1; }
      | slice_access    { $$ = $1; }
      | ident           { $$ = $1; }
      | numeric         { $$ = $1; }
      | slice_expr      { $$ = $1; }
      | vector_expr     { $$ = $1; }
+     | array_expr      { $$ = $1; }
+     | array_access    { $$ = $1; }
      ;
 
 vector_expr 
@@ -148,14 +161,49 @@ block : TLBRACE stmts TRBRACE { $$ = $2; }
 
 var_decl : TVAR TIDENTIFIER { $$ = new VariableDeclarationAST(*$2, nullptr); }
          | TVAR TIDENTIFIER '=' expr { $$ = new VariableDeclarationAST(*$2, $4); }
-         | TVAR TIDENTIFIER slice_type { $$ = new VariableDeclarationAST(*$2, nullptr, $3); }
+         | TVAR TIDENTIFIER slice_type { $$ = new VariableDeclarationAST(*$2, nullptr, nullptr, $3); }
          | TVAR TIDENTIFIER slice_type '=' slice_expr 
-           { $$ = new VariableDeclarationAST(*$2, $5, $3); }
+           { $$ = new VariableDeclarationAST(*$2, $5, nullptr, $3); }
+         | type_spec TIDENTIFIER { 
+             $$ = new VariableDeclarationAST(*$2, nullptr, std::unique_ptr<TypeInfo>($1)); 
+           }
+         | type_spec TIDENTIFIER '=' expr { 
+             $$ = new VariableDeclarationAST(*$2, $4, std::unique_ptr<TypeInfo>($1)); 
+           }
+         | array_type TIDENTIFIER { 
+             $$ = new VariableDeclarationAST(*$2, nullptr, std::unique_ptr<TypeInfo>($1)); 
+           }
+         | array_type TIDENTIFIER '=' expr { 
+             $$ = new VariableDeclarationAST(*$2, $4, std::unique_ptr<TypeInfo>($1)); 
+           }
          ;
 
 slice_type : TSSESLICE { $$ = new SliceTypeAST(SliceType::SSE_SLICE); }
           | TAVXSLICE { $$ = new SliceTypeAST(SliceType::AVX_SLICE); }
           ;
+
+type_spec : TF32 { $$ = new TypeInfo(TypeKind::F32); }
+         | TF64 { $$ = new TypeInfo(TypeKind::F64); }
+         | TI8 { $$ = new TypeInfo(TypeKind::I8); }
+         | TI16 { $$ = new TypeInfo(TypeKind::I16); }
+         | TI32 { $$ = new TypeInfo(TypeKind::I32); }
+         | TI64 { $$ = new TypeInfo(TypeKind::I64); }
+         | TU8 { $$ = new TypeInfo(TypeKind::U8); }
+         | TU16 { $$ = new TypeInfo(TypeKind::U16); }
+         | TU32 { $$ = new TypeInfo(TypeKind::U32); }
+         | TU64 { $$ = new TypeInfo(TypeKind::U64); }
+         | TBOOL { $$ = new TypeInfo(TypeKind::Bool); }
+         | TVOID { $$ = new TypeInfo(TypeKind::Void); }
+         | TVAR { $$ = new TypeInfo(TypeKind::Dynamic); }
+         ;
+
+array_type : type_spec TLBRACKET TINTEGER TRBRACKET { 
+             $$ = new ArrayTypeInfo(std::unique_ptr<TypeInfo>($1), atoi($3->c_str())); 
+           }
+           | type_spec TLBRACKET TRBRACKET { 
+             $$ = new ArrayTypeInfo(std::unique_ptr<TypeInfo>($1), -1); /* Dynamic size */
+           }
+           ;
 
 expr_list 
     : expr { 
@@ -178,17 +226,45 @@ slice_access : ident TLBRACKET expr TRBRACKET
              { $$ = new SliceAccessExprAST($1->getName(), $3); }
           ;
 
+array_expr : TARRAY '<' type_spec '>' TLPAREN TLBRACKET expr_list TRBRACKET TRPAREN {
+             $$ = new ArrayCreateExprAST(std::unique_ptr<TypeInfo>($3), makeUniqueVector(*$7));
+           }
+          ;
+
+array_access : ident TLBRACKET multi_index TRBRACKET {
+             $$ = new ArrayAccessExprAST(std::make_unique<VariableExprAST>($1->getName()), makeUniqueVector(*$3));
+           }
+          ;
+
+multi_index : expr { 
+            $$ = new std::vector<ExprAST*>(); 
+            $$->push_back($1); 
+          }
+          | multi_index TCOMMA expr { 
+            $1->push_back($3); 
+            $$ = $1; 
+          }
+          ;
+
 call_expr : ident TLPAREN call_args TRPAREN { 
             $$ = new CallExprAST($1->getName(), *$3); 
           }
           ;
 
 param_decl : TVAR TIDENTIFIER { $$ = new VariableDeclarationAST(*$2, nullptr); }
-           | TVAR TIDENTIFIER slice_type { $$ = new VariableDeclarationAST(*$2, nullptr, $3); }
+           | TVAR TIDENTIFIER slice_type { $$ = new VariableDeclarationAST(*$2, nullptr, nullptr, $3); }
+           | type_spec TIDENTIFIER { 
+               $$ = new VariableDeclarationAST(*$2, nullptr, std::unique_ptr<TypeInfo>($1)); 
+             }
+           | array_type TIDENTIFIER { 
+               $$ = new VariableDeclarationAST(*$2, nullptr, std::unique_ptr<TypeInfo>($1)); 
+             }
            ;
 
 func_decl : TFUNC TIDENTIFIER TLPAREN func_decl_args TRPAREN block 
             { $$ = new FunctionAST(*$2, $4, $6); }
+          | TFUNC TIDENTIFIER TLPAREN func_decl_args TRPAREN TARROW type_spec block 
+            { $$ = new FunctionAST(*$2, $4, $8, std::unique_ptr<TypeInfo>($7)); }
           ;
 
 func_decl_args : /* empty */ { $$ = new std::vector<VariableDeclarationAST*>(); }
@@ -214,8 +290,8 @@ call_args : /* empty */ { $$ = new std::vector<ExprAST*>(); }
 ident : TIDENTIFIER { $$ = new VariableExprAST(*$1); }
       ;
 
-numeric : TINTEGER { $$ = new NumberExprAST(atof($1->c_str())); }
-        | TFLOAT { $$ = new NumberExprAST(atof($1->c_str())); }
+numeric : TINTEGER { $$ = new NumberExprAST(atof($1->c_str()), true); }  // Mark as integer
+        | TFLOAT { $$ = new NumberExprAST(atof($1->c_str()), false); }  // Mark as float
         | TINTLIT {
             std::string val = *$1;
             val.pop_back(); // Remove the 'i' suffix
