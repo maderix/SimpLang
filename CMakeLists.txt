@@ -59,6 +59,7 @@ add_subdirectory(runtime)    # Runtime library and utilities first
 add_subdirectory(src)        # SimpleLang compiler
 add_subdirectory(tests)      # Tests directory
 add_subdirectory(tests/benchmark)  # Benchmarks
+add_subdirectory(simptensor) # SimpTensor library tests
 
 # Update build_all dependencies
 add_dependencies(build_all 
