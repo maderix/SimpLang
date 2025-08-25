@@ -16,6 +16,7 @@ extern "C" int yywrap() { return 1; }
 [0-9]+\.[0-9]*        { SAVE_TOKEN; return TFLOAT; }
 [0-9]+                { SAVE_TOKEN; return TINTEGER; }
 [0-9]+"i"             { SAVE_TOKEN; return TINTLIT; }
+\"([^\"\\]|\\.)*\"    { SAVE_TOKEN; return TSTRING; }
 
 "fn"                  { return TFUNC; }
 "return"              { return TRETURN; }
@@ -25,6 +26,8 @@ extern "C" int yywrap() { return 1; }
 "var"                 { return TVAR; }
 "make"                { return TMAKE; }
 "array"               { return TARRAY; }
+"include"             { return TINCLUDE; }
+"import"              { return TIMPORT; }
 
 "f32"                 { return TF32; }
 "f64"                 { return TF64; }
@@ -44,6 +47,12 @@ extern "C" int yywrap() { return 1; }
 "AVXSlice"           { return TAVXSLICE; }
 "sse"                { return TSSE; }
 "avx"                { return TAVX; }
+
+"simd"               { return TSIMD; }
+"auto"               { return TAUTO; }
+"avx512"             { return TAVX512; }
+"neon"               { return TNEON; }
+"sve"                { return TSVE; }
 
 "slice_get_sse"      { SAVE_TOKEN; return TIDENTIFIER; }
 "slice_get_avx"      { SAVE_TOKEN; return TIDENTIFIER; }

@@ -102,7 +102,7 @@ void CodeGenContext::initializeRuntimeFunctions() {
     // Initialize SIMD functions only if enabled
     if (simd_enabled) {
         initializeSliceTypes();
-        initializeSIMDFunctions();
+        // initializeSIMDFunctions(); // Commented out - old SIMD implementation not needed
     }
 }
 
@@ -873,4 +873,87 @@ SIMDBackend* CodeGenContext::getSIMDBackend(SIMDType hint) {
 
 bool CodeGenContext::hasSIMDBackend(SIMDType type) const {
     return simdBackends.find(type) != simdBackends.end();
+}
+
+bool CodeGenContext::includeFile(const std::string& filename) {
+    LOG_TRACE("Attempting to include file: ", filename);
+    
+    // Check for circular includes
+    for (const auto& currentFile : includeStack) {
+        if (currentFile == filename) {
+            LOG_ERROR("Circular include detected: ", filename);
+            return false;
+        }
+    }
+    
+    // Check if already included
+    if (includedFiles.find(filename) != includedFiles.end()) {
+        LOG_DEBUG("File already included, skipping: ", filename);
+        return true;
+    }
+    
+    // Add to tracking
+    includeStack.push_back(filename);
+    includedFiles.insert(filename);
+    
+    // Parse the included file's AST
+    extern BlockAST* programBlock;
+    extern int yyparse();
+    extern FILE* yyin;
+    
+    // Save current parser state
+    BlockAST* savedProgramBlock = programBlock;
+    FILE* savedYyin = yyin;
+    
+    // Open and parse the include file
+    yyin = fopen(filename.c_str(), "r");
+    if (!yyin) {
+        LOG_ERROR("Cannot open include file: ", filename);
+        includeStack.pop_back();
+        includedFiles.erase(filename);
+        return false;
+    }
+    
+    programBlock = nullptr;
+    
+    if (yyparse() != 0) {
+        LOG_ERROR("Parse error in include file: ", filename);
+        fclose(yyin);
+        yyin = savedYyin;
+        programBlock = savedProgramBlock;
+        includeStack.pop_back();
+        includedFiles.erase(filename);
+        return false;
+    }
+    
+    fclose(yyin);
+    
+    if (!programBlock) {
+        LOG_ERROR("No AST generated from include file: ", filename);
+        yyin = savedYyin;
+        programBlock = savedProgramBlock;
+        includeStack.pop_back();
+        includedFiles.erase(filename);
+        return false;
+    }
+    
+    // Generate code for the included AST
+    LOG_INFO("Generating code for included file: ", filename);
+    for (auto* stmt : programBlock->statements) {
+        if (!stmt->codeGen(*this)) {
+            LOG_ERROR("Code generation failed for statement in: ", filename);
+            // Continue processing other statements rather than failing completely
+        }
+    }
+    
+    // Clean up included AST
+    delete programBlock;
+    
+    // Restore parser state
+    yyin = savedYyin;
+    programBlock = savedProgramBlock;
+    includeStack.pop_back();
+    
+    LOG_INFO("Successfully included and processed file: ", filename);
+    return true;
 }
