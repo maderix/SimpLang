@@ -55,14 +55,17 @@ add_custom_target(build_all
 )
 
 # Add subdirectories
+add_subdirectory(simpblas)   # SimpBLAS optimized kernels library
 add_subdirectory(runtime)    # Runtime library and utilities first
 add_subdirectory(src)        # SimpleLang compiler
 add_subdirectory(tests)      # Tests directory
 add_subdirectory(tests/benchmark)  # Benchmarks
 add_subdirectory(simptensor) # SimpTensor library tests
+add_subdirectory(mobilenet_poc) # MobileNet POC demonstration
 
 # Update build_all dependencies
 add_dependencies(build_all 
+    simpblas         # SimpBLAS optimized kernels library
     simplang 
     simplang_runtime 
     host_runner 
