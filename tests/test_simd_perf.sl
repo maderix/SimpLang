@@ -1,10 +1,10 @@
-fn kernel_main() {
-    // Create AVX-512 optimized arrays for heavy computation
+fn kernel_main() -> f32 {
+    // Create optimized arrays for heavy computation
     var size = 1024;
-    var simd_a = array<f32, simd=avx512>([size]);
-    var simd_b = array<f32, simd=avx512>([size]);
-    var simd_c = array<f32, simd=avx512>([size]);
-    var simd_result = array<f32, simd=avx512>([size]);
+    var simd_a = array<f32>([size]);
+    var simd_b = array<f32>([size]);
+    var simd_c = array<f32>([size]);
+    var simd_result = array<f32>([size]);
     
     // Initialize arrays with different patterns
     var i = 0;
