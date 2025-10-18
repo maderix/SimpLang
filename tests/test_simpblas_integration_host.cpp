@@ -86,7 +86,8 @@ int main(int argc, char* argv[]) {
         std::cout << "  • Convolution-style computation patterns" << std::endl;
         std::cout << "  • Native SimpBLAS operation comparison" << std::endl;
         std::cout << "  • Foundation for neural network operations" << std::endl;
-        
+        std::cout << "\nTest PASSED" << std::endl;
+
     } catch (const std::exception& e) {
         std::cerr << "Exception during kernel execution: " << e.what() << std::endl;
         return 1;

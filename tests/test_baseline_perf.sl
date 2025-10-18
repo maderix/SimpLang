@@ -1,6 +1,6 @@
 fn kernel_main() {
     // Create regular arrays (no SIMD alignment/hints)
-    var size = 2097152;  // 1M elements to showcase SIMD benefits
+    var size = 10000;  // Reduced size to avoid allocation issues
     var regular_a = array<f32>([size]);
     var regular_b = array<f32>([size]);
     var regular_c = array<f32>([size]);

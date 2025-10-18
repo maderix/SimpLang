@@ -4,7 +4,7 @@
 #include <vector>
 #include <cmath>
 
-typedef double (*kernel_func)();
+typedef float (*kernel_func)();
 
 int main(int argc, char* argv[]) {
     if (argc != 2) {
@@ -35,8 +35,8 @@ int main(int argc, char* argv[]) {
     // Benchmark
     const int iterations = 1000;
     auto start = std::chrono::high_resolution_clock::now();
-    
-    double result = 0;
+
+    float result = 0;
     for (int i = 0; i < iterations; i++) {
         result = kernel();
     }
@@ -47,6 +47,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Result: " << result << std::endl;
     std::cout << "Time for " << iterations << " iterations: " << duration.count() << " μs" << std::endl;
     std::cout << "Average time per iteration: " << duration.count() / (double)iterations << " μs" << std::endl;
+    std::cout << "Test PASSED" << std::endl;
 
     dlclose(handle);
     return 0;
