@@ -141,24 +141,68 @@ llvm::Value* VariableExprAST::codeGen(CodeGenContext& context) {
 
     // Don't load from slice pointers (sse_slice_t* or avx_slice_t*)
     if (value->getType()->isPointerTy()) {
-        llvm::PointerType* ptrTy = llvm::cast<llvm::PointerType>(value->getType());
-        if (llvm::StructType* structTy = llvm::dyn_cast<llvm::StructType>(
-            ptrTy->getPointerElementType()
-        )) {
-            if (structTy->getName().equals("SSESlice") || 
-                structTy->getName().equals("AVXSlice")) {
-                return value;  // Return the pointer directly
+        // For opaque pointers in LLVM 14+, we need to check the symbol table for type info
+        // or use explicit type information from our type system
+        
+        // Try to get type info from symbol table
+        std::string varName = name;
+        llvm::Value* symbolValue = context.getSymbolValue(varName);
+        if (symbolValue && symbolValue == value) {
+            // This is a function parameter or variable - check if it should be loaded
+            // For function parameters, we generally don't load unless it's a local variable
+            llvm::BasicBlock* currentBlock = context.getBuilder().GetInsertBlock();
+            if (currentBlock) {
+                llvm::Function* currentFunc = currentBlock->getParent();
+                for (auto& arg : currentFunc->args()) {
+                    if (&arg == value) {
+                        // This is a function argument - return directly (no load)
+                        return value;
+                    }
+                }
             }
+            // If we're in global context, skip the function argument check
         }
         
-        // For other pointer types (except functions), load the value
-        if (!ptrTy->getPointerElementType()->isFunctionTy()) {
+        // For local variables allocated with alloca, we need to load
+        if (llvm::isa<llvm::AllocaInst>(value)) {
+            // Get the allocated type from the alloca instruction
+            llvm::AllocaInst* allocaInst = llvm::cast<llvm::AllocaInst>(value);
+            llvm::Type* allocatedType = allocaInst->getAllocatedType();
             return context.getBuilder().CreateLoad(
-                ptrTy->getPointerElementType(),
+                allocatedType,
                 value,
                 name.c_str()
             );
         }
+        
+        // For global variables, we need to load them to get their value
+        if (llvm::isa<llvm::GlobalVariable>(value)) {
+            llvm::GlobalVariable* globalVar = llvm::cast<llvm::GlobalVariable>(value);
+            llvm::Type* globalType = globalVar->getValueType();
+            
+            // Check if we have a valid insert block (function context)
+            llvm::BasicBlock* currentBlock = context.getBuilder().GetInsertBlock();
+            if (currentBlock) {
+                // We're in a function - can use load instruction
+                return context.getBuilder().CreateLoad(
+                    globalType,
+                    value,
+                    name.c_str()
+                );
+            } else {
+                // We're in global context - try to get the constant initializer
+                if (globalVar->hasInitializer()) {
+                    llvm::Constant* initializer = globalVar->getInitializer();
+                    return initializer;
+                } else {
+                    LOG_ERROR("Global variable ", name, " accessed in global context without initializer");
+                    return nullptr;
+                }
+            }
+        }
+        
+        // For other cases, return the pointer directly (function parameters, etc.)
+        return value;
     }
     
     return value;
@@ -299,7 +343,13 @@ llvm::Value* AssignmentExprAST::codeGen(CodeGenContext& context) {
     }
 
     // Check types and convert if needed
-    llvm::Type* varType = variable->getType()->getPointerElementType();
+    llvm::Type* varType = nullptr;
+    if (llvm::AllocaInst* allocaInst = llvm::dyn_cast<llvm::AllocaInst>(variable)) {
+        varType = allocaInst->getAllocatedType();
+    } else {
+        // For other cases, try to infer from RHS type
+        varType = rhsValue->getType();
+    }
     rhsValue = convertType(rhsValue, varType, context, "assignconv");
 
     // Create the store instruction
@@ -411,15 +461,18 @@ llvm::Value* VariableDeclarationAST::codeGen(CodeGenContext& context) {
         if (staticType->kind == TypeKind::Array) {
             // For arrays, handle specially
             auto* arrayType = static_cast<ArrayTypeInfo*>(staticType.get());
+            llvm::Type* elemType = arrayType->elementType->getLLVMType(context.getContext());
+            
             if (arrayType->size > 0) {
                 // Fixed-size array
-                llvm::Type* elemType = arrayType->elementType->getLLVMType(context.getContext());
                 varType = llvm::ArrayType::get(elemType, arrayType->size);
             } else {
                 // Dynamic array - use pointer for now
-                llvm::Type* elemType = arrayType->elementType->getLLVMType(context.getContext());
                 varType = llvm::PointerType::get(elemType, 0);
             }
+            
+            // Store the element type for later retrieval
+            context.setArrayElementType(name, elemType);
         } else {
             // Basic static type
             varType = staticType->getLLVMType(context.getContext());
@@ -436,6 +489,19 @@ llvm::Value* VariableDeclarationAST::codeGen(CodeGenContext& context) {
         llvm::Type* elemType = arrayExpr->getElementType()->getLLVMType(context.getContext());
         varType = llvm::PointerType::get(elemType, 0);
         LOG_DEBUG("Inferred array variable type: pointer to ", elemType->getTypeID());
+        
+        // Store the element type for later retrieval during array access/store operations
+        context.setArrayElementType(name, elemType);
+    } else if (auto* simdArrayExpr = dynamic_cast<SIMDArrayCreateExprAST*>(assignmentExpr)) {
+        // For SIMD array expressions, determine if we're in global or local context
+        llvm::Type* elemType = simdArrayExpr->getElementType()->getLLVMType(context.getContext());
+        
+                // Always use pointer type for SIMD arrays (will be malloc'd)
+        varType = llvm::PointerType::get(elemType, 0);
+        LOG_DEBUG("Inferred SIMD array variable type: pointer to ", elemType->getTypeID());
+        
+        // Store the element type for later retrieval during array access/store operations
+        context.setArrayElementType(name, elemType);
     } else if (initVal) {
         // Infer type from initialization value
         varType = initVal->getType();
@@ -454,18 +520,55 @@ llvm::Value* VariableDeclarationAST::codeGen(CodeGenContext& context) {
         varType = llvm::Type::getFloatTy(context.getContext());
     }
     
-    // Create allocation in entry block to prevent stack overflow in loops
-    llvm::Function* function = context.getBuilder().GetInsertBlock()->getParent();
-    llvm::IRBuilder<> entryBuilder(&function->getEntryBlock(), 
-                                   function->getEntryBlock().begin());
-    llvm::AllocaInst* alloc = entryBuilder.CreateAlloca(
-        varType,
-        nullptr,
-        name.c_str()
-    );
+    // Check if we're in a function context or global context
+    llvm::BasicBlock* currentBlock = context.getBuilder().GetInsertBlock();
+    llvm::AllocaInst* alloc = nullptr;
     
-    // Store initial value if it exists
-    if (initVal) {
+    if (currentBlock == nullptr) {
+        // Global variable - create as global variable instead of alloca
+        llvm::GlobalVariable* globalVar = new llvm::GlobalVariable(
+            *context.getModule(),
+            varType,
+            false,  // isConstant
+            llvm::GlobalValue::PrivateLinkage,
+            nullptr,  // Initializer (will set later)
+            name.c_str()
+        );
+        
+        // Set initializer if we have an initial value
+        if (initVal) {
+            if (auto* constVal = llvm::dyn_cast<llvm::Constant>(initVal)) {
+                globalVar->setInitializer(constVal);
+            } else {
+                // For non-constant initializers, we need to defer initialization
+                // Use zero initializer for now
+                globalVar->setInitializer(llvm::Constant::getNullValue(varType));
+                LOG_DEBUG("Global variable ", name, " initialized with zero (non-constant initializer)");
+                
+                // TODO: Implement global constructor for proper initialization
+            }
+        } else {
+            // No initial value - use zero initializer
+            globalVar->setInitializer(llvm::Constant::getNullValue(varType));
+        }
+        
+        // Add to symbol table
+        context.setSymbolValue(name, globalVar);
+        return globalVar;
+    } else {
+        // Local variable - create allocation in entry block to prevent stack overflow in loops
+        llvm::Function* function = currentBlock->getParent();
+        llvm::IRBuilder<> entryBuilder(&function->getEntryBlock(), 
+                                       function->getEntryBlock().begin());
+        alloc = entryBuilder.CreateAlloca(
+            varType,
+            nullptr,
+            name.c_str()
+        );
+    }
+    
+    // Store initial value if it exists (only for local variables)
+    if (initVal && alloc) {
         llvm::Value* storeValue = initVal;
         
         // Use generic type converter for static types
@@ -477,10 +580,15 @@ llvm::Value* VariableDeclarationAST::codeGen(CodeGenContext& context) {
         context.getBuilder().CreateStore(storeValue, alloc);
     }
     
-    // Add to symbol table
-    context.setSymbolValue(name, alloc);
+    // Add to symbol table (only for local variables - global variables already added)
+    if (alloc) {
+        context.setSymbolValue(name, alloc);
+        return alloc;
+    }
     
-    return alloc;
+    // Should not reach here - global variables should have returned earlier
+    LOG_ERROR("Unexpected code path in variable declaration");
+    return nullptr;
 }
 
 llvm::Value* FunctionAST::codeGen(CodeGenContext& context) {
@@ -930,107 +1038,146 @@ llvm::Value* SliceStoreExprAST::codeGen(CodeGenContext& context) {
     
     // Check if this is a simple array (direct pointer to elements) or a slice struct
     if (varType->isPointerTy()) {
-        llvm::Type* pointeeType = varType->getPointerElementType();
+        // For array parameters, we need to check if this is an allocated variable or a function parameter
+        llvm::Type* elemType = nullptr;
+        llvm::Value* arrayDataPtr = nullptr;
         
-        // If it points to a pointer to basic type (f32*, i32*, etc.), treat as array
-        if (pointeeType->isPointerTy()) {
-            llvm::Type* elemType = pointeeType->getPointerElementType();
-            if (elemType->isFloatTy() || elemType->isIntegerTy() || elemType->isDoubleTy()) {
-                LOG_DEBUG("Handling as array (pointer to ", elemType->isFloatTy() ? "float" : "int", ")");
+        if (llvm::AllocaInst* allocaInst = llvm::dyn_cast<llvm::AllocaInst>(varPtr)) {
+            // This is a local variable - get the allocated type
+            llvm::Type* allocatedType = allocaInst->getAllocatedType();
+            if (allocatedType->isPointerTy()) {
+                // This is a pointer to array data
+                arrayDataPtr = builder.CreateLoad(allocatedType, varPtr, "array_data_ptr");
                 
-                // Load the array data pointer from the variable
-                llvm::Value* arrayDataPtr = builder.CreateLoad(pointeeType, varPtr, "array_data_ptr");
+                // Extract the actual element type from the pointer type
+                // For arrays, allocatedType is PointerType::get(elemType, 0)
+                // But in LLVM 14+ with opaque pointers, we need a different approach
+                // We can use the type information from the alloca instruction name or context
                 
-                // Generate index
-                llvm::Value* idx = index_->codeGen(context);
-                if (!idx) {
-                    LOG_ERROR("Failed to generate array index");
-                    return nullptr;
+                // First try to get the stored element type from the context
+                elemType = context.getArrayElementType(slice_name_);
+                if (!elemType) {
+                    // Fallback: try to infer element type from variable name context
+                    if (slice_name_.find("_f64") != std::string::npos) {
+                        elemType = llvm::Type::getDoubleTy(builder.getContext());
+                    } else if (slice_name_.find("_f32") != std::string::npos) {
+                        elemType = llvm::Type::getFloatTy(builder.getContext());
+                    } else if (slice_name_.find("_i8") != std::string::npos) {
+                        elemType = llvm::Type::getInt8Ty(builder.getContext());
+                    } else if (slice_name_.find("_i16") != std::string::npos) {
+                        elemType = llvm::Type::getInt16Ty(builder.getContext());
+                    } else if (slice_name_.find("_i32") != std::string::npos) {
+                        elemType = llvm::Type::getInt32Ty(builder.getContext());
+                    } else if (slice_name_.find("_i64") != std::string::npos) {
+                        elemType = llvm::Type::getInt64Ty(builder.getContext());
+                    } else if (slice_name_.find("_u8") != std::string::npos) {
+                        elemType = llvm::Type::getInt8Ty(builder.getContext());   // LLVM treats unsigned as signed
+                    } else if (slice_name_.find("_u16") != std::string::npos) {
+                        elemType = llvm::Type::getInt16Ty(builder.getContext());  // LLVM treats unsigned as signed
+                    } else if (slice_name_.find("_u32") != std::string::npos) {
+                        elemType = llvm::Type::getInt32Ty(builder.getContext());  // LLVM treats unsigned as signed
+                    } else if (slice_name_.find("_u64") != std::string::npos) {
+                        elemType = llvm::Type::getInt64Ty(builder.getContext());  // LLVM treats unsigned as signed
+                    } else {
+                        // Default to f32 as last resort
+                        elemType = llvm::Type::getFloatTy(builder.getContext());
+                        LOG_DEBUG("Using default f32 element type for array - no type info found");
+                    }
                 }
-                
-                // Optimize index type - prefer i32 for better performance, only convert to i64 if necessary
-                llvm::Type* targetIdxType;
-                if (idx->getType()->isIntegerTy(32)) {
-                    // Keep i32 indices as-is for better performance
-                    targetIdxType = builder.getInt32Ty();
-                } else if (idx->getType()->isIntegerTy(64)) {
-                    // Keep i64 if already 64-bit
-                    targetIdxType = builder.getInt64Ty();
-                } else {
-                    // Convert other types to i32 (most common case)
-                    targetIdxType = builder.getInt32Ty();
+            }
+        } else {
+            // This might be a function parameter - check if it's an array parameter
+            llvm::Function* currentFunc = context.getBuilder().GetInsertBlock()->getParent();
+            for (auto& arg : currentFunc->args()) {
+                if (&arg == varPtr) {
+                    // This is a function argument - treat as array pointer
+                    arrayDataPtr = varPtr;
+                    
+                    // First try to get the stored element type from the context
+                    elemType = context.getArrayElementType(slice_name_);
+                    if (!elemType) {
+                        // Fallback: try to infer element type from parameter name
+                        if (slice_name_.find("_f64") != std::string::npos) {
+                            elemType = llvm::Type::getDoubleTy(builder.getContext());
+                        } else if (slice_name_.find("_f32") != std::string::npos) {
+                            elemType = llvm::Type::getFloatTy(builder.getContext());
+                        } else if (slice_name_.find("_i8") != std::string::npos) {
+                            elemType = llvm::Type::getInt8Ty(builder.getContext());
+                        } else if (slice_name_.find("_i16") != std::string::npos) {
+                            elemType = llvm::Type::getInt16Ty(builder.getContext());
+                        } else if (slice_name_.find("_i32") != std::string::npos) {
+                            elemType = llvm::Type::getInt32Ty(builder.getContext());
+                        } else if (slice_name_.find("_i64") != std::string::npos) {
+                            elemType = llvm::Type::getInt64Ty(builder.getContext());
+                        } else if (slice_name_.find("_u8") != std::string::npos) {
+                            elemType = llvm::Type::getInt8Ty(builder.getContext());   // LLVM treats unsigned as signed
+                        } else if (slice_name_.find("_u16") != std::string::npos) {
+                            elemType = llvm::Type::getInt16Ty(builder.getContext());  // LLVM treats unsigned as signed
+                        } else if (slice_name_.find("_u32") != std::string::npos) {
+                            elemType = llvm::Type::getInt32Ty(builder.getContext());  // LLVM treats unsigned as signed
+                        } else if (slice_name_.find("_u64") != std::string::npos) {
+                            elemType = llvm::Type::getInt64Ty(builder.getContext());  // LLVM treats unsigned as signed
+                        } else {
+                            // Default to f32 for array parameters
+                            elemType = llvm::Type::getFloatTy(builder.getContext());
+                        }
+                    }
+                    break;
                 }
-                
-                if (idx->getType() != targetIdxType) {
-                    idx = convertType(idx, targetIdxType, context, "array_idx");
-                }
-                
-                // Generate value to store
-                llvm::Value* storeValue = value_->codeGen(context);
-                if (!storeValue) {
-                    LOG_ERROR("Failed to generate value for array store");
-                    return nullptr;
-                }
-                
-                // Convert value type if needed
-                if (storeValue->getType() != elemType) {
-                    storeValue = convertType(storeValue, elemType, context, "array_store_val");
-                }
-                
-                // Create GEP and store
-                llvm::Value* elementPtr = builder.CreateGEP(elemType, arrayDataPtr, idx, "array_elem_ptr");
-                builder.CreateStore(storeValue, elementPtr);
-                
-                LOG_DEBUG("Array element store completed");
-                return storeValue;
             }
         }
         
-        // Otherwise, treat as slice struct - load the slice pointer
-        llvm::Value* slicePtr = builder.CreateLoad(pointeeType, varPtr, slice_name_ + ".loaded");
-        llvm::Type* sliceType = slicePtr->getType()->getPointerElementType();
-        std::string typeName = sliceType->getStructName().str();
-        LOG_DEBUG("Slice type: ", typeName);
-        bool isAVX = (typeName == "AVXSlice");
-        
-        LOG_DEBUG("Storing to ", typeName, " at ", slice_name_);
-        
-        // Generate index
-        llvm::Value* idx = index_->codeGen(context);
-        if (!idx) return nullptr;
-        
-        // Generate value
-        llvm::Value* value = value_->codeGen(context);
-        if (!value) return nullptr;
-        
-        // Verify vector type
-        auto vecType = llvm::dyn_cast<llvm::FixedVectorType>(value->getType());
-        if (!vecType) {
-            LOG_ERROR("Value is not a vector type");
+        if (arrayDataPtr && elemType) {
+            LOG_DEBUG("Handling as array (element type: ", elemType->isFloatTy() ? "float" : "other", ")");
+            
+            // Generate index
+            llvm::Value* idx = index_->codeGen(context);
+            if (!idx) {
+                LOG_ERROR("Failed to generate array index");
+                return nullptr;
+            }
+            
+            // Optimize index type - prefer i32 for better performance, only convert to i64 if necessary
+            llvm::Type* targetIdxType;
+            if (idx->getType()->isIntegerTy(32)) {
+                // Keep i32 indices as-is for better performance
+                targetIdxType = builder.getInt32Ty();
+            } else if (idx->getType()->isIntegerTy(64)) {
+                // Keep i64 if already 64-bit
+                targetIdxType = builder.getInt64Ty();
+            } else {
+                // Convert other types to i32 (most common case)
+                targetIdxType = builder.getInt32Ty();
+            }
+            
+            if (idx->getType() != targetIdxType) {
+                idx = convertType(idx, targetIdxType, context, "array_idx");
+            }
+            
+            // Generate value to store
+            llvm::Value* storeValue = value_->codeGen(context);
+            if (!storeValue) {
+                LOG_ERROR("Failed to generate value for array store");
+                return nullptr;
+            }
+            
+            // Convert value type if needed
+            if (storeValue->getType() != elemType) {
+                storeValue = convertType(storeValue, elemType, context, "array_store_val");
+            }
+            
+            // Create GEP and store
+            llvm::Value* elementPtr = builder.CreateGEP(elemType, arrayDataPtr, idx, "array_elem_ptr");
+            builder.CreateStore(storeValue, elementPtr);
+            
+            LOG_DEBUG("Array element store completed");
+            return storeValue;
+        } else {
+            // Try to handle as slice struct - this needs type information
+            // For now, skip slice handling in opaque pointer mode
+            LOG_ERROR("Slice operations not yet supported with opaque pointers");
             return nullptr;
         }
-        
-        unsigned width = vecType->getElementCount().getFixedValue();
-        unsigned expectedWidth = isAVX ? 8 : 2;
-        
-        if (width != expectedWidth) {
-            LOG_ERROR("Vector width mismatch. Got ", width, " but expected ", expectedWidth);
-            return nullptr;
-        }
-        
-        // Call appropriate set function
-        llvm::Function* setFunc = context.getModule()->getFunction(
-            isAVX ? "slice_set_avx" : "slice_set_sse"
-        );
-        
-        if (!setFunc) {
-            LOG_ERROR("Failed to find slice set function: ", (isAVX ? "slice_set_avx" : "slice_set_sse"));
-            return nullptr;
-        }
-        
-        LOG_DEBUG("Calling ", (isAVX ? "slice_set_avx" : "slice_set_sse"), " with slice pointer and vector width ", width);
-        
-        return builder.CreateCall(setFunc, {slicePtr, idx, value});
     }
     
     LOG_ERROR("Unknown variable type for slice/array store");
@@ -1052,69 +1199,125 @@ llvm::Value* SliceAccessExprAST::codeGen(CodeGenContext& context) {
     
     // Check if this is a simple array (direct pointer to elements) or a slice struct
     if (varType->isPointerTy()) {
-        llvm::Type* pointeeType = varType->getPointerElementType();
+        // For array parameters, we need to check if this is an allocated variable or a function parameter
+        llvm::Type* elemType = nullptr;
+        llvm::Value* arrayDataPtr = nullptr;
         
-        // If it points to a pointer to basic type (f32*, i32*, etc.), treat as array
-        if (pointeeType->isPointerTy()) {
-            llvm::Type* elemType = pointeeType->getPointerElementType();
-            if (elemType->isFloatTy() || elemType->isIntegerTy() || elemType->isDoubleTy()) {
-                LOG_DEBUG("Handling as array access (pointer to ", elemType->isFloatTy() ? "float" : "int", ")");
+        if (llvm::AllocaInst* allocaInst = llvm::dyn_cast<llvm::AllocaInst>(varPtr)) {
+            // This is a local variable - get the allocated type
+            llvm::Type* allocatedType = allocaInst->getAllocatedType();
+            if (allocatedType->isPointerTy()) {
+                // This is a pointer to array data
+                arrayDataPtr = builder.CreateLoad(allocatedType, varPtr, "array_data_ptr");
                 
-                // Load the array data pointer from the variable
-                llvm::Value* arrayDataPtr = builder.CreateLoad(pointeeType, varPtr, "array_data_ptr");
-                
-                // Generate index
-                llvm::Value* idx = index->codeGen(context);
-                if (!idx) {
-                    LOG_ERROR("Failed to generate array index");
-                    return nullptr;
+                // First try to get the stored element type from the context
+                elemType = context.getArrayElementType(slice_name);
+                if (!elemType) {
+                    // Fallback: try to infer element type from variable name context
+                    if (slice_name.find("_f64") != std::string::npos) {
+                        elemType = llvm::Type::getDoubleTy(builder.getContext());
+                    } else if (slice_name.find("_f32") != std::string::npos) {
+                        elemType = llvm::Type::getFloatTy(builder.getContext());
+                    } else if (slice_name.find("_i8") != std::string::npos) {
+                        elemType = llvm::Type::getInt8Ty(builder.getContext());
+                    } else if (slice_name.find("_i16") != std::string::npos) {
+                        elemType = llvm::Type::getInt16Ty(builder.getContext());
+                    } else if (slice_name.find("_i32") != std::string::npos) {
+                        elemType = llvm::Type::getInt32Ty(builder.getContext());
+                    } else if (slice_name.find("_i64") != std::string::npos) {
+                        elemType = llvm::Type::getInt64Ty(builder.getContext());
+                    } else if (slice_name.find("_u8") != std::string::npos) {
+                        elemType = llvm::Type::getInt8Ty(builder.getContext());   // LLVM treats unsigned as signed
+                    } else if (slice_name.find("_u16") != std::string::npos) {
+                        elemType = llvm::Type::getInt16Ty(builder.getContext());  // LLVM treats unsigned as signed
+                    } else if (slice_name.find("_u32") != std::string::npos) {
+                        elemType = llvm::Type::getInt32Ty(builder.getContext());  // LLVM treats unsigned as signed
+                    } else if (slice_name.find("_u64") != std::string::npos) {
+                        elemType = llvm::Type::getInt64Ty(builder.getContext());  // LLVM treats unsigned as signed
+                    } else {
+                        // Default to f32 for arrays
+                        elemType = llvm::Type::getFloatTy(builder.getContext());
+                    }
                 }
-                
-                // Optimize index type - prefer i32 for better performance
-                llvm::Type* targetIdxType;
-                if (idx->getType()->isIntegerTy(32)) {
-                    targetIdxType = builder.getInt32Ty();
-                } else if (idx->getType()->isIntegerTy(64)) {
-                    targetIdxType = builder.getInt64Ty();
-                } else {
-                    targetIdxType = builder.getInt32Ty();
+            }
+        } else {
+            // This might be a function parameter - check if it's an array parameter
+            llvm::Function* currentFunc = context.getBuilder().GetInsertBlock()->getParent();
+            for (auto& arg : currentFunc->args()) {
+                if (&arg == varPtr) {
+                    // This is a function argument - treat as array pointer
+                    arrayDataPtr = varPtr;
+                    
+                    // First try to get the stored element type from the context
+                    elemType = context.getArrayElementType(slice_name);
+                    if (!elemType) {
+                        // Fallback: try to infer element type from parameter name
+                        if (slice_name.find("_f64") != std::string::npos) {
+                            elemType = llvm::Type::getDoubleTy(builder.getContext());
+                        } else if (slice_name.find("_f32") != std::string::npos) {
+                            elemType = llvm::Type::getFloatTy(builder.getContext());
+                        } else if (slice_name.find("_i8") != std::string::npos) {
+                            elemType = llvm::Type::getInt8Ty(builder.getContext());
+                        } else if (slice_name.find("_i16") != std::string::npos) {
+                            elemType = llvm::Type::getInt16Ty(builder.getContext());
+                        } else if (slice_name.find("_i32") != std::string::npos) {
+                            elemType = llvm::Type::getInt32Ty(builder.getContext());
+                        } else if (slice_name.find("_i64") != std::string::npos) {
+                            elemType = llvm::Type::getInt64Ty(builder.getContext());
+                        } else if (slice_name.find("_u8") != std::string::npos) {
+                            elemType = llvm::Type::getInt8Ty(builder.getContext());   // LLVM treats unsigned as signed
+                        } else if (slice_name.find("_u16") != std::string::npos) {
+                            elemType = llvm::Type::getInt16Ty(builder.getContext());  // LLVM treats unsigned as signed
+                        } else if (slice_name.find("_u32") != std::string::npos) {
+                            elemType = llvm::Type::getInt32Ty(builder.getContext());  // LLVM treats unsigned as signed
+                        } else if (slice_name.find("_u64") != std::string::npos) {
+                            elemType = llvm::Type::getInt64Ty(builder.getContext());  // LLVM treats unsigned as signed
+                        } else {
+                            // Default to f32 for array parameters
+                            elemType = llvm::Type::getFloatTy(builder.getContext());
+                        }
+                    }
+                    break;
                 }
-                
-                if (idx->getType() != targetIdxType) {
-                    idx = convertType(idx, targetIdxType, context, "array_access_idx");
-                }
-                
-                // Create GEP and load
-                llvm::Value* elementPtr = builder.CreateGEP(elemType, arrayDataPtr, idx, "array_elem_ptr");
-                llvm::Value* element = builder.CreateLoad(elemType, elementPtr, "array_element");
-                
-                LOG_DEBUG("Array element access completed");
-                return element;
             }
         }
         
-        // Otherwise, treat as slice struct - load the slice pointer
-        llvm::Value* slicePtr = builder.CreateLoad(pointeeType, varPtr);
-        
-        // Generate index
-        llvm::Value* idx = index->codeGen(context);
-        if (!idx) return nullptr;
-        
-        // Determine if this is an AVX or SSE slice and call appropriate get function
-        llvm::Type* sliceType = slicePtr->getType()->getPointerElementType();
-        std::string typeName = sliceType->getStructName().str();
-        
-        llvm::Function* getFunc;
-        if (typeName == "SSESlice") {
-            getFunc = context.getModule()->getFunction("slice_get_sse");
-        } else if (typeName == "AVXSlice") {
-            getFunc = context.getModule()->getFunction("slice_get_avx");
+        if (arrayDataPtr && elemType) {
+            LOG_DEBUG("Handling as array access (element type: ", elemType->isFloatTy() ? "float" : "other", ")");
+            
+            // Generate index
+            llvm::Value* idx = index->codeGen(context);
+            if (!idx) {
+                LOG_ERROR("Failed to generate array index");
+                return nullptr;
+            }
+            
+            // Optimize index type - prefer i32 for better performance
+            llvm::Type* targetIdxType;
+            if (idx->getType()->isIntegerTy(32)) {
+                targetIdxType = builder.getInt32Ty();
+            } else if (idx->getType()->isIntegerTy(64)) {
+                targetIdxType = builder.getInt64Ty();
+            } else {
+                targetIdxType = builder.getInt32Ty();
+            }
+            
+            if (idx->getType() != targetIdxType) {
+                idx = convertType(idx, targetIdxType, context, "array_access_idx");
+            }
+            
+            // Create GEP and load
+            llvm::Value* elementPtr = builder.CreateGEP(elemType, arrayDataPtr, idx, "array_elem_ptr");
+            llvm::Value* element = builder.CreateLoad(elemType, elementPtr, "array_element");
+            
+            LOG_DEBUG("Array element access completed");
+            return element;
         } else {
-            LOG_ERROR("Unknown slice type: ", typeName);
+            // Try to handle as slice struct - this needs type information
+            // For now, skip slice handling in opaque pointer mode
+            LOG_ERROR("Slice operations not yet supported with opaque pointers");
             return nullptr;
         }
-        
-        return builder.CreateCall(getFunc, {slicePtr, idx});
     }
     
     LOG_ERROR("Unknown variable type for slice/array access");
@@ -1271,6 +1474,26 @@ llvm::Value* SIMDArrayCreateExprAST::codeGen(CodeGenContext& context) {
     
     // Use SIMD backend for aligned allocation
     llvm::Value* simdArrayPtr = backend->createAlignedAlloc(context.getBuilder(), elemType, totalSize);
+    if (!simdArrayPtr) {
+        LOG_DEBUG("SIMD backend failed (likely global context) - falling back to regular allocation");
+        
+        // Fallback to regular malloc allocation
+        llvm::Value* elementSize = llvm::ConstantInt::get(context.getBuilder().getInt64Ty(), 
+            context.getModule()->getDataLayout().getTypeAllocSize(elemType));
+        llvm::Value* totalBytes = context.getBuilder().CreateMul(totalSize, elementSize, "total_bytes");
+        
+        // Use malloc for memory allocation
+        llvm::Function* mallocFunc = context.getModule()->getFunction("malloc");
+        if (!mallocFunc) {
+            LOG_ERROR("malloc function not found");
+            return nullptr;
+        }
+        
+        llvm::Value* rawPtr = context.getBuilder().CreateCall(mallocFunc, {totalBytes}, "simd_array_raw_ptr");
+        simdArrayPtr = context.getBuilder().CreateBitCast(rawPtr, 
+            llvm::PointerType::get(elemType, 0), "simd_array_data_ptr");
+    }
+    
     LOG_DEBUG("SIMD array created with alignment: ", backend->getAlignment());
     return simdArrayPtr;
 }
@@ -1302,7 +1525,19 @@ llvm::Value* ArrayAccessExprAST::codeGen(CodeGenContext& context) {
         }
         
         // Create GEP and load
-        llvm::Type* elemType = arrayPtr->getType()->getPointerElementType();
+        // For opaque pointers, we need to get element type from type system
+        llvm::Type* elemType = nullptr;
+        
+        // Try to get the variable name from the array expression
+        if (auto* varExpr = dynamic_cast<VariableExprAST*>(array.get())) {
+            elemType = context.getArrayElementType(varExpr->getName());
+        }
+        
+        if (!elemType) {
+            // Fallback to f32 if we can't determine the type
+            elemType = llvm::Type::getFloatTy(context.getContext());
+            LOG_DEBUG("Using fallback f32 element type for array access");
+        }
         llvm::Value* elementPtr = context.getBuilder().CreateGEP(
             elemType, arrayPtr, index, "element_ptr");
         
@@ -1325,7 +1560,19 @@ llvm::Value* ArrayAccessExprAST::codeGen(CodeGenContext& context) {
             index = convertType(index, context.getBuilder().getInt64Ty(), context, "multi_idx_conv");
         }
         
-        llvm::Type* elemType = arrayPtr->getType()->getPointerElementType();
+        // For opaque pointers, we need to get element type from type system
+        llvm::Type* elemType = nullptr;
+        
+        // Try to get the variable name from the array expression
+        if (auto* varExpr = dynamic_cast<VariableExprAST*>(array.get())) {
+            elemType = context.getArrayElementType(varExpr->getName());
+        }
+        
+        if (!elemType) {
+            // Fallback to f32 if we can't determine the type
+            elemType = llvm::Type::getFloatTy(context.getContext());
+            LOG_DEBUG("Using fallback f32 element type for multi-dimensional array access");
+        }
         llvm::Value* elementPtr = context.getBuilder().CreateGEP(
             elemType, arrayPtr, index, "multi_element_ptr");
         
@@ -1398,7 +1645,19 @@ llvm::Value* ArrayStoreExprAST::codeGen(CodeGenContext& context) {
     }
     
     // Create GEP and store
-    llvm::Type* elemType = arrayPtr->getType()->getPointerElementType();
+    // For opaque pointers, we need to get element type from type system
+    llvm::Type* elemType = nullptr;
+    
+    // Try to get the variable name from the array expression
+    if (auto* varExpr = dynamic_cast<VariableExprAST*>(array.get())) {
+        elemType = context.getArrayElementType(varExpr->getName());
+    }
+    
+    if (!elemType) {
+        // Fallback to f32 if we can't determine the type
+        elemType = llvm::Type::getFloatTy(context.getContext());
+        LOG_DEBUG("Using fallback f32 element type for array store");
+    }
     llvm::Value* elementPtr = context.getBuilder().CreateGEP(
         elemType, arrayPtr, index, "store_element_ptr");
     

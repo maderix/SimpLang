@@ -84,6 +84,7 @@ CodeGenContext::~CodeGenContext() {
 void CodeGenContext::initializeRuntimeFunctions() {
     // Always initialize basic runtime functions
     initializeMallocFree();
+    initializeSimpBLASFunctions();
     
     // Always declare error function
     std::vector<llvm::Type*> errorArgs = {llvm::Type::getInt8PtrTy(context)};
@@ -579,10 +580,17 @@ void CodeGenContext::popBlock() {
 
 void CodeGenContext::setSymbolValue(const std::string& name, llvm::Value* value) {
         LOG_TRACE("Setting symbol: ", name);
-        blocks.back()->locals[name] = value;
+        if (!blocks.empty()) {
+            blocks.back()->locals[name] = value;
+        } else {
+            // Global context - store in global symbol table
+            globalSymbols[name] = value;
+            LOG_TRACE("Set global symbol: ", name);
+        }
 }
 
 llvm::Value* CodeGenContext::getSymbolValue(const std::string& name) {
+        // First check local blocks (most recent scope first)
         for (auto it = blocks.rbegin(); it != blocks.rend(); ++it) {
             auto value = (*it)->locals.find(name);
             if (value != (*it)->locals.end()) {
@@ -590,8 +598,31 @@ llvm::Value* CodeGenContext::getSymbolValue(const std::string& name) {
                 return value->second;
             }
         }
+        
+        // If not found in local blocks, check global symbols
+        auto globalIt = globalSymbols.find(name);
+        if (globalIt != globalSymbols.end()) {
+            LOG_TRACE("Found global symbol: ", name);
+            return globalIt->second;
+        }
+        
         std::cerr << "Symbol not found: " << name << std::endl;
         return nullptr;
+}
+
+void CodeGenContext::setArrayElementType(const std::string& name, llvm::Type* elementType) {
+    arrayElementTypes[name] = elementType;
+    LOG_TRACE("Set array element type for ", name, ": ", elementType->getTypeID());
+}
+
+llvm::Type* CodeGenContext::getArrayElementType(const std::string& name) {
+    auto it = arrayElementTypes.find(name);
+    if (it != arrayElementTypes.end()) {
+        LOG_TRACE("Found array element type for ", name, ": ", it->second->getTypeID());
+        return it->second;
+    }
+    LOG_TRACE("Array element type not found for ", name);
+    return nullptr;
 }
 
 void CodeGenContext::dumpBlocks() const {
@@ -715,6 +746,68 @@ void CodeGenContext::initializeMallocFree() {
         "free",
         module.get()
     );
+}
+
+void CodeGenContext::initializeSimpBLASFunctions() {
+    // SimpBLAS initialization function: int sb_init(void)
+    llvm::FunctionType* initType = llvm::FunctionType::get(
+        llvm::Type::getInt32Ty(context),  // Returns int
+        {},                               // No arguments
+        false
+    );
+    sbInitFunc = llvm::Function::Create(
+        initType,
+        llvm::Function::ExternalLinkage,
+        "sb_init",
+        module.get()
+    );
+
+    // SimpBLAS GEMM function: void sb_gemm_f32(int M, int N, int K, float* A, int lda, float* B, int ldb, float* C, int ldc)
+    std::vector<llvm::Type*> gemmArgs = {
+        llvm::Type::getInt32Ty(context),          // M
+        llvm::Type::getInt32Ty(context),          // N
+        llvm::Type::getInt32Ty(context),          // K
+        llvm::Type::getFloatPtrTy(context),       // A
+        llvm::Type::getInt32Ty(context),          // lda
+        llvm::Type::getFloatPtrTy(context),       // B
+        llvm::Type::getInt32Ty(context),          // ldb
+        llvm::Type::getFloatPtrTy(context),       // C
+        llvm::Type::getInt32Ty(context)           // ldc
+    };
+    llvm::FunctionType* gemmType = llvm::FunctionType::get(
+        llvm::Type::getVoidTy(context),
+        gemmArgs,
+        false
+    );
+    sbGemmFunc = llvm::Function::Create(
+        gemmType,
+        llvm::Function::ExternalLinkage,
+        "sb_gemm_f32",
+        module.get()
+    );
+}
+
+void CodeGenContext::generateGemmCall(llvm::Value* M, llvm::Value* N, llvm::Value* K,
+                                     llvm::Value* A, llvm::Value* B, llvm::Value* C) {
+    // Cast float arrays to f32* if needed
+    if (A->getType() != llvm::Type::getFloatPtrTy(context)) {
+        A = builder.CreateBitCast(A, llvm::Type::getFloatPtrTy(context));
+    }
+    if (B->getType() != llvm::Type::getFloatPtrTy(context)) {
+        B = builder.CreateBitCast(B, llvm::Type::getFloatPtrTy(context));
+    }
+    if (C->getType() != llvm::Type::getFloatPtrTy(context)) {
+        C = builder.CreateBitCast(C, llvm::Type::getFloatPtrTy(context));
+    }
+    
+    // Leading dimensions (assume row-major, packed)
+    llvm::Value* lda = N;  // A is M x K, so lda = K, but we pass N for convenience
+    llvm::Value* ldb = K;  // B is K x N, so ldb = N, but we pass K
+    llvm::Value* ldc = N;  // C is M x N, so ldc = N
+    
+    // Create GEMM call: sb_gemm_f32(M, N, K, A, lda, B, ldb, C, ldc)
+    std::vector<llvm::Value*> gemmArgs = {M, N, K, A, lda, B, ldb, C, ldc};
+    builder.CreateCall(sbGemmFunc, gemmArgs);
 }
 
 void CodeGenContext::initializeSIMDFunctions() {

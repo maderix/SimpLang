@@ -12,7 +12,7 @@ int main(int argc, char* argv[]) {
     
     try {
         runner.loadLibrary(argv[1]);
-        double result = runner.runKernel();
+        float result = runner.runKernel();
         
         std::cout << "Array Test Result: " << result << std::endl;
         

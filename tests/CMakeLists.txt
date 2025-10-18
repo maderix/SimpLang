@@ -91,6 +91,12 @@ function(add_sl_test name sl_file expected_result)
             readline
             history
     )
+    
+    # Special handling for SimpBLAS integration test
+    if(${name} STREQUAL "test_simpblas_integration")
+        target_link_libraries(${name}_runner PRIVATE simpblas)
+        message(STATUS "  Linking SimpBLAS for ${name}")
+    endif()
 
     # Add the object file to linker command
     target_link_options(${name}_runner
@@ -331,6 +337,7 @@ add_sl_test(test_array_comprehensive test_array_comprehensive.sl "4314.0")
 
 # SIMD array performance tests (result doesn't matter for perf tests, using 0.0)
 add_sl_test(test_baseline_perf test_baseline_perf.sl "0.0")
+add_sl_test(test_simpblas_integration test_simpblas_integration.sl "0.0")
 # add_sl_test(test_simd_perf test_simd_perf.sl "0.0") # DEPRECATED: old SIMD implementation
 
 # Add SIMD test - DEPRECATED: old SIMD implementation

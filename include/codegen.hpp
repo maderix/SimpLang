@@ -49,6 +49,7 @@ private:
     // SIMD support
     bool simd_enabled = false;
     void initializeMallocFree();
+    void initializeSimpBLASFunctions();
     void initializeSIMDFunctions();
     std::unique_ptr<SIMDInterface> simdInterface;
     
@@ -62,6 +63,14 @@ private:
     llvm::Function* mallocFunc;
     llvm::Function* freeFunc;
     llvm::Function* errorFunc;
+    
+    // SimpBLAS function declarations
+    llvm::Function* sbInitFunc;
+    llvm::Function* sbGemmFunc;
+    
+    // Helper functions for SimpBLAS operations
+    void generateGemmCall(llvm::Value* M, llvm::Value* N, llvm::Value* K, 
+                         llvm::Value* A, llvm::Value* B, llvm::Value* C);
 
     // Private initialization methods
     void initializeModuleAndPassManager();
@@ -83,6 +92,14 @@ private:
     std::shared_ptr<MemoryTracker> memoryTracker;
     std::map<std::string, llvm::DILocalVariable*> debugVariables;
     std::map<std::string, llvm::Value*> globalDebugValues;
+    
+    // Array element type tracking for opaque pointer compatibility
+    std::map<std::string, llvm::Type*> arrayElementTypes;
+    
+    // Global symbol table for global variables
+    std::map<std::string, llvm::Value*> globalSymbols;
+    
+
 
     bool integerContextFlag = false;
 
@@ -177,6 +194,13 @@ public:
     llvm::Value* getSymbolValue(const std::string& name);
     void dumpSymbols() const;
     void dumpBlocks() const;
+    
+    // Array element type tracking
+    void setArrayElementType(const std::string& name, llvm::Type* elementType);
+    llvm::Type* getArrayElementType(const std::string& name);
+    
+    // Track global variables that need lazy initialization (non-constant initializers)
+    std::map<std::string, llvm::Value*> lazyGlobalInitializers;
 
     // Scope and debug handling
     void enterFunction(llvm::Function* func, llvm::DISubprogram* debugInfo);

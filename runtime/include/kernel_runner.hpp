@@ -10,8 +10,8 @@
 
 class KernelRunner {
 public:
-    using KernelMainFunc = double (*)();
-    using KernelMainSIMDFunc = double (*)(SSESlice*, AVXSlice*);
+    using KernelMainFunc = float (*)();
+    using KernelMainSIMDFunc = float (*)(SSESlice*, AVXSlice*);
 
     KernelRunner() : handle_(nullptr), kernel_main_(nullptr), kernel_main_simd_(nullptr) {}
     virtual ~KernelRunner() {
@@ -35,8 +35,8 @@ public:
             kernel_main_simd_ = nullptr;
         }
 
-        // Load the shared library
-        handle_ = dlopen(path.c_str(), RTLD_NOW);
+        // Load the shared library with global symbols
+        handle_ = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
         if (!handle_) {
             throw std::runtime_error("Failed to load library: " + std::string(dlerror()));
         }
@@ -88,14 +88,14 @@ public:
         }
     }
 
-    double runKernel() {
+    float runKernel() {
         if (!kernel_main_) {
             throw std::runtime_error("No kernel loaded");
         }
         return kernel_main_();
     }
 
-    double runKernel(SSESlice* sse_slice, AVXSlice* avx_slice) {
+    float runKernel(SSESlice* sse_slice, AVXSlice* avx_slice) {
         if (!kernel_main_simd_) {
             throw std::runtime_error("No SIMD kernel loaded");
         }
