@@ -3,7 +3,7 @@
     #include <string>
     #include <vector>
     #include <iostream>
-    #include "ast.hpp"
+    #include "ast/ast.hpp"
     #include "simd_backend.hpp"
 
     BlockAST *programBlock;

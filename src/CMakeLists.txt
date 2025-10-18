@@ -7,16 +7,21 @@ BISON_TARGET(Parser parser.y ${CMAKE_CURRENT_BINARY_DIR}/parser.cpp
 FLEX_TARGET(Scanner lexer.l ${CMAKE_CURRENT_BINARY_DIR}/lexer.cpp)
 ADD_FLEX_BISON_DEPENDENCY(Scanner Parser)
 
+# Collect AST source files
+file(GLOB_RECURSE AST_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/ast/*.cpp
+)
+
 # Add executable
 add_executable(simplang
     main.cpp
-    ast.cpp
+    ${AST_SOURCES}
     codegen.cpp
     simd_ops.cpp
     simd_interface.cpp
     avx512_backend.cpp
     logger.cpp
-    
+
     ${BISON_Parser_OUTPUTS}
     ${FLEX_Scanner_OUTPUTS}
 )
@@ -24,6 +29,7 @@ add_executable(simplang
 # Include directories
 target_include_directories(simplang PRIVATE
     ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/include/ast
     ${CMAKE_CURRENT_BINARY_DIR}
     ${LLVM_INCLUDE_DIRS}
 )

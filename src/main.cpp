@@ -3,7 +3,7 @@
 #include <cstdio>
 #include <cstring>
 
-#include "ast.hpp"
+#include "ast/ast.hpp"
 #include "codegen.hpp"
 #include "parser.hpp"
 #include "logger.hpp"

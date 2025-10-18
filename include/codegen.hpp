@@ -14,7 +14,7 @@
 #include <llvm/IR/DIBuilder.h>
 #include <llvm/IR/DebugLoc.h>
 #include <llvm/IR/DebugInfo.h>
-#include "ast.hpp"
+#include "ast/ast.hpp"
 #include "memory_tracker.hpp"
 #include <map>
 #include <set>

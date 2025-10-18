@@ -1,6 +1,6 @@
 #include "logger.hpp"
 #include "codegen.hpp"
-#include "ast.hpp"
+#include "ast/ast.hpp"
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/raw_ostream.h>
