@@ -66,13 +66,14 @@
 %token SSE AVX
 
 %left TLBRACKET    /* For array subscripting */
+%left TCEQ TCNE TCLE TCGE '<' '>'  /* Comparison operators */
 %left '+' '-'
 %left '*' '/' TOK_MOD
 %left UNARY_MINUS  /* Add precedence for unary minus */
 
 %type <block> program stmts block
 %type <stmt> stmt func_decl if_stmt while_stmt return_stmt include_stmt
-%type <expr> expr numeric slice_expr slice_access call_expr vector_expr  /* Add vector_expr here */
+%type <expr> expr numeric slice_expr call_expr vector_expr  /* Add vector_expr here */
 %type <var_expr> ident
 %type <exprvec> call_args expr_list multi_index
 %type <varvec> func_decl_args
@@ -114,13 +115,13 @@ expr : expr '+' expr   { $$ = new BinaryExprAST(static_cast<BinaryOp>('+'), make
      | expr TCGE expr  { $$ = new BinaryExprAST(BinaryOp::OpGE, makeUnique($1), makeUnique($3)); }
      | TLPAREN expr TRPAREN { $$ = $2; }
      | ident '=' expr  { $$ = new AssignmentExprAST($1, makeUnique($3)); }
-     | slice_access '=' expr { 
-         $$ = new SliceStoreExprAST(
-             ((SliceAccessExprAST*)$1)->getName(), 
-             ((SliceAccessExprAST*)$1)->getIndex(), 
-             makeUnique($3)
-         ); 
-     }
+     // | slice_access '=' expr { 
+     //     $$ = new SliceStoreExprAST(
+     //         ((SliceAccessExprAST*)$1)->getName(), 
+     //         ((SliceAccessExprAST*)$1)->getIndex(), 
+     //         makeUnique($3)
+     //     ); 
+     // }
      | ident TLBRACKET multi_index TRBRACKET '=' expr {
          $$ = new ArrayStoreExprAST(
              std::make_unique<VariableExprAST>($1->getName()),
@@ -129,7 +130,7 @@ expr : expr '+' expr   { $$ = new BinaryExprAST(static_cast<BinaryOp>('+'), make
          );
      }
      | call_expr       { $$ = $1; }
-     | slice_access    { $$ = $1; }
+     // | slice_access    { $$ = $1; }
      | ident           { $$ = $1; }
      | numeric         { $$ = $1; }
      | slice_expr      { $$ = $1; }
@@ -226,9 +227,9 @@ slice_expr : TMAKE TLPAREN slice_type TCOMMA expr TRPAREN
             { $$ = new SliceExprAST($3->getType(), $5, $7); }
           ;
 
-slice_access : ident TLBRACKET expr TRBRACKET 
-             { $$ = new SliceAccessExprAST($1->getName(), $3); }
-          ;
+// slice_access : ident TLBRACKET expr TRBRACKET 
+//              { $$ = new SliceAccessExprAST($1->getName(), $3); }
+//           ;
 
 array_expr : TARRAY '<' type_spec '>' TLPAREN TLBRACKET expr_list TRBRACKET TRPAREN {
              $$ = new ArrayCreateExprAST(std::unique_ptr<TypeInfo>($3), makeUniqueVector(*$7));
