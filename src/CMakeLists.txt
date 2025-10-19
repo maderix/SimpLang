@@ -55,3 +55,14 @@ llvm_map_components_to_libnames(llvm_libs
 )
 
 target_link_libraries(simplang ${llvm_libs} simplang_runtime)
+
+# Add MLIR support if enabled
+if(USE_MLIR)
+    target_compile_definitions(simplang PRIVATE USE_MLIR)
+    target_include_directories(simplang PRIVATE
+        ${CMAKE_SOURCE_DIR}/include/mlir
+        ${CMAKE_BINARY_DIR}/src/mlir  # For generated .inc files
+        ${MLIR_INCLUDE_DIRS}
+    )
+    target_link_libraries(simplang simp_dialect)
+endif()

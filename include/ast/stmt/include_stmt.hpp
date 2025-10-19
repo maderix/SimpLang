@@ -10,6 +10,7 @@ public:
     IncludeStmtAST(const std::string& file) : filename(file) {}
     const std::string& getFilename() const { return filename; }
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
+    virtual ASTKind getKind() const override { return ASTKind::IncludeStmt; }
 };
 
 #endif // AST_STMT_INCLUDE_STMT_HPP

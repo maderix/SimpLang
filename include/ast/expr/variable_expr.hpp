@@ -19,6 +19,7 @@ public:
     unsigned getLine() const { return lineNo; }
 
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
+    virtual ASTKind getKind() const override { return ASTKind::VariableExpr; }
 };
 
 class AssignmentExprAST : public ExprAST {
@@ -28,6 +29,11 @@ public:
     AssignmentExprAST(VariableExprAST* lhs, std::unique_ptr<ExprAST> rhs)
         : lhs_(lhs), rhs_(std::move(rhs)) {}
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
+    virtual ASTKind getKind() const override { return ASTKind::AssignmentExpr; }
+
+    // Accessors for MLIR lowering
+    VariableExprAST* getLHS() const { return lhs_; }
+    ExprAST* getRHS() const { return rhs_.get(); }
 };
 
 #endif // AST_EXPR_VARIABLE_EXPR_HPP

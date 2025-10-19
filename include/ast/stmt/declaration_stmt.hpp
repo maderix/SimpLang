@@ -59,6 +59,7 @@ public:
     const TypeInfo* getStaticType() const { return staticType.get(); }
 
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
+    virtual ASTKind getKind() const override { return ASTKind::VariableDecl; }
 };
 
 #endif // AST_STMT_DECLARATION_STMT_HPP

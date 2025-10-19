@@ -16,6 +16,10 @@
 #include <llvm/Analysis/TargetTransformInfo.h>
 #include <llvm/Target/TargetMachine.h>
 
+#ifdef USE_MLIR
+#include "mlir/mlir_codegen.hpp"
+#endif
+
 extern BlockAST* programBlock;
 extern int yyparse();
 extern FILE* yyin;
@@ -23,15 +27,19 @@ extern FILE* yyin;
 int main(int argc, char** argv) {
     bool debug = false;
     bool printIR = false;
+    bool emitMLIR = false;
     std::string outputPath;
     std::string logLevel = "INFO";  // Default log level
 
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " source.sl [-o output] [-d] [--log-level LEVEL] [--print-ir]" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " source.sl [-o output] [-d] [--log-level LEVEL] [--print-ir] [--emit-mlir]" << std::endl;
         std::cerr << "  --log-level LEVEL: Set logging level (ERROR, WARNING, INFO, DEBUG, TRACE)" << std::endl;
         std::cerr << "  -q, --quiet:       Equivalent to --log-level ERROR" << std::endl;
         std::cerr << "  -v, --verbose:     Equivalent to --log-level DEBUG" << std::endl;
         std::cerr << "  --print-ir:        Print LLVM IR to console" << std::endl;
+#ifdef USE_MLIR
+        std::cerr << "  --emit-mlir:       Emit MLIR instead of LLVM IR" << std::endl;
+#endif
         return 1;
     }
 
@@ -59,6 +67,11 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "--print-ir") == 0) {
             printIR = true;
         }
+#ifdef USE_MLIR
+        else if (strcmp(argv[i], "--emit-mlir") == 0) {
+            emitMLIR = true;
+        }
+#endif
     }
     
     // Initialize logger
@@ -88,6 +101,56 @@ int main(int argc, char** argv) {
         std::cerr << "Error: No program block generated!" << std::endl;
         return 1;
     }
+
+#ifdef USE_MLIR
+    if (emitMLIR) {
+        LOG_INFO("MLIR mode enabled - generating MLIR...");
+
+        // Create MLIR code generation context
+        std::string moduleName = argv[1];
+        mlir::simp::MLIRCodeGenContext mlirContext(moduleName);
+
+        // Lower AST to MLIR
+        mlir::ModuleOp mlirModule = mlirContext.lowerAST(programBlock);
+
+        if (!mlirModule) {
+            std::cerr << "Error: Failed to lower AST to MLIR!" << std::endl;
+            return 1;
+        }
+
+        // Determine output path
+        std::string mlirFile;
+        if (!outputPath.empty()) {
+            size_t lastDot = outputPath.find_last_of('.');
+            mlirFile = outputPath.substr(0, lastDot) + ".mlir";
+        } else {
+            std::string inputPath = argv[1];
+            size_t lastDot = inputPath.find_last_of('.');
+            mlirFile = inputPath.substr(0, lastDot) + ".mlir";
+        }
+
+        // Write MLIR to file
+        std::error_code EC;
+        llvm::raw_fd_ostream dest(mlirFile, EC, llvm::sys::fs::OF_None);
+        if (EC) {
+            llvm::errs() << "Could not open file: " << EC.message() << "\n";
+            return 1;
+        }
+        mlirModule.print(dest);
+        dest.flush();
+        std::cout << "MLIR written to: " << mlirFile << std::endl;
+
+        // Also print to console if requested
+        if (printIR) {
+            std::cout << "\nGenerated MLIR:" << std::endl;
+            std::cout << "==================" << std::endl;
+            mlirModule.print(llvm::outs());
+            std::cout << "==================" << std::endl;
+        }
+
+        return 0;
+    }
+#endif
 
     LOG_INFO("Creating CodeGen context...");
     CodeGenContext context;

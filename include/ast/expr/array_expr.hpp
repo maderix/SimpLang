@@ -17,9 +17,11 @@ public:
         : elementType(std::move(elemType)), dimensionExprs(std::move(dimensions)) {}
 
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
+    virtual ASTKind getKind() const override { return ASTKind::ArrayCreateExpr; }
 
     TypeInfo* getElementType() const { return elementType.get(); }
     size_t getDimensionCount() const { return dimensionExprs.size(); }
+    const std::vector<std::unique_ptr<ExprAST>>& getDimensions() const { return dimensionExprs; }
 };
 
 class SIMDArrayCreateExprAST : public ExprAST {
@@ -34,6 +36,7 @@ public:
         : elementType(std::move(elemType)), simdHint(simd), dimensionExprs(std::move(dimensions)) {}
 
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
+    virtual ASTKind getKind() const override { return ASTKind::ArrayCreateExpr; }
 
     TypeInfo* getElementType() const { return elementType.get(); }
     SIMDType getSIMDHint() const { return simdHint; }
@@ -51,8 +54,11 @@ public:
         : array(std::move(arrayExpr)), indices(std::move(idxExprs)) {}
 
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
+    virtual ASTKind getKind() const override { return ASTKind::ArrayAccessExpr; }
 
     bool hasVectorSlice() const;
+    ExprAST* getArray() const { return array.get(); }
+    const std::vector<std::unique_ptr<ExprAST>>& getIndices() const { return indices; }
 };
 
 // Array element assignment: arr[i, j, k] = value
@@ -68,6 +74,7 @@ public:
         : array(std::move(arrayExpr)), indices(std::move(idxExprs)), value(std::move(val)) {}
 
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
+    virtual ASTKind getKind() const override { return ASTKind::ArrayStoreExpr; }
 };
 
 #endif // AST_EXPR_ARRAY_EXPR_HPP

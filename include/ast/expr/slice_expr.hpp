@@ -13,6 +13,9 @@ public:
     virtual ~SliceTypeAST() {}
 
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
+    virtual ASTKind getKind() const override {
+        return type == SliceType::SSE_SLICE ? ASTKind::SSESliceExpr : ASTKind::AVXSliceExpr;
+    }
     SliceType getType() const { return type; }
 };
 
@@ -31,6 +34,9 @@ public:
     }
 
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
+    virtual ASTKind getKind() const override {
+        return type == SliceType::SSE_SLICE ? ASTKind::SSESliceExpr : ASTKind::AVXSliceExpr;
+    }
 
     SliceType getType() const { return type; }
     ExprAST* getLength() const { return length; }
@@ -49,6 +55,7 @@ public:
     }
 
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
+    virtual ASTKind getKind() const override { return ASTKind::SliceGetExpr; }
 
     const std::string& getName() const { return slice_name; }
     ExprAST* getIndex() const { return index; }
@@ -62,6 +69,7 @@ public:
     SliceStoreExprAST(const std::string& name, ExprAST* idx, std::unique_ptr<ExprAST> val)
         : slice_name_(name), index_(idx), value_(std::move(val)) {}
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
+    virtual ASTKind getKind() const override { return ASTKind::SliceSetExpr; }
 };
 
 #endif // AST_EXPR_SLICE_EXPR_HPP

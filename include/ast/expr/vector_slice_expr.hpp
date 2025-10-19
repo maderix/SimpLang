@@ -15,6 +15,7 @@ public:
         : start(std::move(startExpr)), end(std::move(endExpr)) {}
 
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
+    virtual ASTKind getKind() const override { return ASTKind::VectorSliceExpr; }
 
     ExprAST* getStart() const { return start.get(); }
     ExprAST* getEnd() const { return end.get(); }

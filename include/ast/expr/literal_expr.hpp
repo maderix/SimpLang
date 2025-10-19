@@ -10,6 +10,7 @@ public:
     NumberExprAST(double value, bool isInt = false)
         : value(value), isInteger(isInt) {}
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
+    virtual ASTKind getKind() const override { return ASTKind::NumberExpr; }
     bool isIntegerLiteral() const { return isInteger; }
     double getValue() const { return value; }
 };

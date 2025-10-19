@@ -12,6 +12,11 @@ public:
     CallExprAST(const std::string& callee, const std::vector<ExprAST*>& args)
         : callee(callee), arguments(args) {}
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
+    virtual ASTKind getKind() const override { return ASTKind::CallExpr; }
+
+    // Accessors for MLIR lowering
+    const std::string& getCallee() const { return callee; }
+    const std::vector<ExprAST*>& getArguments() const { return arguments; }
 };
 
 #endif // AST_EXPR_CALL_EXPR_HPP

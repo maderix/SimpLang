@@ -11,6 +11,7 @@ public:
     UnaryExprAST(UnaryOp op, std::unique_ptr<ExprAST> operand)
         : op_(op), operand_(std::move(operand)) {}
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
+    virtual ASTKind getKind() const override { return ASTKind::UnaryExpr; }
 };
 
 class BinaryExprAST : public ExprAST {
@@ -23,7 +24,13 @@ public:
                   std::unique_ptr<ExprAST> right)
         : op_(op), left_(std::move(left)), right_(std::move(right)) {}
 
+    // Accessors for MLIR lowering
+    BinaryOp getOp() const { return op_; }
+    ExprAST* getLeft() const { return left_.get(); }
+    ExprAST* getRight() const { return right_.get(); }
+
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
+    virtual ASTKind getKind() const override { return ASTKind::BinaryExpr; }
 };
 
 #endif // AST_EXPR_OPERATOR_EXPR_HPP

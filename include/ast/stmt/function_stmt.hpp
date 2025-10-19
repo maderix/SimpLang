@@ -26,7 +26,13 @@ public:
     TypeKind getReturnTypeKind() const { return returnType ? returnType->kind : TypeKind::Dynamic; }
     const TypeInfo* getReturnType() const { return returnType.get(); }
 
+    // Accessors for MLIR lowering
+    const std::string& getName() const { return name; }
+    const std::vector<VariableDeclarationAST*>& getArguments() const { return arguments; }
+    BlockAST* getBody() const { return body; }
+
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
+    virtual ASTKind getKind() const override { return ASTKind::FunctionDecl; }
 };
 
 #endif // AST_STMT_FUNCTION_STMT_HPP
