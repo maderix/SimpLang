@@ -21,7 +21,7 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 // Simp_ConstantOp
 //===----------------------------------------------------------------------===//
 
-def Simp_ConstantOp : Simp_Op<"constant", [NoSideEffect]> {
+def Simp_ConstantOp : Simp_Op<"constant", [NoSideEffect, ConstantLike]> {
   let summary = "Constant value";
 
   let description = [{
@@ -159,6 +159,53 @@ def Simp_DivOp : Simp_Op<"div", [NoSideEffect]> {
   let hasCanonicalizer = 1;
 }
 
+def Simp_ModOp : Simp_Op<"mod", [NoSideEffect]> {
+  let summary = "Modulo operation";
+
+  let description = [{
+    The `simp.mod` operation performs the modulo (remainder) operation.
+
+    Examples:
+    ```mlir
+    %0 = simp.mod %a, %b : (f64, f64) -> f64
+    %1 = simp.mod %x, %y : (i32, i32) -> i32
+    ```
+
+    Lowering:
+    - Phase 1: Lower to arith.remf (floats) or arith.remsi (signed integers)
+    - Canonicalization: Fold constant modulos
+  }];
+
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs);
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
+  let hasCanonicalizer = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// Simp_NegOp
+//===----------------------------------------------------------------------===//
+
+def Simp_NegOp : Simp_Op<"neg", [NoSideEffect]> {
+  let summary = "Unary negation operation";
+  let description = [{
+    The `simp.neg` operation performs unary negation on a value.
+
+    Example:
+    ```mlir
+    %result = simp.neg %value : f64 -> f64
+    ```
+  }];
+
+  let arguments = (ins AnyType:$operand);
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = [{
+    $operand attr-dict `:` type($operand) `->` type($result)
+  }];
+}
+
 //===----------------------------------------------------------------------===//
 // Simp_ArrayCreateOp
 //===----------------------------------------------------------------------===//
@@ -280,46 +327,47 @@ def Simp_MatMulOp : Simp_Op<"matmul", [NoSideEffect]> {
 
   let description = [{
     The `simp.matmul` operation performs matrix multiplication (GEMM).
-    This is a placeholder operation for Phase 1, with full implementation
-    in Phase 3.
 
     Examples:
     ```mlir
-    %C = simp.matmul %A, %B : !simp.array<f32>, !simp.array<f32> -> !simp.array<f32>
+    %C = simp.matmul %A, %B, %m, %k, %n : (!simp.array<f32>, !simp.array<f32>, i64, i64, i64) -> !simp.array<f32>
     ```
 
     Mathematical Operation:
       C = A × B
-      Where A is MxK, B is KxN, C is MxN
+      Where A is MxK (stored as 1D array of M*K elements)
+            B is KxN (stored as 1D array of K*N elements)
+            C is MxN (stored as 1D array of M*N elements)
 
-    Phase 1 Implementation:
-    - Placeholder lowering to naive nested loops
-    - Basic functionality testing
+    Arrays are interpreted as row-major matrices.
 
-    Phase 3 Implementation (SimpBLAS Integration):
-    - Lower to linalg.matmul
-    - Apply fusion and tiling optimizations
-    - Late lowering to sb_gemm_f32 via pattern matching
-
-    Lowering Path (Phase 3):
+    Lowering Path:
     ```
     simp.matmul
-      → linalg.matmul (via LowerSimpToLinalgPass)
+      → linalg.matmul (via ConvertSimpToLinalg)
       → [fusion + tiling optimizations]
-      → sb_gemm_f32 (via LinalgToSimpBLASPass, LATE!)
+      → loops + arith ops
     ```
 
-    Critical Design Note:
-    - SimpBLAS lowering must happen LATE (after fusion/tiling)
-    - Early lowering to BLAS freezes the graph
-    - See mlir_implementation_notes.md for rationale
+    Session 9 Implementation:
+    - Lower to linalg.matmul for optimization
+    - Use memref.reinterpret_cast for 2D view creation
   }];
 
-  let arguments = (ins Simp_ArrayType:$lhs, Simp_ArrayType:$rhs);
-  let results = (outs Simp_ArrayType:$result);
+  let arguments = (ins
+    Simp_ArrayType:$lhs,    // A: MxK matrix as 1D array
+    Simp_ArrayType:$rhs,    // B: KxN matrix as 1D array
+    Simp_ArrayType:$output, // C: MxN matrix as 1D array (pre-allocated output buffer)
+    I64:$m,                 // Rows of A
+    I64:$k,                 // Cols of A / Rows of B
+    I64:$n                  // Cols of B
+  );
+  let results = (outs Simp_ArrayType:$result);  // Returns the same output buffer (for chaining)
 
-  // Custom assembly format: simp.matmul <lhs>, <rhs> : (<lhs-type>, <rhs-type>) -> <result-type>
-  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, $result)";
+  let assemblyFormat = [{
+    $lhs `,` $rhs `,` $output `,` $m `,` $k `,` $n attr-dict `:`
+    `(` type($lhs) `,` type($rhs) `,` type($output) `,` type($m) `,` type($k) `,` type($n) `)` `->` type($result)
+  }];
 }
 
 #endif // SIMP_OPS

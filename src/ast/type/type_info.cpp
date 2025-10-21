@@ -41,3 +41,11 @@ std::string TypeInfo::toString() const {
         default:                return "unknown";
     }
 }
+
+// ArrayTypeInfo override for proper MLIR type conversion
+std::string ArrayTypeInfo::toString() const {
+    if (elementType) {
+        return "array<" + elementType->toString() + ">";
+    }
+    return "array";
+}

@@ -18,6 +18,7 @@
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Dialect/StandardOps/IR/Ops.h"  // For FuncOp in MLIR 14
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 #include <memory>
@@ -30,8 +31,11 @@ class NumberExprAST;
 class VariableExprAST;
 class AssignmentExprAST;
 class BinaryExprAST;
+class UnaryExprAST;
 class ArrayCreateExprAST;
 class ArrayAccessExprAST;
+class ArrayStoreExprAST;
+class MatMulExprAST;
 class CallExprAST;
 class VariableDeclarationAST;
 class ReturnAST;
@@ -133,12 +137,21 @@ public:
   /// Lower a binary operation (add, sub, mul, div)
   mlir::Value lowerBinaryOp(BinaryExprAST* binOp);
 
+  /// Lower a unary operation (neg)
+  mlir::Value lowerUnaryOp(UnaryExprAST* unaryOp);
+
   /// Lower an array creation expression
   mlir::Value lowerArrayCreate(ArrayCreateExprAST* arrayCreate);
 
   /// Lower an array access expression (get or set)
   mlir::Value lowerArrayAccess(ArrayAccessExprAST* arrayAccess,
                                 mlir::Value newValue = nullptr);
+
+  /// Lower an array store expression (arr[idx] = val)
+  mlir::Value lowerArrayStore(ArrayStoreExprAST* arrayStore);
+
+  /// Lower a matrix multiplication expression
+  mlir::Value lowerMatMul(MatMulExprAST* matmul);
 
   /// Lower a function call
   mlir::Value lowerCall(CallExprAST* call);
@@ -161,6 +174,25 @@ public:
 
   /// Lower an expression statement
   mlir::LogicalResult lowerExpressionStmt(ExpressionStmtAST* exprStmt);
+
+  //===--------------------------------------------------------------------===//
+  // Control Flow Helpers
+  //===--------------------------------------------------------------------===//
+
+  /// Track variables modified in a scope (for if/while value passing)
+  /// Only tracks modifications to variables that already exist in the symbol table
+  std::set<std::string> trackModifiedVariables(BlockAST* block,
+                                                 const std::set<std::string>& existingVars);
+
+  /// Get all currently declared variable names
+  std::set<std::string> getCurrentVariableNames() const;
+
+  /// Collect current values of variables (for yielding from if/while)
+  std::vector<mlir::Value> collectVariableValues(const std::set<std::string>& varNames);
+
+  /// Update symbol table with yielded values from control flow
+  void updateSymbolTableWithResults(const std::set<std::string>& varNames,
+                                     mlir::ValueRange results);
 
   //===--------------------------------------------------------------------===//
   // Type Conversion Helpers

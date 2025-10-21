@@ -132,17 +132,17 @@ mlir::Type MLIRCodeGenContext::convertType(const std::string& simpType) {
   if (simpType.find("tensor<") == 0) {
     // Parse shape and element type
     // For now, return a placeholder - full parsing in future
-    return mlir::simp::SimpTensorType::get(&mlirContext, {-1}, builder.getF64Type());
+    return mlir::simp::SimpTensorType::get(&mlirContext, {-1}, builder.getF32Type());
   }
 
-  // Default to f64
-  llvm::errs() << "Warning: Unknown type '" << simpType << "', defaulting to f64\n";
-  return builder.getF64Type();
+  // Default to f32 (matches existing SimpLang compiler)
+  llvm::errs() << "Warning: Unknown type '" << simpType << "', defaulting to f32\n";
+  return builder.getF32Type();
 }
 
 mlir::Type MLIRCodeGenContext::getMLIRType(TypeInfo* typeInfo) {
   if (!typeInfo) {
-    return builder.getF64Type(); // Default
+    return builder.getF32Type(); // Default (matches existing compiler)
   }
 
   // Use the toString() method from TypeInfo
@@ -167,7 +167,7 @@ mlir::Type MLIRCodeGenContext::getElementType(const std::string& typeStr) {
     }
   }
 
-  return builder.getF64Type();
+  return builder.getF32Type();
 }
 
 //===----------------------------------------------------------------------===//
@@ -244,6 +244,9 @@ mlir::Value MLIRCodeGenContext::lowerExpression(ExprAST* expr) {
     case ASTKind::BinaryExpr:
       return lowerBinaryOp(static_cast<BinaryExprAST*>(expr));
 
+    case ASTKind::UnaryExpr:
+      return lowerUnaryOp(static_cast<UnaryExprAST*>(expr));
+
     case ASTKind::CallExpr:
       return lowerCall(static_cast<CallExprAST*>(expr));
 
@@ -253,8 +256,15 @@ mlir::Value MLIRCodeGenContext::lowerExpression(ExprAST* expr) {
     case ASTKind::ArrayAccessExpr:
       return lowerArrayAccess(static_cast<ArrayAccessExprAST*>(expr));
 
+    case ASTKind::ArrayStoreExpr:
+      return lowerArrayStore(static_cast<ArrayStoreExprAST*>(expr));
+
+    case ASTKind::MatMulExpr:
+      return lowerMatMul(static_cast<MatMulExprAST*>(expr));
+
     default:
-      llvm::errs() << "Error: Unsupported expression kind in MLIR lowering\n";
+      llvm::errs() << "Error: Unsupported expression kind " << static_cast<int>(expr->getKind())
+                   << " in MLIR lowering\n";
       return nullptr;
   }
 }
@@ -264,7 +274,7 @@ mlir::Value MLIRCodeGenContext::lowerLiteral(NumberExprAST* literal) {
 
   // Determine type based on the literal value using accessor
   double val = literal->getValue();
-  mlir::Type type = builder.getF64Type();
+  mlir::Type type = builder.getF32Type(); // Default float type (matches existing compiler)
   mlir::Attribute value;
 
   // Check if it's an integer or floating-point
@@ -273,8 +283,9 @@ mlir::Value MLIRCodeGenContext::lowerLiteral(NumberExprAST* literal) {
     type = builder.getI64Type();
     value = builder.getI64IntegerAttr(static_cast<int64_t>(val));
   } else {
-    // Floating-point value
-    value = builder.getF64FloatAttr(val);
+    // Floating-point value - use f32 to match existing compiler
+    type = builder.getF32Type();
+    value = builder.getF32FloatAttr(static_cast<float>(val));
   }
 
   // Create simp.constant operation
@@ -336,27 +347,82 @@ mlir::Value MLIRCodeGenContext::lowerBinaryOp(BinaryExprAST* binOp) {
 
     // Comparison operations - use arith dialect
     // Result type is always i1 (boolean) for comparisons
+    // Need to check operand type: use CmpIOp for integers, CmpFOp for floats
     case OpLT:
-      return builder.create<mlir::arith::CmpFOp>(
-          loc, mlir::arith::CmpFPredicate::OLT, lhs, rhs);
+      if (lhs.getType().isa<mlir::IntegerType>()) {
+        return builder.create<mlir::arith::CmpIOp>(
+            loc, mlir::arith::CmpIPredicate::slt, lhs, rhs);
+      } else {
+        return builder.create<mlir::arith::CmpFOp>(
+            loc, mlir::arith::CmpFPredicate::OLT, lhs, rhs);
+      }
     case OpGT:
-      return builder.create<mlir::arith::CmpFOp>(
-          loc, mlir::arith::CmpFPredicate::OGT, lhs, rhs);
+      if (lhs.getType().isa<mlir::IntegerType>()) {
+        return builder.create<mlir::arith::CmpIOp>(
+            loc, mlir::arith::CmpIPredicate::sgt, lhs, rhs);
+      } else {
+        return builder.create<mlir::arith::CmpFOp>(
+            loc, mlir::arith::CmpFPredicate::OGT, lhs, rhs);
+      }
     case OpLE:
-      return builder.create<mlir::arith::CmpFOp>(
-          loc, mlir::arith::CmpFPredicate::OLE, lhs, rhs);
+      if (lhs.getType().isa<mlir::IntegerType>()) {
+        return builder.create<mlir::arith::CmpIOp>(
+            loc, mlir::arith::CmpIPredicate::sle, lhs, rhs);
+      } else {
+        return builder.create<mlir::arith::CmpFOp>(
+            loc, mlir::arith::CmpFPredicate::OLE, lhs, rhs);
+      }
     case OpGE:
-      return builder.create<mlir::arith::CmpFOp>(
-          loc, mlir::arith::CmpFPredicate::OGE, lhs, rhs);
+      if (lhs.getType().isa<mlir::IntegerType>()) {
+        return builder.create<mlir::arith::CmpIOp>(
+            loc, mlir::arith::CmpIPredicate::sge, lhs, rhs);
+      } else {
+        return builder.create<mlir::arith::CmpFOp>(
+            loc, mlir::arith::CmpFPredicate::OGE, lhs, rhs);
+      }
     case OpEQ:
-      return builder.create<mlir::arith::CmpFOp>(
-          loc, mlir::arith::CmpFPredicate::OEQ, lhs, rhs);
+      if (lhs.getType().isa<mlir::IntegerType>()) {
+        return builder.create<mlir::arith::CmpIOp>(
+            loc, mlir::arith::CmpIPredicate::eq, lhs, rhs);
+      } else {
+        return builder.create<mlir::arith::CmpFOp>(
+            loc, mlir::arith::CmpFPredicate::OEQ, lhs, rhs);
+      }
     case OpNE:
-      return builder.create<mlir::arith::CmpFOp>(
-          loc, mlir::arith::CmpFPredicate::ONE, lhs, rhs);
+      if (lhs.getType().isa<mlir::IntegerType>()) {
+        return builder.create<mlir::arith::CmpIOp>(
+            loc, mlir::arith::CmpIPredicate::ne, lhs, rhs);
+      } else {
+        return builder.create<mlir::arith::CmpFOp>(
+            loc, mlir::arith::CmpFPredicate::ONE, lhs, rhs);
+      }
 
     default:
       llvm::errs() << "Error: Unsupported binary operator: " << binOp->getOp() << "\n";
+      return nullptr;
+  }
+}
+
+mlir::Value MLIRCodeGenContext::lowerUnaryOp(UnaryExprAST* unaryOp) {
+  auto loc = getUnknownLocation();
+
+  // Lower the operand
+  mlir::Value operand = lowerExpression(unaryOp->getOperand());
+  if (!operand) {
+    llvm::errs() << "Error: Failed to lower unary operand\n";
+    return nullptr;
+  }
+
+  // Get result type (same as operand type for negation)
+  mlir::Type resultType = operand.getType();
+
+  // Handle the unary operation
+  switch (unaryOp->getOp()) {
+    case OpNeg:
+      return builder.create<mlir::simp::NegOp>(loc, resultType, operand);
+
+    default:
+      llvm::errs() << "Error: Unsupported unary operator: " << unaryOp->getOp() << "\n";
       return nullptr;
   }
 }
@@ -428,6 +494,111 @@ mlir::Value MLIRCodeGenContext::lowerArrayAccess(ArrayAccessExprAST* arrayAccess
     mlir::Type elemType = arrayType.getElementType();
     return builder.create<mlir::simp::ArrayGetOp>(loc, elemType, array, index);
   }
+}
+
+mlir::Value MLIRCodeGenContext::lowerArrayStore(ArrayStoreExprAST* arrayStore) {
+  auto loc = getUnknownLocation();
+
+  // Check if we're storing to a variable (need to update symbol table)
+  std::string varName;
+  if (arrayStore->getArray()->getKind() == ASTKind::VariableExpr) {
+    auto* varExpr = static_cast<VariableExprAST*>(arrayStore->getArray());
+    varName = varExpr->getName();
+  }
+
+  // Lower the array expression
+  mlir::Value array = lowerExpression(arrayStore->getArray());
+  if (!array) {
+    llvm::errs() << "Error: Failed to lower array expression in store\n";
+    return nullptr;
+  }
+
+  // Lower the index expression (first index for now)
+  const auto& indices = arrayStore->getIndices();
+  if (indices.empty()) {
+    llvm::errs() << "Error: Array store requires at least one index\n";
+    return nullptr;
+  }
+
+  mlir::Value index = lowerExpression(indices[0].get());
+  if (!index) {
+    llvm::errs() << "Error: Failed to lower array index in store\n";
+    return nullptr;
+  }
+
+  // Lower the value to store
+  mlir::Value value = lowerExpression(arrayStore->getValue());
+  if (!value) {
+    llvm::errs() << "Error: Failed to lower value in array store\n";
+    return nullptr;
+  }
+
+  // Create simp.array_set operation (returns new array in SSA form)
+  mlir::Value newArray = builder.create<mlir::simp::ArraySetOp>(
+      loc, array.getType(), array, index, value);
+
+  // Update the symbol table if storing to a variable
+  if (!varName.empty()) {
+    declareVariable(varName, newArray);
+  }
+
+  return newArray;
+}
+
+mlir::Value MLIRCodeGenContext::lowerMatMul(MatMulExprAST* matmul) {
+  auto loc = getUnknownLocation();
+
+  // Lower the left-hand side matrix (A: MxK)
+  mlir::Value lhs = lowerExpression(matmul->getLHS());
+  if (!lhs) {
+    llvm::errs() << "Error: Failed to lower matmul LHS\n";
+    return nullptr;
+  }
+
+  // Lower the right-hand side matrix (B: KxN)
+  mlir::Value rhs = lowerExpression(matmul->getRHS());
+  if (!rhs) {
+    llvm::errs() << "Error: Failed to lower matmul RHS\n";
+    return nullptr;
+  }
+
+  // Lower the dimension arguments: m, k, n
+  mlir::Value m = lowerExpression(matmul->getM());
+  if (!m) {
+    llvm::errs() << "Error: Failed to lower matmul dimension m\n";
+    return nullptr;
+  }
+
+  mlir::Value k = lowerExpression(matmul->getK());
+  if (!k) {
+    llvm::errs() << "Error: Failed to lower matmul dimension k\n";
+    return nullptr;
+  }
+
+  mlir::Value n = lowerExpression(matmul->getN());
+  if (!n) {
+    llvm::errs() << "Error: Failed to lower matmul dimension n\n";
+    return nullptr;
+  }
+
+  // Lower the output buffer (pre-allocated by caller)
+  mlir::Value output = lowerExpression(matmul->getOutput());
+  if (!output) {
+    llvm::errs() << "Error: Failed to lower matmul output buffer\n";
+    return nullptr;
+  }
+
+  // Get the array type
+  auto arrayType = output.getType().dyn_cast<mlir::simp::ArrayType>();
+  if (!arrayType) {
+    llvm::errs() << "Error: MatMul output is not an array type\n";
+    return nullptr;
+  }
+
+  // Create the simp.matmul operation
+  // The output buffer is pre-allocated - matmul writes in-place
+  return builder.create<mlir::simp::MatMulOp>(
+      loc, arrayType, lhs, rhs, output, m, k, n);
 }
 
 mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
@@ -559,22 +730,37 @@ mlir::LogicalResult MLIRCodeGenContext::lowerIf(IfAST* ifStmt) {
   }
 
   // The condition must be i1 type for scf.if
-  // If it's not, we need to convert it (e.g., compare with zero)
   if (!condition.getType().isInteger(1)) {
-    // Convert to boolean by comparing with 0.0
-    mlir::Value zero = builder.create<mlir::simp::ConstantOp>(
-        loc, condition.getType(),
-        builder.getZeroAttr(condition.getType()));
-
-    // Create a comparison (not equal to zero means true)
-    // For now, assume f64 - we'd use arith.cmpf in a full implementation
-    // Since we don't have comparison ops in simp dialect yet,
-    // we'll just document this limitation
-    llvm::errs() << "Warning: Boolean conversion not fully implemented, assuming i1 type\n";
+    // For now, we'll just warn about this limitation
+    llvm::errs() << "Warning: Non-boolean condition in if statement\n";
   }
 
-  // Create the scf.if operation
-  auto ifOp = builder.create<mlir::scf::IfOp>(loc, condition, /*withElseRegion=*/ifStmt->getElseBlock() != nullptr);
+  // Get the set of variables that exist before the if statement
+  auto existingVars = getCurrentVariableNames();
+
+  // Track which variables are modified in the if/else blocks
+  // Only track modifications to pre-existing variables (not new locals)
+  auto thenModified = trackModifiedVariables(ifStmt->getThenBlock(), existingVars);
+  auto elseModified = trackModifiedVariables(ifStmt->getElseBlock(), existingVars);
+
+  // Find the union of variables modified in either branch
+  std::set<std::string> allModified;
+  allModified.insert(thenModified.begin(), thenModified.end());
+  allModified.insert(elseModified.begin(), elseModified.end());
+
+  // Collect initial values of modified variables (for else branch defaults)
+  std::vector<mlir::Value> initialValues = collectVariableValues(allModified);
+
+  // Determine result types for the scf.if operation
+  llvm::SmallVector<mlir::Type, 4> resultTypes;
+  for (const auto& value : initialValues) {
+    resultTypes.push_back(value.getType());
+  }
+
+  // Create the scf.if operation with result types
+  auto ifOp = builder.create<mlir::scf::IfOp>(
+      loc, resultTypes, condition,
+      /*withElseRegion=*/true);  // Always create else region when we have results
 
   // Lower the then block
   {
@@ -591,29 +777,73 @@ mlir::LogicalResult MLIRCodeGenContext::lowerIf(IfAST* ifStmt) {
         }
       }
     }
+
+    // Collect final values of modified variables for yielding
+    std::vector<mlir::Value> thenValues;
+    for (const auto& varName : allModified) {
+      mlir::Value value = lookupVariable(varName);
+      if (!value) {
+        // Variable wasn't modified in then branch, use initial value
+        auto it = std::find(allModified.begin(), allModified.end(), varName);
+        size_t idx = std::distance(allModified.begin(), it);
+        value = initialValues[idx];
+      }
+      thenValues.push_back(value);
+    }
+
     popScope();
 
-    // Add yield to terminate the region
-    builder.create<mlir::scf::YieldOp>(loc);
+    // Terminate with scf.yield, passing the modified values
+    builder.create<mlir::scf::YieldOp>(loc, thenValues);
   }
 
-  // Lower the else block if it exists
-  if (ifStmt->getElseBlock()) {
+  // Lower the else block
+  {
     mlir::OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
 
-    pushScope();
-    BlockAST* elseBlock = ifStmt->getElseBlock();
-    for (auto* stmt : elseBlock->statements) {
-      if (failed(lowerStatement(stmt))) {
-        popScope();
-        return mlir::failure();
+    if (ifStmt->getElseBlock()) {
+      pushScope();
+      BlockAST* elseBlock = ifStmt->getElseBlock();
+      for (auto* stmt : elseBlock->statements) {
+        if (failed(lowerStatement(stmt))) {
+          popScope();
+          return mlir::failure();
+        }
       }
-    }
-    popScope();
 
-    // Add yield to terminate the region
-    builder.create<mlir::scf::YieldOp>(loc);
+      // Collect final values of modified variables for yielding
+      std::vector<mlir::Value> elseValues;
+      for (const auto& varName : allModified) {
+        mlir::Value value = lookupVariable(varName);
+        if (!value) {
+          // Variable wasn't modified in else branch, use initial value
+          auto it = std::find(allModified.begin(), allModified.end(), varName);
+          size_t idx = std::distance(allModified.begin(), it);
+          value = initialValues[idx];
+        }
+        elseValues.push_back(value);
+      }
+
+      popScope();
+
+      // Terminate with scf.yield, passing the modified values
+      builder.create<mlir::scf::YieldOp>(loc, elseValues);
+    } else {
+      // No else block - create implicit else that yields initial values
+      std::vector<mlir::Value> elseValues(initialValues);
+      builder.create<mlir::scf::YieldOp>(loc, elseValues);
+    }
+  }
+
+  // Update symbol table with the results from scf.if
+  if (!allModified.empty()) {
+    // Extract modified variable values
+    std::vector<mlir::Value> modifiedResults;
+    for (size_t i = 0; i < allModified.size(); ++i) {
+      modifiedResults.push_back(ifOp.getResult(i));
+    }
+    updateSymbolTableWithResults(allModified, modifiedResults);
   }
 
   return mlir::success();
@@ -622,39 +852,98 @@ mlir::LogicalResult MLIRCodeGenContext::lowerIf(IfAST* ifStmt) {
 mlir::LogicalResult MLIRCodeGenContext::lowerWhile(WhileAST* whileLoop) {
   auto loc = getUnknownLocation();
 
-  // Create the scf.while operation
+  // Get the set of variables that exist before the while loop
+  auto existingVars = getCurrentVariableNames();
+
+  // Track which variables are modified in the loop body
+  // Only track modifications to pre-existing variables (not new loop locals)
+  auto modifiedVars = trackModifiedVariables(whileLoop->getBody(), existingVars);
+
+  // Collect initial values of loop-carried variables
+  std::vector<mlir::Value> initialValues = collectVariableValues(modifiedVars);
+
+  // Determine types for iter_args
+  llvm::SmallVector<mlir::Type, 4> iterTypes;
+  for (const auto& value : initialValues) {
+    iterTypes.push_back(value.getType());
+  }
+
+  // Create the scf.while operation with iter_args
   // scf.while has two regions: "before" (condition) and "after" (body)
-  auto whileOp = builder.create<mlir::scf::WhileOp>(loc, llvm::None, llvm::None);
+  auto whileOp = builder.create<mlir::scf::WhileOp>(loc, iterTypes, initialValues);
 
   // Build the "before" region (condition check)
   {
     mlir::OpBuilder::InsertionGuard guard(builder);
     mlir::Block* beforeBlock = builder.createBlock(&whileOp.getBefore());
+
+    // Add block arguments for loop-carried values
+    for (auto type : iterTypes) {
+      beforeBlock->addArgument(type, loc);
+    }
+
     builder.setInsertionPointToStart(beforeBlock);
+
+    // Update symbol table with block arguments
+    pushScope();
+    auto varIt = modifiedVars.begin();
+    for (size_t i = 0; i < beforeBlock->getNumArguments(); ++i, ++varIt) {
+      declareVariable(*varIt, beforeBlock->getArgument(i));
+    }
 
     // Lower the condition
     mlir::Value condition = lowerExpression(whileLoop->getCondition());
     if (!condition) {
       llvm::errs() << "Error: Failed to lower while condition\n";
+      popScope();
       return mlir::failure();
     }
 
     // The condition must be i1 type
     if (!condition.getType().isInteger(1)) {
-      llvm::errs() << "Warning: Boolean conversion not fully implemented for while, assuming i1 type\n";
+      llvm::errs() << "Warning: Non-boolean condition in while loop\n";
     }
 
-    // Terminate with scf.condition
-    builder.create<mlir::scf::ConditionOp>(loc, condition, llvm::None);
+    // Collect current values for passing to loop body
+    std::vector<mlir::Value> conditionValues;
+    for (const auto& varName : modifiedVars) {
+      mlir::Value value = lookupVariable(varName);
+      if (!value) {
+        // Use the block argument if not found
+        auto it = std::find(modifiedVars.begin(), modifiedVars.end(), varName);
+        size_t idx = std::distance(modifiedVars.begin(), it);
+        value = beforeBlock->getArgument(idx);
+      }
+      conditionValues.push_back(value);
+    }
+
+    popScope();
+
+    // Terminate with scf.condition, passing values to the body
+    builder.create<mlir::scf::ConditionOp>(loc, condition, conditionValues);
   }
 
   // Build the "after" region (loop body)
   {
     mlir::OpBuilder::InsertionGuard guard(builder);
     mlir::Block* afterBlock = builder.createBlock(&whileOp.getAfter());
+
+    // Add block arguments for loop-carried values
+    for (auto type : iterTypes) {
+      afterBlock->addArgument(type, loc);
+    }
+
     builder.setInsertionPointToStart(afterBlock);
 
     pushScope();
+
+    // Update symbol table with block arguments
+    auto varIt = modifiedVars.begin();
+    for (size_t i = 0; i < afterBlock->getNumArguments(); ++i, ++varIt) {
+      declareVariable(*varIt, afterBlock->getArgument(i));
+    }
+
+    // Lower the loop body
     BlockAST* body = whileLoop->getBody();
     if (body) {
       for (auto* stmt : body->statements) {
@@ -664,13 +953,175 @@ mlir::LogicalResult MLIRCodeGenContext::lowerWhile(WhileAST* whileLoop) {
         }
       }
     }
+
+    // Collect updated values for the next iteration
+    std::vector<mlir::Value> nextIterValues;
+    for (const auto& varName : modifiedVars) {
+      mlir::Value value = lookupVariable(varName);
+      if (!value) {
+        // This shouldn't happen if tracking is correct
+        auto it = std::find(modifiedVars.begin(), modifiedVars.end(), varName);
+        size_t idx = std::distance(modifiedVars.begin(), it);
+        value = afterBlock->getArgument(idx);
+      }
+      nextIterValues.push_back(value);
+    }
+
     popScope();
 
-    // Terminate with scf.yield
-    builder.create<mlir::scf::YieldOp>(loc);
+    // Terminate with scf.yield, passing updated values back to condition
+    builder.create<mlir::scf::YieldOp>(loc, nextIterValues);
+  }
+
+  // Update symbol table with the final results from the while loop
+  if (!modifiedVars.empty()) {
+    updateSymbolTableWithResults(modifiedVars, whileOp.getResults());
   }
 
   return mlir::success();
+}
+
+//===----------------------------------------------------------------------===//
+// Control Flow Helpers
+//===----------------------------------------------------------------------===//
+
+std::set<std::string> MLIRCodeGenContext::getCurrentVariableNames() const {
+  std::set<std::string> varNames;
+
+  // Collect all variable names from all scopes
+  for (const auto& scope : symbolTable) {
+    for (const auto& entry : scope) {
+      varNames.insert(entry.first);
+    }
+  }
+
+  return varNames;
+}
+
+std::set<std::string> MLIRCodeGenContext::trackModifiedVariables(
+    BlockAST* block, const std::set<std::string>& existingVars) {
+  std::set<std::string> modifiedVars;
+
+  if (!block) return modifiedVars;
+
+  // Scan through all statements to find assignments to existing variables
+  for (auto* stmt : block->statements) {
+    if (!stmt) continue;
+
+    switch (stmt->getKind()) {
+      case ASTKind::VariableDecl: {
+        // Variable declarations: check if re-declaring an existing variable
+        auto* decl = static_cast<VariableDeclarationAST*>(stmt);
+        const std::string& varName = decl->getName();
+
+        // Only track if this variable existed before this block
+        if (existingVars.find(varName) != existingVars.end()) {
+          modifiedVars.insert(varName);
+        }
+        // Otherwise it's a new local variable, not loop-carried
+        break;
+      }
+
+      case ASTKind::ExpressionStmt: {
+        auto* exprStmt = static_cast<ExpressionStmtAST*>(stmt);
+        if (!exprStmt->getExpression()) break;
+
+        // Check for regular assignment: x = value
+        if (exprStmt->getExpression()->getKind() == ASTKind::AssignmentExpr) {
+          auto* assign = static_cast<AssignmentExprAST*>(exprStmt->getExpression());
+          // Extract variable name from LHS (assuming it's a VariableExprAST)
+          if (assign->getLHS() &&
+              assign->getLHS()->getKind() == ASTKind::VariableExpr) {
+            auto* varExpr = static_cast<VariableExprAST*>(assign->getLHS());
+            const std::string& varName = varExpr->getName();
+
+            // Only track if this variable existed before this block
+            if (existingVars.find(varName) != existingVars.end()) {
+              modifiedVars.insert(varName);
+            }
+          }
+        }
+        // Check for array element assignment: A[i] = value
+        // In Simp dialect, this is functional: A = array_set(A, i, value)
+        else if (exprStmt->getExpression()->getKind() == ASTKind::ArrayStoreExpr) {
+          auto* arrayStore = static_cast<ArrayStoreExprAST*>(exprStmt->getExpression());
+          // Extract variable name from the array being modified
+          if (arrayStore->getArray() &&
+              arrayStore->getArray()->getKind() == ASTKind::VariableExpr) {
+            auto* varExpr = static_cast<VariableExprAST*>(arrayStore->getArray());
+            const std::string& varName = varExpr->getName();
+
+            // Only track if this variable existed before this block
+            if (existingVars.find(varName) != existingVars.end()) {
+              modifiedVars.insert(varName);
+            }
+          }
+        }
+        break;
+      }
+
+      case ASTKind::IfStmt: {
+        // Recursively track modified vars in nested if
+        auto* ifStmt = static_cast<IfAST*>(stmt);
+        auto thenVars = trackModifiedVariables(ifStmt->getThenBlock(), existingVars);
+        auto elseVars = trackModifiedVariables(ifStmt->getElseBlock(), existingVars);
+        modifiedVars.insert(thenVars.begin(), thenVars.end());
+        modifiedVars.insert(elseVars.begin(), elseVars.end());
+        break;
+      }
+
+      case ASTKind::WhileStmt: {
+        // Recursively track modified vars in nested while
+        auto* whileStmt = static_cast<WhileAST*>(stmt);
+        auto bodyVars = trackModifiedVariables(whileStmt->getBody(), existingVars);
+        modifiedVars.insert(bodyVars.begin(), bodyVars.end());
+        break;
+      }
+
+      default:
+        // Other statement types don't modify variables
+        break;
+    }
+  }
+
+  return modifiedVars;
+}
+
+std::vector<mlir::Value> MLIRCodeGenContext::collectVariableValues(
+    const std::set<std::string>& varNames) {
+  std::vector<mlir::Value> values;
+
+  for (const auto& name : varNames) {
+    mlir::Value value = lookupVariable(name);
+    if (value) {
+      values.push_back(value);
+    } else {
+      // This shouldn't happen if tracking is correct
+      llvm::errs() << "Warning: Variable '" << name
+                   << "' not found when collecting values\n";
+    }
+  }
+
+  return values;
+}
+
+void MLIRCodeGenContext::updateSymbolTableWithResults(
+    const std::set<std::string>& varNames,
+    mlir::ValueRange results) {
+
+  // Ensure we have the right number of results
+  if (varNames.size() != results.size()) {
+    llvm::errs() << "Error: Mismatch between variable count ("
+                 << varNames.size() << ") and result count ("
+                 << results.size() << ")\n";
+    return;
+  }
+
+  // Update symbol table with new SSA values
+  auto varIt = varNames.begin();
+  for (size_t i = 0; i < results.size(); ++i, ++varIt) {
+    declareVariable(*varIt, results[i]);
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -687,7 +1138,7 @@ mlir::FuncOp MLIRCodeGenContext::lowerFunction(FunctionAST* funcAst) {
   llvm::SmallVector<mlir::Type, 4> argTypes;
   for (auto* arg : funcAst->getArguments()) {
     // Get type from VariableDeclarationAST
-    mlir::Type argType = builder.getF64Type(); // Default for now
+    mlir::Type argType = builder.getF32Type(); // Default (matches existing compiler)
     if (arg->isStaticallyTyped()) {
       argType = getMLIRType(const_cast<TypeInfo*>(arg->getStaticType()));
     }
@@ -695,7 +1146,7 @@ mlir::FuncOp MLIRCodeGenContext::lowerFunction(FunctionAST* funcAst) {
   }
 
   // Get return type
-  mlir::Type returnType = builder.getF64Type(); // Default
+  mlir::Type returnType = builder.getF32Type(); // Default (matches existing compiler)
   if (funcAst->hasStaticReturnType()) {
     returnType = getMLIRType(const_cast<TypeInfo*>(funcAst->getReturnType()));
   }

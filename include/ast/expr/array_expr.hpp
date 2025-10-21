@@ -73,6 +73,11 @@ public:
                      std::unique_ptr<ExprAST> val)
         : array(std::move(arrayExpr)), indices(std::move(idxExprs)), value(std::move(val)) {}
 
+    // Accessors for MLIR lowering
+    ExprAST* getArray() const { return array.get(); }
+    const std::vector<std::unique_ptr<ExprAST>>& getIndices() const { return indices; }
+    ExprAST* getValue() const { return value.get(); }
+
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
     virtual ASTKind getKind() const override { return ASTKind::ArrayStoreExpr; }
 };

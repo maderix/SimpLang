@@ -14,8 +14,13 @@ set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/cmake")
 # Options
 option(SIMD_DEBUG "Enable SIMD debugging" OFF)
 option(ENABLE_DEBUGGER "Enable kernel debugger" ON)
+option(USE_MLIR "Enable MLIR integration" OFF)
 
 # LLVM setup
+# Prefer custom LLVM build if MLIR is enabled
+if(USE_MLIR)
+    set(LLVM_DIR "$ENV{HOME}/llvm-project/build/lib/cmake/llvm" CACHE PATH "Path to LLVM cmake config")
+endif()
 find_package(LLVM REQUIRED CONFIG)
 find_package(BISON REQUIRED)
 find_package(FLEX REQUIRED)
@@ -40,6 +45,37 @@ message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 message(STATUS "Found readline: ${READLINE_LIBRARY}")
 
+# MLIR setup (optional, controlled by USE_MLIR option)
+if(USE_MLIR)
+    # Try to find MLIR in the known build location
+    set(MLIR_DIR "$ENV{HOME}/llvm-project/build/lib/cmake/mlir" CACHE PATH "Path to MLIR cmake config")
+
+    find_package(MLIR REQUIRED CONFIG)
+
+    message(STATUS "MLIR integration ENABLED")
+    message(STATUS "Using MLIRConfig.cmake in: ${MLIR_DIR}")
+
+    # Add MLIR include directories
+    include_directories(
+        ${MLIR_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/include/mlir
+        ${CMAKE_BINARY_DIR}/src/mlir  # For generated .inc files
+    )
+
+    # MLIR requires these definitions
+    add_definitions(${MLIR_DEFINITIONS})
+
+    # Include MLIR's CMake modules for mlir_tablegen()
+    list(APPEND CMAKE_MODULE_PATH "${MLIR_CMAKE_DIR}")
+    list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
+    include(TableGen)
+    include(AddLLVM)
+    include(AddMLIR)
+    include(HandleLLVMOptions)
+else()
+    message(STATUS "MLIR integration DISABLED (use -DUSE_MLIR=ON to enable)")
+endif()
+
 include_directories(
     ${LLVM_INCLUDE_DIRS}
     ${CMAKE_SOURCE_DIR}/include/kernel_debugger
@@ -58,6 +94,12 @@ add_custom_target(build_all
 add_subdirectory(simpblas)   # SimpBLAS optimized kernels library
 add_subdirectory(runtime)    # Runtime library and utilities first
 add_subdirectory(src)        # SimpleLang compiler
+
+# Add MLIR dialect if enabled
+if(USE_MLIR)
+    add_subdirectory(src/mlir)  # MLIR dialect implementation
+endif()
+
 add_subdirectory(tests)      # Tests directory
 add_subdirectory(tests/benchmark)  # Benchmarks
 add_subdirectory(simptensor) # SimpTensor library tests

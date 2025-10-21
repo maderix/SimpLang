@@ -15,9 +15,13 @@
 #include <llvm/Transforms/Vectorize.h>
 #include <llvm/Analysis/TargetTransformInfo.h>
 #include <llvm/Target/TargetMachine.h>
+#include <llvm/MC/TargetRegistry.h>
 
 #ifdef USE_MLIR
 #include "mlir/mlir_codegen.hpp"
+#include "mlir/mlir_pipeline.hpp"
+#include "mlir/ExecutionEngine/OptUtils.h"
+#include "ast/transforms/normalize_returns.hpp"
 #endif
 
 extern BlockAST* programBlock;
@@ -28,17 +32,21 @@ int main(int argc, char** argv) {
     bool debug = false;
     bool printIR = false;
     bool emitMLIR = false;
+    bool enableTiling = false;  // MLIR tiling optimization
+    bool dumpMLIRPasses = false;  // Dump MLIR at each pipeline stage
     std::string outputPath;
     std::string logLevel = "INFO";  // Default log level
 
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " source.sl [-o output] [-d] [--log-level LEVEL] [--print-ir] [--emit-mlir]" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " source.sl [-o output] [-d] [--log-level LEVEL] [--print-ir] [--emit-mlir] [--enable-tiling] [--dump-mlir-passes]" << std::endl;
         std::cerr << "  --log-level LEVEL: Set logging level (ERROR, WARNING, INFO, DEBUG, TRACE)" << std::endl;
         std::cerr << "  -q, --quiet:       Equivalent to --log-level ERROR" << std::endl;
         std::cerr << "  -v, --verbose:     Equivalent to --log-level DEBUG" << std::endl;
         std::cerr << "  --print-ir:        Print LLVM IR to console" << std::endl;
 #ifdef USE_MLIR
         std::cerr << "  --emit-mlir:       Emit MLIR instead of LLVM IR" << std::endl;
+        std::cerr << "  --enable-tiling:   Enable loop tiling optimization for matmul" << std::endl;
+        std::cerr << "  --dump-mlir-passes: Dump MLIR IR at each pipeline stage" << std::endl;
 #endif
         return 1;
     }
@@ -71,6 +79,12 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "--emit-mlir") == 0) {
             emitMLIR = true;
         }
+        else if (strcmp(argv[i], "--enable-tiling") == 0) {
+            enableTiling = true;
+        }
+        else if (strcmp(argv[i], "--dump-mlir-passes") == 0) {
+            dumpMLIRPasses = true;
+        }
 #endif
     }
     
@@ -82,6 +96,11 @@ int main(int argc, char** argv) {
     llvm::InitializeNativeTarget();
     llvm::InitializeNativeTargetAsmPrinter();
     llvm::InitializeNativeTargetAsmParser();
+
+#ifdef USE_MLIR
+    // Initialize LLVM optimization passes (required for makeOptimizingTransformer)
+    mlir::initializeLLVMPasses();
+#endif
 
     // Set input file
     LOG_INFO("Opening ", argv[1]);
@@ -106,11 +125,15 @@ int main(int argc, char** argv) {
     if (emitMLIR) {
         LOG_INFO("MLIR mode enabled - generating MLIR...");
 
+        // Apply return normalization pass (required for MLIR structured control flow)
+        LOG_INFO("Applying return normalization pass...");
+        ast::transforms::normalizeAllReturns(programBlock);
+
         // Create MLIR code generation context
         std::string moduleName = argv[1];
         mlir::simp::MLIRCodeGenContext mlirContext(moduleName);
 
-        // Lower AST to MLIR
+        // Lower AST to MLIR Simp dialect
         mlir::ModuleOp mlirModule = mlirContext.lowerAST(programBlock);
 
         if (!mlirModule) {
@@ -118,35 +141,160 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        // Determine output path
-        std::string mlirFile;
+        // Determine output paths
+        std::string basePath;
         if (!outputPath.empty()) {
             size_t lastDot = outputPath.find_last_of('.');
-            mlirFile = outputPath.substr(0, lastDot) + ".mlir";
+            basePath = outputPath.substr(0, lastDot);
         } else {
             std::string inputPath = argv[1];
             size_t lastDot = inputPath.find_last_of('.');
-            mlirFile = inputPath.substr(0, lastDot) + ".mlir";
+            basePath = inputPath.substr(0, lastDot);
         }
 
-        // Write MLIR to file
+        std::string mlirFile = basePath + ".mlir";
+        std::string llFile = basePath + ".ll";
+        std::string objFile = outputPath.empty() ? basePath + ".o" : outputPath;
+
+        // Write initial MLIR (Simp dialect) to file for debugging
+        {
+            std::error_code EC;
+            llvm::raw_fd_ostream dest(mlirFile, EC, llvm::sys::fs::OF_None);
+            if (EC) {
+                llvm::errs() << "Could not open file: " << EC.message() << "\n";
+                return 1;
+            }
+            mlirModule.print(dest);
+            dest.flush();
+            std::cout << "Initial MLIR (Simp dialect) written to: " << mlirFile << std::endl;
+        }
+
+        // Print initial MLIR if requested
+        if (printIR) {
+            std::cout << "\n=== Initial MLIR (Simp Dialect) ===" << std::endl;
+            mlirModule.print(llvm::outs());
+            std::cout << "====================================\n" << std::endl;
+        }
+
+        // Create MLIR compilation pipeline
+        LOG_INFO("Running MLIR lowering passes...");
+        mlir::simp::MLIRCompilationPipeline pipeline(mlirModule);
+
+        // Configure pipeline options
+        pipeline.setEnableTiling(enableTiling);
+        if (enableTiling) {
+            LOG_INFO("Loop tiling optimization enabled (32x32x32)");
+        }
+
+        pipeline.setDumpIntermediateIR(dumpMLIRPasses);
+        if (dumpMLIRPasses) {
+            LOG_INFO("MLIR intermediate IR dumping enabled");
+        }
+
+        // Run progressive lowering passes (Simp → LLVM dialect)
+        if (!pipeline.runPasses()) {
+            std::cerr << "Error: MLIR lowering passes failed!" << std::endl;
+            return 1;
+        }
+
+        // Print lowered MLIR (LLVM dialect) if requested
+        if (printIR) {
+            std::cout << "\n=== Lowered MLIR (LLVM Dialect) ===" << std::endl;
+            pipeline.getModule().print(llvm::outs());
+            std::cout << "====================================\n" << std::endl;
+        }
+
+        // Translate MLIR LLVM dialect to LLVM IR
+        LOG_INFO("Translating MLIR to LLVM IR...");
+        llvm::LLVMContext llvmContext;
+        auto llvmModule = pipeline.translateToLLVMIR(llvmContext);
+
+        if (!llvmModule) {
+            std::cerr << "Error: Failed to translate MLIR to LLVM IR!" << std::endl;
+            return 1;
+        }
+
+        // Write LLVM IR to file
+        {
+            std::error_code EC;
+            llvm::raw_fd_ostream dest(llFile, EC, llvm::sys::fs::OF_None);
+            if (EC) {
+                llvm::errs() << "Could not open file: " << EC.message() << "\n";
+                return 1;
+            }
+            llvmModule->print(dest, nullptr);
+            dest.flush();
+            std::cout << "LLVM IR written to: " << llFile << std::endl;
+        }
+
+        // Print unoptimized LLVM IR if requested
+        if (printIR) {
+            std::cout << "\n=== Generated LLVM IR (Before Optimization) ===" << std::endl;
+            llvmModule->print(llvm::outs(), nullptr);
+            std::cout << "==================================================\n" << std::endl;
+        }
+
+        // Generate object code using existing infrastructure
+        // We need to create a target machine for the LLVM module
+        LOG_INFO("Generating object code...");
+
+        std::string targetTriple = llvm::sys::getDefaultTargetTriple();
+        llvmModule->setTargetTriple(targetTriple);
+
+        std::string error;
+        auto target = llvm::TargetRegistry::lookupTarget(targetTriple, error);
+        if (!target) {
+            llvm::errs() << error;
+            return 1;
+        }
+
+        auto cpu = "generic";
+        auto features = "";
+        llvm::TargetOptions opt;
+        auto rm = llvm::Optional<llvm::Reloc::Model>();
+        auto targetMachine = target->createTargetMachine(targetTriple, cpu, features, opt, rm);
+
+        llvmModule->setDataLayout(targetMachine->createDataLayout());
+
+        // RUN LLVM OPTIMIZATION PASSES (Critical for performance!)
+        // Use MLIR's optimization transformer (same as Toy tutorial Ch6)
+        LOG_INFO("Running LLVM optimization passes (O3)...");
+        auto optPipeline = mlir::makeOptimizingTransformer(
+            /*optLevel=*/3,        // O3 optimization (enables loop vectorization!)
+            /*sizeLevel=*/0,       // Optimize for speed, not size
+            /*targetMachine=*/targetMachine);
+
+        if (auto err = optPipeline(llvmModule.get())) {
+            llvm::errs() << "Failed to optimize LLVM IR: " << err << "\n";
+            return 1;
+        }
+
+        // Print optimized IR if requested
+        if (printIR) {
+            std::cout << "\n=== Optimized LLVM IR (After O3) ===" << std::endl;
+            llvmModule->print(llvm::outs(), nullptr);
+            std::cout << "=========================================\n" << std::endl;
+        }
+
+        // Generate object file
         std::error_code EC;
-        llvm::raw_fd_ostream dest(mlirFile, EC, llvm::sys::fs::OF_None);
+        llvm::raw_fd_ostream destObj(objFile, EC, llvm::sys::fs::OF_None);
         if (EC) {
             llvm::errs() << "Could not open file: " << EC.message() << "\n";
             return 1;
         }
-        mlirModule.print(dest);
-        dest.flush();
-        std::cout << "MLIR written to: " << mlirFile << std::endl;
 
-        // Also print to console if requested
-        if (printIR) {
-            std::cout << "\nGenerated MLIR:" << std::endl;
-            std::cout << "==================" << std::endl;
-            mlirModule.print(llvm::outs());
-            std::cout << "==================" << std::endl;
+        llvm::legacy::PassManager pass;
+        auto fileType = llvm::CGFT_ObjectFile;
+
+        if (targetMachine->addPassesToEmitFile(pass, destObj, nullptr, fileType)) {
+            llvm::errs() << "TargetMachine can't emit a file of this type\n";
+            return 1;
         }
+
+        pass.run(*llvmModule);
+        destObj.flush();
+        std::cout << "Object code written to: " << objFile << std::endl;
 
         return 0;
     }

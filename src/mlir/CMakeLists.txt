@@ -40,6 +40,10 @@ add_mlir_dialect_library(simp_dialect
   simp_types.cpp
   simp_ops.cpp
   mlir_codegen.cpp
+  mlir_pipeline.cpp
+  lowering/ConvertSimpToMemRef.cpp
+  lowering/ConvertSimpToLinalg.cpp
+  lowering/SpecializeShapes.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${CMAKE_SOURCE_DIR}/include/mlir
@@ -53,7 +57,24 @@ add_mlir_dialect_library(simp_dialect
   MLIRIR
   MLIRStandard
   MLIRSCF
+  MLIRAffine
+  MLIRAffineTransforms
   MLIRArithmetic
+  MLIRMemRef
+  MLIRLinalg
+  MLIRLinalgTransforms
+  MLIRBufferizationTransforms
+  MLIRBufferizationToMemRef
+  MLIRTransforms
+  MLIRLLVMIR
+  MLIRLLVMCommonConversion
+  MLIRArithmeticToLLVM
+  MLIRLinalgToLLVM
+  MLIRMemRefToLLVM
+  MLIRSCFToStandard
+  MLIRStandardToLLVM
+  MLIRTargetLLVMIRExport
+  MLIRLLVMToLLVMIRTranslation
 )
 
 # Disable RTTI and exceptions to match LLVM/MLIR build

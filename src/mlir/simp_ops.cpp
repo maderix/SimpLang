@@ -59,3 +59,12 @@ void DivOp::getCanonicalizationPatterns(mlir::RewritePatternSet &results,
                                          mlir::MLIRContext *context) {
   // No canonicalization patterns for now
 }
+
+//===----------------------------------------------------------------------===//
+// ModOp
+//===----------------------------------------------------------------------===//
+
+void ModOp::getCanonicalizationPatterns(mlir::RewritePatternSet &results,
+                                         mlir::MLIRContext *context) {
+  // No canonicalization patterns for now
+}

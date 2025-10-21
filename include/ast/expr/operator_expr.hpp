@@ -10,6 +10,11 @@ class UnaryExprAST : public ExprAST {
 public:
     UnaryExprAST(UnaryOp op, std::unique_ptr<ExprAST> operand)
         : op_(op), operand_(std::move(operand)) {}
+
+    // Accessors for MLIR lowering
+    UnaryOp getOp() const { return op_; }
+    ExprAST* getOperand() const { return operand_.get(); }
+
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
     virtual ASTKind getKind() const override { return ASTKind::UnaryExpr; }
 };

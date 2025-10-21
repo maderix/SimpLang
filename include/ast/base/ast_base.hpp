@@ -17,6 +17,7 @@ enum class ASTKind {
     ArrayCreateExpr,
     ArrayAccessExpr,
     ArrayStoreExpr,
+    MatMulExpr,
     SSEExpr,
     AVXExpr,
     SSESliceExpr,

@@ -50,6 +50,58 @@ mlir::Operation *SimpDialect::materializeConstant(mlir::OpBuilder &builder,
 }
 
 //===----------------------------------------------------------------------===//
+// Type Printing and Parsing
+//===----------------------------------------------------------------------===//
+
+mlir::Type SimpDialect::parseType(mlir::DialectAsmParser &parser) const {
+  llvm::StringRef typeTag;
+  if (parser.parseKeyword(&typeTag))
+    return Type();
+
+  if (typeTag == "array") {
+    // Parse: array<element-type>
+    mlir::Type elemType;
+    if (parser.parseLess() || parser.parseType(elemType) || parser.parseGreater())
+      return Type();
+    return ArrayType::get(getContext(), elemType);
+  }
+
+  if (typeTag == "tensor") {
+    // Parse: tensor<shape>
+    // For now, just error - full tensor parsing would go here
+    parser.emitError(parser.getNameLoc(), "tensor type parsing not yet implemented");
+    return Type();
+  }
+
+  parser.emitError(parser.getNameLoc(), "unknown simp type: ") << typeTag;
+  return Type();
+}
+
+void SimpDialect::printType(mlir::Type type, mlir::DialectAsmPrinter &printer) const {
+  if (auto arrayType = type.dyn_cast<ArrayType>()) {
+    printer << "array<";
+    printer.printType(arrayType.getElementType());
+    printer << ">";
+  } else if (auto tensorType = type.dyn_cast<SimpTensorType>()) {
+    printer << "tensor<";
+    // Print shape
+    for (size_t i = 0; i < tensorType.getShape().size(); ++i) {
+      if (i > 0) printer << "x";
+      int64_t dim = tensorType.getShape()[i];
+      if (dim == -1)
+        printer << "?";
+      else
+        printer << dim;
+    }
+    printer << "x";
+    printer.printType(tensorType.getElementType());
+    printer << ">";
+  } else {
+    llvm_unreachable("unhandled simp type");
+  }
+}
+
+//===----------------------------------------------------------------------===//
 // Operation Definitions
 //===----------------------------------------------------------------------===//
 

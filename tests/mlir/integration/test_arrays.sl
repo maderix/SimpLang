@@ -2,9 +2,9 @@
 // Demonstrates: array creation, indexing, stores, loads
 // Progressive lowering: simp.array_* → memref.* → llvm.*
 
-fn test_array_basic() f64 {
+fn test_array_basic() {
     // Create array: simp.array_create
-    var arr = array<f64>([10]);
+    var arr = array<f32>([10]);
 
     // Array stores: simp.array_set
     arr[0] = 1.0;
@@ -17,8 +17,8 @@ fn test_array_basic() f64 {
     return sum;  // Expected: 6.0
 }
 
-fn test_array_compute() f64 {
-    var data = array<f64>([5]);
+fn test_array_compute() {
+    var data = array<f32>([5]);
 
     // Initialize array elements
     data[0] = 10.0;
@@ -32,8 +32,8 @@ fn test_array_compute() f64 {
     return result;  // Expected: 230.0
 }
 
-fn test_array_accumulate() f64 {
-    var values = array<f64>([4]);
+fn test_array_accumulate() {
+    var values = array<f32>([4]);
 
     values[0] = 5.0;
     values[1] = 10.0;

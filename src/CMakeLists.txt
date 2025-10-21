@@ -64,5 +64,8 @@ if(USE_MLIR)
         ${CMAKE_BINARY_DIR}/src/mlir  # For generated .inc files
         ${MLIR_INCLUDE_DIRS}
     )
-    target_link_libraries(simplang simp_dialect)
+    target_link_libraries(simplang
+        simp_dialect
+        MLIRExecutionEngine  # For makeOptimizingTransformer and initializeLLVMPasses
+    )
 endif()

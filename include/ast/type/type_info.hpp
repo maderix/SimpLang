@@ -44,7 +44,7 @@ public:
     }
 
     llvm::Type* getLLVMType(llvm::LLVMContext& ctx) const;
-    std::string toString() const;
+    virtual std::string toString() const;
 };
 
 class ArrayTypeInfo : public TypeInfo {
@@ -68,6 +68,9 @@ public:
                       (elementType->isFloat() || elementType->isInteger());
         alignment = getSIMDAlignment(simd);
     }
+
+    // Override toString() to return "array<elementType>" for MLIR codegen
+    std::string toString() const override;
 
 private:
     int getSIMDAlignment(SIMDType simd) const {

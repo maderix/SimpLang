@@ -58,7 +58,7 @@
 %token TSIMD TAUTO TAVX512 TNEON TSVE
 %token TLPAREN TRPAREN TLBRACE TRBRACE
 %token TCOMMA TSEMICOLON
-%token TMAKE TARRAY TSSESLICE TAVXSLICE TLBRACKET TRBRACKET
+%token TMAKE TARRAY TSSESLICE TAVXSLICE TLBRACKET TRBRACKET TMATMUL
 %token UNARY_MINUS  /* Add this token for unary minus */
 %token TOK_MOD
 %token <string> IDENTIFIER
@@ -73,7 +73,7 @@
 
 %type <block> program stmts block
 %type <stmt> stmt func_decl if_stmt while_stmt return_stmt include_stmt
-%type <expr> expr numeric slice_expr call_expr vector_expr  /* Add vector_expr here */
+%type <expr> expr numeric slice_expr call_expr vector_expr matmul_expr
 %type <var_expr> ident
 %type <exprvec> call_args expr_list multi_index
 %type <varvec> func_decl_args
@@ -137,6 +137,7 @@ expr : expr '+' expr   { $$ = new BinaryExprAST(static_cast<BinaryOp>('+'), make
      | vector_expr     { $$ = $1; }
      | array_expr      { $$ = $1; }
      | array_access    { $$ = $1; }
+     | matmul_expr     { $$ = $1; }
      ;
 
 vector_expr 
@@ -262,10 +263,22 @@ multi_index : expr {
           }
           ;
 
-call_expr : ident TLPAREN call_args TRPAREN { 
-            $$ = new CallExprAST($1->getName(), *$3); 
+call_expr : ident TLPAREN call_args TRPAREN {
+            $$ = new CallExprAST($1->getName(), *$3);
           }
           ;
+
+matmul_expr : TMATMUL TLPAREN expr TCOMMA expr TCOMMA expr TCOMMA expr TCOMMA expr TCOMMA expr TRPAREN {
+                $$ = new MatMulExprAST(
+                    makeUnique($3),   // lhs: A matrix (MxK as 1D array)
+                    makeUnique($5),   // rhs: B matrix (KxN as 1D array)
+                    makeUnique($7),   // output: C matrix (MxN as 1D array, pre-allocated)
+                    makeUnique($9),   // m: rows of A
+                    makeUnique($11),  // k: cols of A / rows of B
+                    makeUnique($13)   // n: cols of B
+                );
+            }
+            ;
 
 param_decl : TVAR TIDENTIFIER { $$ = new VariableDeclarationAST(*$2, nullptr); }
            | TVAR TIDENTIFIER slice_type { $$ = new VariableDeclarationAST(*$2, nullptr, nullptr, $3); }
