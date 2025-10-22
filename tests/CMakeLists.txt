@@ -591,3 +591,6 @@ else()
     # message(FATAL_ERROR "SIMD test target not found. Make sure it's defined before this block.") # DEPRECATED: old SIMD test
     message(STATUS "SIMD test target not found - old SIMD tests are deprecated")
 endif()
+
+# Add MLIR tests
+add_subdirectory(mlir)

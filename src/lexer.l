@@ -54,6 +54,7 @@ extern "C" int yywrap() { return 1; }
 "neon"               { return TNEON; }
 "sve"                { return TSVE; }
 
+"matmul"             { return TMATMUL; }
 "slice_get_sse"      { SAVE_TOKEN; return TIDENTIFIER; }
 "slice_get_avx"      { SAVE_TOKEN; return TIDENTIFIER; }
 "slice_set_sse"      { SAVE_TOKEN; return TIDENTIFIER; }
