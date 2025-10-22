@@ -1,6 +1,17 @@
-# SimpLang: A Domain-Specific Language for SIMD Optimization
+<p align="center">
+  <img src="docs/animation_cropped.gif" alt="SimpLang Banner" width="600"/>
+</p>
 
-SimpLang is a domain-specific language (DSL) designed to facilitate SIMD hardware optimization, particularly for deep learning applications. It provides high-level abstractions for SIMD operations, coupled with robust debugging and runtime infrastructure.
+# SimpLang: A Research Language for Compute and Machine Learning
+
+> **Note**: SimpLang is a research project - one developer's dream to build a complete ML compiler architecture from the ground up. It's a learning journey exploring compiler design, SIMD optimization, and modern ML infrastructure. Expect rough edges, but also expect innovation! 🚀
+
+SimpLang is a domain-specific language (DSL) that bridges high-performance computing and machine learning through **dual compiler backends**:
+
+- **LLVM Backend** - For pure compute applications: automatic SIMD vectorization, scientific computing, signal processing, and numerical algorithms
+- **MLIR Backend** ✨ **NEW** - Transforms SimpLang into an ML-focused language: tensor abstractions, layout optimizations (NHWC/NCHW), convolutions, and deep learning operations
+
+Whether you're building a high-performance compute kernel or exploring ML compiler techniques, SimpLang provides a playground for experimentation with real-world performance.
 
 ## Getting Started
 
@@ -109,16 +120,43 @@ Execute the test suite using:
 
 ### Using SimpLang
 
+#### LLVM Backend (Default - General Compute)
+
 1. **Compile a SimpLang Kernel**
 ```bash
-# Syntax: ./build/src/simplang <input_file.sl>
+# Default LLVM backend
 ./build/src/simplang my_kernel.sl
 ```
 
 2. **Run a Compiled Kernel**
 ```bash
-# Syntax: ./build/tests/test_loop_runner <path_to_compiled_kernel.so>
 ./build/tests/test_loop_runner ./build/tests/obj/test_loop.so
+```
+
+#### MLIR Backend (Experimental - ML Workloads)
+
+1. **Compile with MLIR Backend**
+```bash
+# Enable MLIR backend with --emit-mlir flag
+./build/src/simplang my_kernel.sl --emit-mlir -o kernel.o
+
+# Create shared library
+gcc -shared -fPIC kernel.o -o kernel.so
+```
+
+2. **Run MLIR Kernel**
+```bash
+# Use custom host runner for MLIR kernels (memref calling convention)
+./matmul_host kernel.so
+```
+
+3. **Enable Optimizations**
+```bash
+# Enable loop tiling for better cache locality
+./build/src/simplang kernel.sl --emit-mlir --enable-tiling -o kernel.o
+
+# Dump intermediate IR for debugging
+./build/src/simplang kernel.sl --emit-mlir --dump-mlir-passes
 ```
 
 ### Example Workflow
@@ -174,17 +212,29 @@ cmake -B build -DSIMD_DEBUG=ON
 
 ## Key Features
 
-### 🚀 **Automatic SIMD Vectorization**
+### 🎯 **Dual Backend Architecture**
+- **LLVM Backend** - Stable backend for general compute workloads
+  - Built on LLVM infrastructure with optimization passes
+  - Automatic SIMD vectorization (SSE/AVX/AVX-512)
+  - 25% faster than scalar code on large datasets (1M+ elements)
+- **MLIR Backend** ✨ **NEW** - Experimental ML compiler infrastructure
+  - Tensor operations with multi-dimensional support
+  - Layout optimizations (NHWC for GPU, NCHW for CPU)
+  - MatMul operation: 4.55 GFLOPS (2.59x slower than C++ - work in progress!)
+  - Progressive lowering: Simp → MemRef/Linalg → SCF → LLVM
+  - Loop tiling and fusion for cache optimization
+
+### 🚀 **Automatic SIMD Vectorization** (LLVM Backend)
 - **Auto-vectorization engine** - Automatically converts scalar loops to SIMD operations
-- **AVX-512 support** - Leverages 512-bit vector instructions for up to 16x parallel processing  
+- **AVX-512 support** - Leverages 512-bit vector instructions for up to 16x parallel processing
 - **Performance scaling** - 25% faster than scalar code on large datasets (1M+ elements)
 - **Zero expertise required** - Get SIMD benefits without manual vector programming
 
-### 🏗️ **Modern Compiler Infrastructure**
-- **LLVM-based backend** - Industry-standard compiler infrastructure with advanced optimizations
-- **Static type system** - Production-ready type checking with comprehensive error reporting
-- **Float-optimized pipeline** - Type system optimized for vectorization performance
-- **Advanced optimization passes** - Loop vectorization, SLP vectorization, and memory optimization
+### 🏗️ **Compiler Infrastructure**
+- **Static type system** - Type checking with error reporting
+- **Float-optimized pipeline** - Type system designed for vectorization
+- **Optimization passes** - Loop vectorization, SLP vectorization, and memory optimization
+- **Multi-dialect lowering** (MLIR) - Progressive transformation through specialized dialects
 
 ### 🔧 **SIMD Hardware Abstraction**
 - **Plugin-based SIMD backends** - Extensible architecture supporting multiple SIMD instruction sets
@@ -204,10 +254,10 @@ cmake -B build -DSIMD_DEBUG=ON
 - **Cross-platform support** - Docker-based development with live file mounting
 - **VS Code integration** - Full IDE support with dev container configuration
 
-### 🎯 **Production-Ready Features**
+### 🎯 **Core Features**
 - **Host-kernel architecture** - Modular design with C++ host integration
-- **Robust error handling** - Comprehensive error reporting and recovery mechanisms  
-- **Logging system** - Configurable logging levels for development and production
+- **Error handling** - Error reporting and recovery mechanisms
+- **Logging system** - Configurable logging levels for debugging
 - **Memory safety** - Automatic resource management and cleanup
 
 ### ⚡ **Performance Characteristics**
@@ -435,26 +485,51 @@ int main() {
 4. **Debug:** Utilize the built-in debugging infrastructure to step through code, inspect variables, and analyze performance.
 5. **Profile and Optimize:**  Identify performance bottlenecks and refine your SimpLang code or compiler settings.
 
+## MLIR Backend Roadmap
+
+The MLIR backend is actively being developed with the following planned features:
+
+### 🔄 **Current Work** (Session 11 - In Planning)
+* **Tensor Abstractions** - 4D tensor support with NHWC layout
+* **Conv2D Operation** - 2D convolution with affine map layouts
+* **Multi-dimensional Indexing** - Support for `tensor[n, h, w, c]` syntax
+* **Layout Optimizations** - NHWC (GPU-optimized) and NCHW (CPU-optimized) layouts
+
+### 📋 **Upcoming** (Sessions 12-14)
+* **Native Tensor Dialect** - Use MLIR's tensor operations instead of memref workarounds
+* **Bufferization** - Automatic tensor-to-memref conversion with layout preservation
+* **Tensor Fusion** - Fuse operations to reduce memory traffic
+* **Custom Lowering** - Fix matmul accumulator pattern (eliminate 256x memory stores!)
+
+### 🚀 **Future Enhancements** (Sessions 15+)
+* **Performance Optimization** - Match C++ baseline performance
+* **More Operations** - Pooling, activations (ReLU, sigmoid), reductions
+* **GPU Support** - Lower to GPU dialect for CUDA/ROCm
+* **Dynamic Shapes** - Runtime-determined tensor dimensions
+
+📖 **Full Roadmap**: See `docs/TENSOR_IMPLEMENTATION_GUIDE.md` and `MLIR_FUTURE_ROADMAP.md`
+
 ## Future Directions
 
 * **Language Extensions:**
-    * Template support for generic programming.
-    * Meta-programming capabilities for compile-time code generation.
-    * Advanced control flow constructs for complex algorithms.
+    * Template support for generic programming
+    * Meta-programming capabilities for compile-time code generation
+    * Advanced control flow constructs for complex algorithms
 * **Optimization Improvements:**
     * ✅ **Auto-vectorization** - ✨ **COMPLETED** - Automatic SIMD code generation from scalar operations
-    * Pattern-based optimizations to recognize and optimize common code patterns.
-    * Hardware-specific tuning to leverage unique features of different processor architectures.
-    * Memory prefetching optimizations for improved cache utilization.
+    * ✅ **MLIR Backend** - ✨ **IN PROGRESS** - Tensor operations for ML workloads
+    * Pattern-based optimizations to recognize and optimize common code patterns
+    * Hardware-specific tuning to leverage unique features of different processor architectures
+    * Memory prefetching optimizations for improved cache utilization
 * **SIMD Enhancements:**
-    * GPU compute backend integration (CUDA/OpenCL).
-    * ARM NEON SIMD support for mobile and embedded platforms.
-    * Custom SIMD instruction pattern matching and generation.
+    * GPU compute backend integration (CUDA/OpenCL via MLIR GPU dialect)
+    * ARM NEON SIMD support for mobile and embedded platforms
+    * Custom SIMD instruction pattern matching and generation
 * **Tooling:**
     * ✅ **VS Code integration** - ✨ **COMPLETED** - Dev container with full IDE support
-    * Visual debugger for a more intuitive debugging experience.
-    * Performance analyzer to provide detailed performance insights.
-    * Real-time performance profiling and optimization suggestions.
+    * Visual debugger for a more intuitive debugging experience
+    * Performance analyzer to provide detailed performance insights
+    * Real-time performance profiling and optimization suggestions
 
 ## Contributing
 
