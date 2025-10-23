@@ -1,0 +1,42 @@
+================================================================================
+SIMPLANG COMPREHENSIVE BENCHMARK REPORT
+================================================================================
+
+Total Tests: 11
+
+OVERALL PERFORMANCE:
+--------------------------------------------------------------------------------
+SimpLang vs GCC:
+  Average Speedup: 1.373x
+  Geometric Mean: 1.209x
+  Tests Faster: 7/11 (63.6%)
+  Best Speedup: 3.719x (i8 - Seq Write (10M))
+
+SimpLang vs Clang:
+  Average Speedup: 1.165x
+  Geometric Mean: 1.107x
+  Tests Faster: 7/11 (63.6%)
+  Best Speedup: 2.308x (i8 - Seq Write (10M))
+
+
+TOP 5 PERFORMANCE WINS (vs GCC):
+--------------------------------------------------------------------------------
+i8     - Seq Write (10M)               :  3.72x  (  74.7 vs   20.1 GB/s)
+i8     - Seq Read (10M)                :  2.45x  (  42.9 vs   17.5 GB/s)
+i64    - Seq Write (10M)               :  1.11x  (   3.3 vs    3.0 GB/s)
+i64    - Seq Read (10M)                :  1.10x  (   3.2 vs    2.9 GB/s)
+i8     - Block Copy (10M)              :  1.08x  (   3.0 vs    2.8 GB/s)
+
+TOP 5 PERFORMANCE WINS (vs Clang):
+--------------------------------------------------------------------------------
+i8     - Seq Write (10M)               :  2.31x  (  74.7 vs   32.4 GB/s)
+i8     - Seq Read (10M)                :  1.70x  (  42.9 vs   25.2 GB/s)
+i64    - Seq Write (10M)               :  1.12x  (   3.3 vs    3.0 GB/s)
+i64    - Seq Read (10M)                :  1.08x  (   3.2 vs    2.9 GB/s)
+f64    - Seq Write (10M)               :  1.04x  (   3.0 vs    2.9 GB/s)
+
+PEAK BANDWIDTH BY DATATYPE:
+--------------------------------------------------------------------------------
+f64   : SimpLang=   3.9 GB/s  |  GCC=   4.8 GB/s  |  Clang=   4.8 GB/s
+i64   : SimpLang=   3.3 GB/s  |  GCC=   3.0 GB/s  |  Clang=   3.0 GB/s
+i8    : SimpLang=  74.7 GB/s  |  GCC=  20.1 GB/s  |  Clang=  32.4 GB/s

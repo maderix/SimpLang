@@ -29,6 +29,8 @@ extern "C" int yywrap() { return 1; }
 "include"             { return TINCLUDE; }
 "import"              { return TIMPORT; }
 
+"f16"                 { return TF16; }
+"bf16"                { return TBF16; }
 "f32"                 { return TF32; }
 "f64"                 { return TF64; }
 "int"                 { return TI32; }  /* Alias for i32 */

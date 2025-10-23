@@ -370,4 +370,89 @@ def Simp_MatMulOp : Simp_Op<"matmul", [NoSideEffect]> {
   }];
 }
 
+//===----------------------------------------------------------------------===//
+// Simp_Conv2DOp
+//===----------------------------------------------------------------------===//
+
+def Simp_Conv2DOp : Simp_Op<"conv2d", [NoSideEffect]> {
+  let summary = "2D Convolution operation";
+
+  let description = [{
+    The `simp.conv2d` operation performs 2D convolution with support for
+    strides, padding, and multiple data types.
+
+    Examples:
+    ```mlir
+    %output = simp.conv2d %input, %weights, %bias, %out_buf,
+                          %batch, %in_h, %in_w, %in_c,
+                          %out_c, %k_h, %k_w,
+                          %stride_h, %stride_w,
+                          %pad_h, %pad_w
+      : (!simp.array<f32>, !simp.array<f32>, !simp.array<f32>, !simp.array<f32>,
+         i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64)
+      -> !simp.array<f32>
+    ```
+
+    Mathematical Operation:
+      output[b, oh, ow, oc] = bias[oc] +
+        Σ(kh, kw, ic) input[b, oh*stride_h + kh - pad_h, ow*stride_w + kw - pad_w, ic]
+                      * weights[oc, kh, kw, ic]
+
+    Layout:
+    - Input: NHWC [batch, height, width, in_channels]
+    - Weights: [out_channels, kernel_h, kernel_w, in_channels]
+    - Bias: [out_channels]
+    - Output: NHWC [batch, out_height, out_width, out_channels]
+
+    Where:
+      out_height = (in_height + 2*pad_h - kernel_h) / stride_h + 1
+      out_width = (in_width + 2*pad_w - kernel_w) / stride_w + 1
+
+    Arrays are stored as flattened 1D arrays with row-major layout.
+
+    Lowering Path:
+    ```
+    simp.conv2d
+      → nested affine loops with memref operations
+      → [tiling + vectorization optimizations]
+      → LLVM IR
+    ```
+
+    Dtype Support:
+    Supports all numeric types: f64, f32, f16, i64, i32, i16, i8
+  }];
+
+  let arguments = (ins
+    Simp_ArrayType:$input,     // Input: NHWC as 1D array
+    Simp_ArrayType:$weights,   // Weights: [OC, KH, KW, IC] as 1D array
+    Simp_ArrayType:$bias,      // Bias: [OC] as 1D array
+    Simp_ArrayType:$output,    // Output: NHWC as 1D array (pre-allocated)
+    I64:$batch,                // Batch size (N)
+    I64:$in_h,                 // Input height
+    I64:$in_w,                 // Input width
+    I64:$in_c,                 // Input channels
+    I64:$out_c,                // Output channels
+    I64:$kernel_h,             // Kernel height
+    I64:$kernel_w,             // Kernel width
+    I64:$stride_h,             // Vertical stride
+    I64:$stride_w,             // Horizontal stride
+    I64:$pad_h,                // Vertical padding
+    I64:$pad_w                 // Horizontal padding
+  );
+  let results = (outs Simp_ArrayType:$result);  // Returns the output buffer
+
+  let assemblyFormat = [{
+    $input `,` $weights `,` $bias `,` $output `,`
+    $batch `,` $in_h `,` $in_w `,` $in_c `,`
+    $out_c `,` $kernel_h `,` $kernel_w `,`
+    $stride_h `,` $stride_w `,` $pad_h `,` $pad_w
+    attr-dict `:`
+    `(` type($input) `,` type($weights) `,` type($bias) `,` type($output) `,`
+    type($batch) `,` type($in_h) `,` type($in_w) `,` type($in_c) `,`
+    type($out_c) `,` type($kernel_h) `,` type($kernel_w) `,`
+    type($stride_h) `,` type($stride_w) `,` type($pad_h) `,` type($pad_w) `)`
+    `->` type($result)
+  }];
+}
+
 #endif // SIMP_OPS

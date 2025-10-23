@@ -235,6 +235,11 @@ private:
   /// Uses vector of maps for nested scopes
   std::vector<std::map<std::string, mlir::Value>> symbolTable;
 
+  /// Dimension tracking: maps variable names to their runtime dimension values
+  /// Used for computing flattened indices in multi-dimensional array access
+  /// Using variable names instead of SSA values since values change through assignments
+  std::map<std::string, llvm::SmallVector<mlir::Value, 4>> arrayDimensions;
+
   /// Current function being lowered
   mlir::FuncOp currentFunction;
 

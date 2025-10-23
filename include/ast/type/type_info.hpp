@@ -11,9 +11,9 @@
 // Type system for static typing
 enum class TypeKind {
     Dynamic,    // Current 'var' behavior
-    F32, F64,   // Floating point
-    I8, I16, I32, I64,   // Signed integers
-    U8, U16, U32, U64,   // Unsigned integers
+    F16, BF16, F32, F64,   // Floating point (FP16, BFloat16, FP32, FP64)
+    I8, I16, I32, I64,     // Signed integers
+    U8, U16, U32, U64,     // Unsigned integers
     Bool,       // Boolean
     Void,       // Function returns
     Array       // Multi-dimensional array types
@@ -31,7 +31,8 @@ public:
         return kind >= TypeKind::I8 && kind <= TypeKind::U64;
     }
     bool isFloat() const {
-        return kind == TypeKind::F32 || kind == TypeKind::F64;
+        return kind == TypeKind::F16 || kind == TypeKind::BF16 ||
+               kind == TypeKind::F32 || kind == TypeKind::F64;
     }
     bool isArray() const {
         return kind == TypeKind::Array;

@@ -4,6 +4,8 @@
 // TypeInfo implementations
 llvm::Type* TypeInfo::getLLVMType(llvm::LLVMContext& ctx) const {
     switch (kind) {
+        case TypeKind::F16:     return llvm::Type::getHalfTy(ctx);
+        case TypeKind::BF16:    return llvm::Type::getBFloatTy(ctx);
         case TypeKind::F32:     return llvm::Type::getFloatTy(ctx);
         case TypeKind::F64:     return llvm::Type::getDoubleTy(ctx);
         case TypeKind::I8:      return llvm::Type::getInt8Ty(ctx);
@@ -24,6 +26,8 @@ llvm::Type* TypeInfo::getLLVMType(llvm::LLVMContext& ctx) const {
 
 std::string TypeInfo::toString() const {
     switch (kind) {
+        case TypeKind::F16:     return "f16";
+        case TypeKind::BF16:    return "bf16";
         case TypeKind::F32:     return "f32";
         case TypeKind::F64:     return "f64";
         case TypeKind::I8:      return "i8";

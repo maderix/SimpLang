@@ -12,9 +12,13 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/IR/AffineMap.h"
 #include "mlir/Dialect/StandardOps/IR/Ops.h"
 #include "mlir/Dialect/SCF/SCF.h"
 #include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/tensor_layout.hpp"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cmath>
 
@@ -100,21 +104,293 @@ void MLIRCodeGenContext::popScope() {
 }
 
 //===----------------------------------------------------------------------===//
+// Type Conversion Helper
+//===----------------------------------------------------------------------===//
+
+namespace {
+/// Helper class for converting SimpLang types to MLIR types
+/// Supports all TypeKind values including F16, BF16, and full integer range
+class TypeConverter {
+public:
+  /// Convert TypeKind enum to MLIR type
+  static mlir::Type toMLIRType(TypeKind kind, mlir::OpBuilder& builder) {
+    switch (kind) {
+      case TypeKind::F16:     return builder.getF16Type();
+      case TypeKind::BF16:    return builder.getBF16Type();
+      case TypeKind::F32:     return builder.getF32Type();
+      case TypeKind::F64:     return builder.getF64Type();
+      case TypeKind::I8:      return builder.getIntegerType(8);
+      case TypeKind::I16:     return builder.getIntegerType(16);
+      case TypeKind::I32:     return builder.getI32Type();
+      case TypeKind::I64:     return builder.getI64Type();
+      case TypeKind::U8:      return builder.getIntegerType(8, /*isSigned=*/false);
+      case TypeKind::U16:     return builder.getIntegerType(16, /*isSigned=*/false);
+      case TypeKind::U32:     return builder.getIntegerType(32, /*isSigned=*/false);
+      case TypeKind::U64:     return builder.getIntegerType(64, /*isSigned=*/false);
+      case TypeKind::Bool:    return builder.getI1Type();
+      case TypeKind::Void:    return builder.getNoneType();
+      case TypeKind::Dynamic: return builder.getF32Type(); // Default for var
+      default:                return builder.getF32Type();
+    }
+  }
+
+  /// Convert string type name to MLIR type
+  static mlir::Type fromString(const std::string& typeStr, mlir::OpBuilder& builder) {
+    // Floating point types
+    if (typeStr == "f16")                     return builder.getF16Type();
+    if (typeStr == "bf16")                    return builder.getBF16Type();
+    if (typeStr == "f32" || typeStr == "float") return builder.getF32Type();
+    if (typeStr == "f64" || typeStr == "double") return builder.getF64Type();
+
+    // Signed integer types
+    if (typeStr == "i8")                      return builder.getIntegerType(8);
+    if (typeStr == "i16")                     return builder.getIntegerType(16);
+    if (typeStr == "i32" || typeStr == "int") return builder.getI32Type();
+    if (typeStr == "i64")                     return builder.getI64Type();
+
+    // Unsigned integer types
+    if (typeStr == "u8")                      return builder.getIntegerType(8, false);
+    if (typeStr == "u16")                     return builder.getIntegerType(16, false);
+    if (typeStr == "u32")                     return builder.getIntegerType(32, false);
+    if (typeStr == "u64")                     return builder.getIntegerType(64, false);
+
+    // Boolean
+    if (typeStr == "bool" || typeStr == "i1") return builder.getI1Type();
+
+    // Void
+    if (typeStr == "void")                    return builder.getNoneType();
+
+    // Unknown - default to f32
+    return builder.getF32Type();
+  }
+
+  /// Check if type supports arithmetic operations
+  static bool supportsArithmetic(mlir::Type type) {
+    return type.isa<mlir::FloatType>() || type.isa<mlir::IntegerType>();
+  }
+
+  /// Get type size in bits
+  static unsigned getTypeSizeInBits(mlir::Type type) {
+    if (auto floatTy = type.dyn_cast<mlir::FloatType>()) {
+      return floatTy.getWidth();
+    }
+    if (auto intTy = type.dyn_cast<mlir::IntegerType>()) {
+      return intTy.getWidth();
+    }
+    return 32; // Default
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// Tensor Layout and Affine Map Helpers
+//===----------------------------------------------------------------------===//
+
+/// Create affine map for NHWC layout
+/// Logical indices: (N, C, H, W) → Physical memory: (N, H, W, C)
+mlir::AffineMap createNHWCAffineMap(mlir::MLIRContext* ctx) {
+  using namespace mlir;
+  auto d0 = getAffineDimExpr(0, ctx);  // N
+  auto d1 = getAffineDimExpr(1, ctx);  // C
+  auto d2 = getAffineDimExpr(2, ctx);  // H
+  auto d3 = getAffineDimExpr(3, ctx);  // W
+
+  // Permute: NCHW → NHWC
+  return AffineMap::get(4, 0, {d0, d2, d3, d1}, ctx);
+}
+
+/// Create affine map for NCHW layout (identity)
+mlir::AffineMap createNCHWAffineMap(mlir::MLIRContext* ctx) {
+  return mlir::AffineMap::getMultiDimIdentityMap(4, ctx);
+}
+
+/// Create affine map for given layout
+mlir::AffineMap createAffineMapForLayout(::simp::TensorLayout layout,
+                                          unsigned rank,
+                                          mlir::MLIRContext* ctx) {
+  switch (layout) {
+    case ::simp::TensorLayout::NHWC:
+      if (rank == 4) return createNHWCAffineMap(ctx);
+      break;
+    case ::simp::TensorLayout::NCHW:
+      if (rank == 4) return createNCHWAffineMap(ctx);
+      break;
+    case ::simp::TensorLayout::RowMajor:
+      return mlir::AffineMap::getMultiDimIdentityMap(rank, ctx);
+    case ::simp::TensorLayout::Custom:
+      // TODO: Parse custom affine map from string
+      break;
+  }
+  // Default: identity map
+  return mlir::AffineMap::getMultiDimIdentityMap(rank, ctx);
+}
+
+/// Compute strides for NHWC layout: [N, H, W, C]
+/// Memory layout: [N][H][W][C]
+/// Strides: [H*W*C, W*C, C, 1]
+mlir::SmallVector<mlir::Value> computeNHWCStrides(mlir::Value H, mlir::Value W, mlir::Value C,
+                                                   mlir::OpBuilder& builder, mlir::Location loc) {
+  mlir::Value one = builder.create<mlir::arith::ConstantIndexOp>(loc, 1);
+  mlir::Value WC = builder.create<mlir::arith::MulIOp>(loc, W, C);
+  mlir::Value HWC = builder.create<mlir::arith::MulIOp>(loc, H, WC);
+
+  return {HWC, WC, C, one};
+}
+
+/// Compute strides for NCHW layout: [N, C, H, W]
+/// Memory layout: [N][C][H][W]
+/// Strides: [C*H*W, H*W, W, 1]
+mlir::SmallVector<mlir::Value> computeNCHWStrides(mlir::Value C, mlir::Value H, mlir::Value W,
+                                                   mlir::OpBuilder& builder, mlir::Location loc) {
+  mlir::Value one = builder.create<mlir::arith::ConstantIndexOp>(loc, 1);
+  mlir::Value HW = builder.create<mlir::arith::MulIOp>(loc, H, W);
+  mlir::Value CHW = builder.create<mlir::arith::MulIOp>(loc, C, HW);
+
+  return {CHW, HW, W, one};
+}
+
+/// Helper to cast i64 to index type (forward declare before use)
+mlir::Value castToIndex(mlir::Value val, mlir::OpBuilder& builder, mlir::Location loc);
+
+/// Compute row-major strides for arbitrary rank
+/// For shape [d0, d1, ..., dn], strides are [d1*d2*...*dn, d2*d3*...*dn, ..., 1]
+mlir::SmallVector<mlir::Value> computeRowMajorStrides(mlir::ArrayRef<mlir::Value> dims,
+                                                       mlir::OpBuilder& builder, mlir::Location loc) {
+  mlir::SmallVector<mlir::Value> strides;
+  mlir::Value one = builder.create<mlir::arith::ConstantIndexOp>(loc, 1);
+
+  for (size_t i = 0; i < dims.size(); ++i) {
+    mlir::Value stride = one;
+    for (size_t j = i + 1; j < dims.size(); ++j) {
+      // Cast dimension to index type if needed
+      mlir::Value dim = castToIndex(dims[j], builder, loc);
+      stride = builder.create<mlir::arith::MulIOp>(loc, stride, dim);
+    }
+    strides.push_back(stride);
+  }
+
+  return strides;
+}
+
+/// Create memref type with layout
+mlir::MemRefType createMemRefWithLayout(mlir::ArrayRef<int64_t> shape,
+                                         mlir::Type elemType,
+                                         ::simp::TensorLayout layout,
+                                         mlir::MLIRContext* ctx) {
+  mlir::AffineMap layoutMap = createAffineMapForLayout(layout, shape.size(), ctx);
+  return mlir::MemRefType::get(shape, elemType, layoutMap);
+}
+
+/// Helper to cast i64 to index type
+mlir::Value castToIndex(mlir::Value val, mlir::OpBuilder& builder, mlir::Location loc) {
+  if (val.getType().isa<mlir::IndexType>()) {
+    return val;
+  }
+  return builder.create<mlir::arith::IndexCastOp>(loc, builder.getIndexType(), val);
+}
+
+//===----------------------------------------------------------------------===//
+// Type Promotion (C++ style)
+//===----------------------------------------------------------------------===//
+
+/// Get type precedence for C++ style promotion (higher = wider type)
+/// Float types always outrank integer types in mixed arithmetic
+int getTypePrecedence(mlir::Type type) {
+  if (auto floatTy = type.dyn_cast<mlir::FloatType>()) {
+    // Float precedence: f16=10, bf16=11, f32=12, f64=13
+    switch (floatTy.getWidth()) {
+      case 16: return floatTy.isBF16() ? 11 : 10;
+      case 32: return 12;
+      case 64: return 13;
+      default: return 10;
+    }
+  }
+  if (auto intTy = type.dyn_cast<mlir::IntegerType>()) {
+    if (intTy.getWidth() == 1) return 0;  // bool (lowest)
+    // Integer precedence: i8=1, i16=2, i32=3, i64=4 (below all floats)
+    return (intTy.getWidth() / 16) + 1;  // i8=1, i16=2, i32=3, i64=5
+  }
+  return 0;
+}
+
+/// Promote a value to target type following C++ rules
+mlir::Value promoteType(mlir::Value val, mlir::Type targetType,
+                        mlir::OpBuilder& builder, mlir::Location loc) {
+  mlir::Type srcType = val.getType();
+  if (srcType == targetType) return val;
+
+  // Float to float (extend or truncate)
+  if (srcType.isa<mlir::FloatType>() && targetType.isa<mlir::FloatType>()) {
+    auto srcFloat = srcType.cast<mlir::FloatType>();
+    auto targetFloat = targetType.cast<mlir::FloatType>();
+    if (targetFloat.getWidth() > srcFloat.getWidth()) {
+      return builder.create<mlir::arith::ExtFOp>(loc, targetType, val);
+    } else if (targetFloat.getWidth() < srcFloat.getWidth()) {
+      return builder.create<mlir::arith::TruncFOp>(loc, targetType, val);
+    }
+  }
+
+  // Int to int (extend or truncate)
+  if (srcType.isa<mlir::IntegerType>() && targetType.isa<mlir::IntegerType>()) {
+    auto srcInt = srcType.cast<mlir::IntegerType>();
+    auto targetInt = targetType.cast<mlir::IntegerType>();
+    if (srcInt.getWidth() == 1) return val;  // Don't convert bool
+    if (targetInt.getWidth() > srcInt.getWidth()) {
+      return builder.create<mlir::arith::ExtSIOp>(loc, targetType, val);
+    } else if (targetInt.getWidth() < srcInt.getWidth()) {
+      return builder.create<mlir::arith::TruncIOp>(loc, targetType, val);
+    }
+  }
+
+  // Int to float (C++ style: always promote int to float in mixed arithmetic)
+  if (srcType.isa<mlir::IntegerType>() && targetType.isa<mlir::FloatType>()) {
+    return builder.create<mlir::arith::SIToFPOp>(loc, targetType, val);
+  }
+
+  // Float to int (rarely needed, but support it)
+  if (srcType.isa<mlir::FloatType>() && targetType.isa<mlir::IntegerType>()) {
+    return builder.create<mlir::arith::FPToSIOp>(loc, targetType, val);
+  }
+
+  return val;  // No conversion possible
+}
+
+/// Apply C++ usual arithmetic conversions to binary operands
+/// Returns promoted operands with common type
+std::pair<mlir::Value, mlir::Value> applyUsualArithmeticConversions(
+    mlir::Value lhs, mlir::Value rhs, mlir::OpBuilder& builder, mlir::Location loc) {
+
+  mlir::Type lhsType = lhs.getType();
+  mlir::Type rhsType = rhs.getType();
+
+  if (lhsType == rhsType) {
+    return {lhs, rhs};
+  }
+
+  // Apply C++ usual arithmetic conversions
+  // Rule: promote to the "wider" type
+  int lhsPrec = getTypePrecedence(lhsType);
+  int rhsPrec = getTypePrecedence(rhsType);
+
+  if (lhsPrec > rhsPrec) {
+    // Promote rhs to lhs type
+    return {lhs, promoteType(rhs, lhsType, builder, loc)};
+  } else {
+    // Promote lhs to rhs type
+    return {promoteType(lhs, rhsType, builder, loc), rhs};
+  }
+}
+
+} // anonymous namespace
+
+//===----------------------------------------------------------------------===//
 // Type Conversion
 //===----------------------------------------------------------------------===//
 
 mlir::Type MLIRCodeGenContext::convertType(const std::string& simpType) {
-  // Handle basic types
-  if (simpType == "double" || simpType == "f64") {
-    return builder.getF64Type();
-  } else if (simpType == "float" || simpType == "f32") {
-    return builder.getF32Type();
-  } else if (simpType == "int" || simpType == "i64") {
-    return builder.getI64Type();
-  } else if (simpType == "i32") {
-    return builder.getI32Type();
-  } else if (simpType == "bool" || simpType == "i1") {
-    return builder.getI1Type();
+  // Handle basic types using TypeConverter
+  if (simpType.find('<') == std::string::npos && simpType.find('[') == std::string::npos) {
+    // Simple type (not array or tensor)
+    return TypeConverter::fromString(simpType, builder);
   }
 
   // Handle array types: "array<T>"
@@ -145,7 +421,12 @@ mlir::Type MLIRCodeGenContext::getMLIRType(TypeInfo* typeInfo) {
     return builder.getF32Type(); // Default (matches existing compiler)
   }
 
-  // Use the toString() method from TypeInfo
+  // For non-array types, use TypeConverter directly for better performance
+  if (!typeInfo->isArray()) {
+    return TypeConverter::toMLIRType(typeInfo->kind, builder);
+  }
+
+  // Use the toString() method from TypeInfo for arrays
   return convertType(typeInfo->toString());
 }
 
@@ -330,7 +611,12 @@ mlir::Value MLIRCodeGenContext::lowerBinaryOp(BinaryExprAST* binOp) {
     return nullptr;
   }
 
-  // Result type is the same as operand type (assuming both operands have same type)
+  // Apply C++ style type promotion for arithmetic operations
+  auto promoted = applyUsualArithmeticConversions(lhs, rhs, builder, loc);
+  lhs = promoted.first;
+  rhs = promoted.second;
+
+  // Result type is the promoted common type
   mlir::Type resultType = lhs.getType();
 
   // Create the appropriate operation based on the operator
@@ -437,21 +723,34 @@ mlir::Value MLIRCodeGenContext::lowerArrayCreate(ArrayCreateExprAST* arrayCreate
     return nullptr;
   }
 
-  // Lower the first dimension as size
-  mlir::Value size = lowerExpression(dimensions[0].get());
-  if (!size) {
-    llvm::errs() << "Error: Failed to lower array size\n";
-    return nullptr;
+  // Lower all dimensions
+  mlir::SmallVector<mlir::Value> dimValues;
+  for (const auto& dim : dimensions) {
+    mlir::Value dimValue = lowerExpression(dim.get());
+    if (!dimValue) {
+      llvm::errs() << "Error: Failed to lower array dimension\n";
+      return nullptr;
+    }
+    dimValues.push_back(dimValue);
+  }
+
+  // Calculate total size as product of all dimensions
+  // size = d0 * d1 * d2 * ... * dn
+  mlir::Value totalSize = dimValues[0];
+  for (size_t i = 1; i < dimValues.size(); ++i) {
+    totalSize = builder.create<mlir::arith::MulIOp>(loc, totalSize, dimValues[i]);
   }
 
   // Get element type
   mlir::Type elemType = getMLIRType(arrayCreate->getElementType());
 
-  // Create the array type
+  // Create the array type (still 1D, but stores total size)
   mlir::Type arrayType = mlir::simp::ArrayType::get(&mlirContext, elemType);
 
-  // Create simp.array_create operation
-  return builder.create<mlir::simp::ArrayCreateOp>(loc, arrayType, size);
+  // Create simp.array_create operation with total flattened size
+  // Note: Dimensions are tracked by variable name in lowerDeclaration,
+  // not by SSA value here, since the value changes when assigned to variables
+  return builder.create<mlir::simp::ArrayCreateOp>(loc, arrayType, totalSize);
 }
 
 mlir::Value MLIRCodeGenContext::lowerArrayAccess(ArrayAccessExprAST* arrayAccess,
@@ -465,21 +764,119 @@ mlir::Value MLIRCodeGenContext::lowerArrayAccess(ArrayAccessExprAST* arrayAccess
     return nullptr;
   }
 
-  // Lower the index expression (first index for now)
+  // Lower all index expressions
   const auto& indices = arrayAccess->getIndices();
   if (indices.empty()) {
     llvm::errs() << "Error: Array access requires at least one index\n";
     return nullptr;
   }
 
-  mlir::Value index = lowerExpression(indices[0].get());
-  if (!index) {
-    llvm::errs() << "Error: Failed to lower array index\n";
-    return nullptr;
+  mlir::SmallVector<mlir::Value> indexValues;
+  for (const auto& idx : indices) {
+    mlir::Value indexValue = lowerExpression(idx.get());
+    if (!indexValue) {
+      llvm::errs() << "Error: Failed to lower array index\n";
+      return nullptr;
+    }
+    indexValues.push_back(indexValue);
+  }
+
+  // Compute flattened index for multi-dimensional arrays
+  mlir::Value flatIndex;
+
+  if (indexValues.size() == 1) {
+    // Simple 1D case
+    flatIndex = indexValues[0];
+  } else {
+    // Multi-dimensional: compute flattened index using row-major layout
+    // flat_index = i0 * (D1*D2*...*Dn) + i1 * (D2*D3*...*Dn) + ... + in
+
+    // Get the array variable name (if this is a variable reference)
+    std::string arrayVarName;
+    if (arrayAccess->getArray()->getKind() == ASTKind::VariableExpr) {
+      VariableExprAST* varExpr = static_cast<VariableExprAST*>(arrayAccess->getArray());
+      arrayVarName = varExpr->getName();
+    }
+
+    // Look up stored dimensions for this array by variable name
+    auto dimIt = arrayDimensions.find(arrayVarName);
+    if (dimIt == arrayDimensions.end() || arrayVarName.empty()) {
+      llvm::errs() << "Error: Multi-dimensional array access but dimensions not tracked\n";
+      llvm::errs() << "       Variable name: " << (arrayVarName.empty() ? "<unknown>" : arrayVarName) << "\n";
+      llvm::errs() << "       This array may not have been created with explicit dimensions\n";
+      return nullptr;
+    }
+
+    const auto& dims = dimIt->second;
+    if (indexValues.size() != dims.size()) {
+      llvm::errs() << "Error: Index count (" << indexValues.size()
+                   << ") doesn't match array dimensions (" << dims.size() << ")\n";
+      return nullptr;
+    }
+
+    // Compute strides: stride[i] = product(dims[i+1] ... dims[n-1])
+    // For [D0, D1, D2], strides are [D1*D2, D2, 1]
+    mlir::SmallVector<mlir::Value> strides = computeRowMajorStrides(dims, builder, loc);
+
+    // Compute flat_index = sum(indices[i] * strides[i])
+    // Cast all values to index type for arithmetic
+    mlir::Value idx0 = castToIndex(indexValues[0], builder, loc);
+    flatIndex = builder.create<mlir::arith::MulIOp>(loc, idx0, strides[0]);
+    for (size_t i = 1; i < indexValues.size(); ++i) {
+      mlir::Value idx = castToIndex(indexValues[i], builder, loc);
+      mlir::Value term = builder.create<mlir::arith::MulIOp>(loc, idx, strides[i]);
+      flatIndex = builder.create<mlir::arith::AddIOp>(loc, flatIndex, term);
+    }
+  }
+
+  // Ensure final index is i64 for array operations
+  mlir::Value index = flatIndex;
+  if (!index.getType().isa<mlir::IntegerType>() ||
+      index.getType().cast<mlir::IntegerType>().getWidth() != 64) {
+    index = builder.create<mlir::arith::IndexCastOp>(loc, builder.getI64Type(), flatIndex);
   }
 
   // If newValue is provided, this is an array_set
   if (newValue) {
+    // Cast value to match array element type if needed
+    auto arrayType = array.getType().dyn_cast<mlir::simp::ArrayType>();
+    if (arrayType) {
+      mlir::Type elemType = arrayType.getElementType();
+      mlir::Type valueType = newValue.getType();
+
+      if (elemType != valueType) {
+        // Handle float type mismatches
+        if (elemType.isa<mlir::FloatType>() && valueType.isa<mlir::FloatType>()) {
+          auto expectedFloat = elemType.cast<mlir::FloatType>();
+          auto actualFloat = valueType.cast<mlir::FloatType>();
+
+          if (expectedFloat.getWidth() > actualFloat.getWidth()) {
+            // Extend: f32 -> f64, f16 -> f32, etc.
+            newValue = builder.create<mlir::arith::ExtFOp>(loc, elemType, newValue);
+          } else {
+            // Truncate: f64 -> f32, f32 -> f16, etc.
+            newValue = builder.create<mlir::arith::TruncFOp>(loc, elemType, newValue);
+          }
+        } else if (elemType.isa<mlir::IntegerType>() && valueType.isa<mlir::IntegerType>()) {
+          // Handle integer conversions
+          auto expectedInt = elemType.cast<mlir::IntegerType>();
+          auto actualInt = valueType.cast<mlir::IntegerType>();
+
+          if (expectedInt.getWidth() > actualInt.getWidth()) {
+            newValue = builder.create<mlir::arith::ExtSIOp>(loc, elemType, newValue);
+          } else if (expectedInt.getWidth() < actualInt.getWidth()) {
+            newValue = builder.create<mlir::arith::TruncIOp>(loc, elemType, newValue);
+          }
+        } else if (elemType.isa<mlir::FloatType>() && valueType.isa<mlir::IntegerType>()) {
+          // Int to float conversion (C++ style promotion)
+          newValue = builder.create<mlir::arith::SIToFPOp>(loc, elemType, newValue);
+        } else if (elemType.isa<mlir::IntegerType>() && valueType.isa<mlir::FloatType>()) {
+          // Float to int conversion (truncation)
+          newValue = builder.create<mlir::arith::FPToSIOp>(loc, elemType, newValue);
+        }
+      }
+    }
+
     return builder.create<mlir::simp::ArraySetOp>(loc, array.getType(),
                                                    array, index, newValue);
   } else {
@@ -513,17 +910,60 @@ mlir::Value MLIRCodeGenContext::lowerArrayStore(ArrayStoreExprAST* arrayStore) {
     return nullptr;
   }
 
-  // Lower the index expression (first index for now)
+  // Lower all index expressions
   const auto& indices = arrayStore->getIndices();
   if (indices.empty()) {
     llvm::errs() << "Error: Array store requires at least one index\n";
     return nullptr;
   }
 
-  mlir::Value index = lowerExpression(indices[0].get());
-  if (!index) {
-    llvm::errs() << "Error: Failed to lower array index in store\n";
-    return nullptr;
+  mlir::SmallVector<mlir::Value> indexValues;
+  for (const auto& idx : indices) {
+    mlir::Value indexValue = lowerExpression(idx.get());
+    if (!indexValue) {
+      llvm::errs() << "Error: Failed to lower array index in store\n";
+      return nullptr;
+    }
+    indexValues.push_back(indexValue);
+  }
+
+  // Compute flattened index for multi-dimensional arrays
+  mlir::Value index;
+  if (indexValues.size() == 1) {
+    index = indexValues[0];
+  } else {
+    // Multi-dimensional: flatten using row-major stride computation
+    // Look up dimensions by variable name
+    auto dimIt = arrayDimensions.find(varName);
+    if (dimIt == arrayDimensions.end()) {
+      llvm::errs() << "Error: Multi-dimensional array dimensions not tracked for " << varName << "\n";
+      return nullptr;
+    }
+
+    const auto& dims = dimIt->second;
+    if (dims.size() != indexValues.size()) {
+      llvm::errs() << "Error: Dimension mismatch in array store\n";
+      return nullptr;
+    }
+
+    // Compute row-major strides
+    mlir::SmallVector<mlir::Value> strides = computeRowMajorStrides(dims, builder, loc);
+
+    // Flatten: index = i0*stride[0] + i1*stride[1] + ... + in*stride[n]
+    mlir::Value idx0 = castToIndex(indexValues[0], builder, loc);
+    index = builder.create<mlir::arith::MulIOp>(loc, idx0, strides[0]);
+
+    for (size_t i = 1; i < indexValues.size(); ++i) {
+      mlir::Value idx = castToIndex(indexValues[i], builder, loc);
+      mlir::Value term = builder.create<mlir::arith::MulIOp>(loc, idx, strides[i]);
+      index = builder.create<mlir::arith::AddIOp>(loc, index, term);
+    }
+  }
+
+  // Cast to i64 for array operations
+  if (!index.getType().isa<mlir::IntegerType>() ||
+      index.getType().cast<mlir::IntegerType>().getWidth() != 64) {
+    index = builder.create<mlir::arith::IndexCastOp>(loc, builder.getI64Type(), index);
   }
 
   // Lower the value to store
@@ -531,6 +971,45 @@ mlir::Value MLIRCodeGenContext::lowerArrayStore(ArrayStoreExprAST* arrayStore) {
   if (!value) {
     llvm::errs() << "Error: Failed to lower value in array store\n";
     return nullptr;
+  }
+
+  // Cast value to match array element type if needed
+  auto arrayType = array.getType().dyn_cast<mlir::simp::ArrayType>();
+  if (arrayType) {
+    mlir::Type elemType = arrayType.getElementType();
+    mlir::Type valueType = value.getType();
+
+    if (elemType != valueType) {
+      // Handle float type mismatches
+      if (elemType.isa<mlir::FloatType>() && valueType.isa<mlir::FloatType>()) {
+        auto expectedFloat = elemType.cast<mlir::FloatType>();
+        auto actualFloat = valueType.cast<mlir::FloatType>();
+
+        if (expectedFloat.getWidth() > actualFloat.getWidth()) {
+          // Extend: f32 -> f64, f16 -> f32, etc.
+          value = builder.create<mlir::arith::ExtFOp>(loc, elemType, value);
+        } else {
+          // Truncate: f64 -> f32, f32 -> f16, etc.
+          value = builder.create<mlir::arith::TruncFOp>(loc, elemType, value);
+        }
+      } else if (elemType.isa<mlir::IntegerType>() && valueType.isa<mlir::IntegerType>()) {
+        // Handle integer conversions
+        auto expectedInt = elemType.cast<mlir::IntegerType>();
+        auto actualInt = valueType.cast<mlir::IntegerType>();
+
+        if (expectedInt.getWidth() > actualInt.getWidth()) {
+          value = builder.create<mlir::arith::ExtSIOp>(loc, elemType, value);
+        } else if (expectedInt.getWidth() < actualInt.getWidth()) {
+          value = builder.create<mlir::arith::TruncIOp>(loc, elemType, value);
+        }
+      } else if (elemType.isa<mlir::FloatType>() && valueType.isa<mlir::IntegerType>()) {
+        // Int to float conversion (C++ style promotion)
+        value = builder.create<mlir::arith::SIToFPOp>(loc, elemType, value);
+      } else if (elemType.isa<mlir::IntegerType>() && valueType.isa<mlir::FloatType>()) {
+        // Float to int conversion (truncation)
+        value = builder.create<mlir::arith::FPToSIOp>(loc, elemType, value);
+      }
+    }
   }
 
   // Create simp.array_set operation (returns new array in SSA form)
@@ -618,7 +1097,47 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
     args.push_back(arg);
   }
 
-  // Look up the function in the module
+  // Handle builtin functions: conv2d
+  if (calleeName == "conv2d") {
+    // conv2d(input, weights, bias, output, batch, in_h, in_w, in_c, out_c, k_h, k_w, stride_h, stride_w, pad_h, pad_w)
+    if (args.size() != 15) {
+      llvm::errs() << "Error: conv2d requires 15 arguments (got " << args.size() << ")\n";
+      return nullptr;
+    }
+
+    mlir::Value input = args[0];
+    mlir::Value weights = args[1];
+    mlir::Value bias = args[2];
+    mlir::Value output = args[3];
+    mlir::Value batch = args[4];
+    mlir::Value in_h = args[5];
+    mlir::Value in_w = args[6];
+    mlir::Value in_c = args[7];
+    mlir::Value out_c = args[8];
+    mlir::Value kernel_h = args[9];
+    mlir::Value kernel_w = args[10];
+    mlir::Value stride_h = args[11];
+    mlir::Value stride_w = args[12];
+    mlir::Value pad_h = args[13];
+    mlir::Value pad_w = args[14];
+
+    // Get the output array type to determine return type
+    mlir::Type outputArrayType = output.getType();
+
+    // Create the simp.conv2d operation
+    auto conv2dOp = builder.create<simp::Conv2DOp>(
+        loc,
+        outputArrayType,  // Result type (same as output buffer)
+        input, weights, bias, output,
+        batch, in_h, in_w, in_c,
+        out_c, kernel_h, kernel_w,
+        stride_h, stride_w, pad_h, pad_w
+    );
+
+    return conv2dOp.getResult();
+  }
+
+  // Look up user-defined functions in the module
   mlir::FuncOp callee = module.lookupSymbol<mlir::FuncOp>(calleeName);
   if (!callee) {
     llvm::errs() << "Error: Undefined function '" << calleeName << "'\n";
@@ -686,6 +1205,13 @@ mlir::LogicalResult MLIRCodeGenContext::lowerStatement(StmtAST* stmt) {
 }
 
 mlir::LogicalResult MLIRCodeGenContext::lowerDeclaration(VariableDeclarationAST* decl) {
+  // Check if this is an array creation - we need to track dimensions
+  ExprAST* initExpr = decl->getAssignmentExpr();
+  ArrayCreateExprAST* arrayCreate = nullptr;
+  if (initExpr && initExpr->getKind() == ASTKind::ArrayCreateExpr) {
+    arrayCreate = static_cast<ArrayCreateExprAST*>(initExpr);
+  }
+
   // Lower the initialization expression
   mlir::Value initValue = lowerExpression(decl->getAssignmentExpr());
   if (!initValue) {
@@ -694,6 +1220,20 @@ mlir::LogicalResult MLIRCodeGenContext::lowerDeclaration(VariableDeclarationAST*
 
   // Declare the variable in the symbol table
   declareVariable(decl->getName(), initValue);
+
+  // If this was an array creation with multiple dimensions, store the dimensions
+  if (arrayCreate && arrayCreate->getDimensions().size() > 1) {
+    llvm::SmallVector<mlir::Value, 4> dimValues;
+    for (const auto& dim : arrayCreate->getDimensions()) {
+      mlir::Value dimValue = lowerExpression(dim.get());
+      if (dimValue) {
+        dimValues.push_back(dimValue);
+      }
+    }
+    if (dimValues.size() > 1) {
+      arrayDimensions[decl->getName()] = dimValues;
+    }
+  }
 
   return mlir::success();
 }
@@ -705,6 +1245,42 @@ mlir::LogicalResult MLIRCodeGenContext::lowerReturn(ReturnAST* ret) {
   mlir::Value returnValue = lowerExpression(ret->getExpression());
   if (!returnValue) {
     return mlir::failure();
+  }
+
+  // Check if we need to cast to match function return type
+  if (currentFunction) {
+    mlir::Type expectedType = currentFunction.getType().getResult(0);
+    mlir::Type actualType = returnValue.getType();
+
+    if (expectedType != actualType) {
+      // Need to cast - handle float type mismatches (f32 <-> f64, f16, bf16)
+      if (expectedType.isa<mlir::FloatType>() && actualType.isa<mlir::FloatType>()) {
+        // Use fpext (extend) or fptrunc (truncate) based on bitwidths
+        auto expectedFloat = expectedType.cast<mlir::FloatType>();
+        auto actualFloat = actualType.cast<mlir::FloatType>();
+
+        if (expectedFloat.getWidth() > actualFloat.getWidth()) {
+          // Extend: f32 -> f64, f16 -> f32, etc.
+          returnValue = builder.create<mlir::arith::ExtFOp>(loc, expectedType, returnValue);
+        } else {
+          // Truncate: f64 -> f32, f32 -> f16, etc.
+          returnValue = builder.create<mlir::arith::TruncFOp>(loc, expectedType, returnValue);
+        }
+      } else if (expectedType.isa<mlir::IntegerType>() && actualType.isa<mlir::IntegerType>()) {
+        // Integer conversions
+        auto expectedInt = expectedType.cast<mlir::IntegerType>();
+        auto actualInt = actualType.cast<mlir::IntegerType>();
+
+        if (expectedInt.getWidth() > actualInt.getWidth()) {
+          // Sign extend for now (could check signedness)
+          returnValue = builder.create<mlir::arith::ExtSIOp>(loc, expectedType, returnValue);
+        } else if (expectedInt.getWidth() < actualInt.getWidth()) {
+          // Truncate
+          returnValue = builder.create<mlir::arith::TruncIOp>(loc, expectedType, returnValue);
+        }
+      }
+      // TODO: Handle other type mismatches (int <-> float, etc.)
+    }
   }
 
   // Create return operation (Standard dialect in MLIR 14)
@@ -862,15 +1438,107 @@ mlir::LogicalResult MLIRCodeGenContext::lowerWhile(WhileAST* whileLoop) {
   // Collect initial values of loop-carried variables
   std::vector<mlir::Value> initialValues = collectVariableValues(modifiedVars);
 
-  // Determine types for iter_args
-  llvm::SmallVector<mlir::Type, 4> iterTypes;
-  for (const auto& value : initialValues) {
-    iterTypes.push_back(value.getType());
+  // PROPER TYPE INFERENCE: Analyze loop body to determine final types after promotions
+  // We need to simulate the loop body to see what types variables will have
+  std::map<std::string, mlir::Type> inferredTypes;
+
+  // Start with current types
+  size_t idx = 0;
+  for (const auto& varName : modifiedVars) {
+    inferredTypes[varName] = initialValues[idx].getType();
+    idx++;
   }
 
-  // Create the scf.while operation with iter_args
-  // scf.while has two regions: "before" (condition) and "after" (body)
-  auto whileOp = builder.create<mlir::scf::WhileOp>(loc, iterTypes, initialValues);
+  // Helper lambda to recursively analyze statements for type promotions
+  std::function<void(StmtAST*)> analyzeStatement = [&](StmtAST* stmt) {
+    if (!stmt) return;
+
+    if (stmt->getKind() == ASTKind::ExpressionStmt) {
+      auto* exprStmt = static_cast<ExpressionStmtAST*>(stmt);
+      ExprAST* expr = exprStmt->getExpression();
+
+      // Check for assignments that might promote types
+      if (expr && expr->getKind() == ASTKind::AssignmentExpr) {
+        auto* assign = static_cast<AssignmentExprAST*>(expr);
+        VariableExprAST* lhs = assign->getLHS();
+        if (!lhs) return;
+
+        std::string varName = lhs->getName();
+
+        // If this is a modified variable, infer its promoted type
+        if (modifiedVars.find(varName) != modifiedVars.end()) {
+          // Detect patterns like: sum = sum + array[i] where array[i] might be wider type
+          ExprAST* rhs = assign->getRHS();
+          if (rhs && rhs->getKind() == ASTKind::BinaryExpr) {
+            auto* binOp = static_cast<BinaryExprAST*>(rhs);
+            // Check if one operand is array access (might be f64)
+            bool hasArrayAccess = false;
+            if (binOp->getLeft() && binOp->getLeft()->getKind() == ASTKind::ArrayAccessExpr) hasArrayAccess = true;
+            if (binOp->getRight() && binOp->getRight()->getKind() == ASTKind::ArrayAccessExpr) hasArrayAccess = true;
+
+            if (hasArrayAccess) {
+              // Array access involved - assume widest float type
+              mlir::Type currentType = inferredTypes[varName];
+              if (currentType.isa<mlir::FloatType>()) {
+                inferredTypes[varName] = builder.getF64Type();
+              }
+            }
+          }
+        }
+      }
+    } else if (stmt->getKind() == ASTKind::WhileStmt) {
+      // RECURSIVE CASE: Analyze nested while loop body
+      auto* nestedWhile = static_cast<WhileAST*>(stmt);
+      BlockAST* nestedBody = nestedWhile->getBody();
+      if (nestedBody) {
+        for (auto* nestedStmt : nestedBody->statements) {
+          analyzeStatement(nestedStmt);  // Recurse into nested loop
+        }
+      }
+    }
+  };
+
+  // Simulate loop body type evolution by recursively analyzing all statements
+  BlockAST* body = whileLoop->getBody();
+  if (body) {
+    for (auto* stmt : body->statements) {
+      analyzeStatement(stmt);
+    }
+  }
+
+  // Build final iter_args types and promoted initial values
+  llvm::SmallVector<mlir::Type, 4> iterTypes;
+  std::vector<mlir::Value> promotedInitialValues;
+
+  idx = 0;
+  for (const auto& varName : modifiedVars) {
+    mlir::Type originalType = initialValues[idx].getType();
+    mlir::Type inferredType = inferredTypes[varName];
+
+    // Use the wider of original and inferred types
+    mlir::Type useType = originalType;
+    if (inferredType != originalType) {
+      int origPrec = getTypePrecedence(originalType);
+      int inferPrec = getTypePrecedence(inferredType);
+      if (inferPrec > origPrec) {
+        useType = inferredType;
+      }
+    }
+
+    iterTypes.push_back(useType);
+
+    // Promote initial value if needed
+    mlir::Value promotedValue = initialValues[idx];
+    if (useType != originalType) {
+      promotedValue = promoteType(initialValues[idx], useType, builder, loc);
+    }
+    promotedInitialValues.push_back(promotedValue);
+
+    idx++;
+  }
+
+  // Create the scf.while operation with iter_args using inferred types
+  auto whileOp = builder.create<mlir::scf::WhileOp>(loc, iterTypes, promotedInitialValues);
 
   // Build the "before" region (condition check)
   {
@@ -961,8 +1629,8 @@ mlir::LogicalResult MLIRCodeGenContext::lowerWhile(WhileAST* whileLoop) {
       if (!value) {
         // This shouldn't happen if tracking is correct
         auto it = std::find(modifiedVars.begin(), modifiedVars.end(), varName);
-        size_t idx = std::distance(modifiedVars.begin(), it);
-        value = afterBlock->getArgument(idx);
+        size_t varIdx = std::distance(modifiedVars.begin(), it);
+        value = afterBlock->getArgument(varIdx);
       }
       nextIterValues.push_back(value);
     }
@@ -970,6 +1638,7 @@ mlir::LogicalResult MLIRCodeGenContext::lowerWhile(WhileAST* whileLoop) {
     popScope();
 
     // Terminate with scf.yield, passing updated values back to condition
+    // Types should match now due to proper type inference above
     builder.create<mlir::scf::YieldOp>(loc, nextIterValues);
   }
 

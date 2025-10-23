@@ -53,7 +53,7 @@
 %token <string> TIDENTIFIER TINTEGER TFLOAT TINTLIT TSTRING
 %token TCEQ TCNE TCLE TCGE TARROW
 %token TVAR TFUNC TIF TELSE TWHILE TRETURN TINCLUDE TIMPORT
-%token TF32 TF64 TI8 TI16 TI32 TI64 TU8 TU16 TU32 TU64 TBOOL TVOID
+%token TF16 TBF16 TF32 TF64 TI8 TI16 TI32 TI64 TU8 TU16 TU32 TU64 TBOOL TVOID
 %token TSSE TAVX    /* Vector creation tokens */
 %token TSIMD TAUTO TAVX512 TNEON TSVE
 %token TLPAREN TRPAREN TLBRACE TRBRACE
@@ -188,7 +188,9 @@ slice_type : TSSESLICE { $$ = new SliceTypeAST(SliceType::SSE_SLICE); }
           | TAVXSLICE { $$ = new SliceTypeAST(SliceType::AVX_SLICE); }
           ;
 
-type_spec : TF32 { $$ = new TypeInfo(TypeKind::F32); }
+type_spec : TF16 { $$ = new TypeInfo(TypeKind::F16); }
+         | TBF16 { $$ = new TypeInfo(TypeKind::BF16); }
+         | TF32 { $$ = new TypeInfo(TypeKind::F32); }
          | TF64 { $$ = new TypeInfo(TypeKind::F64); }
          | TI8 { $$ = new TypeInfo(TypeKind::I8); }
          | TI16 { $$ = new TypeInfo(TypeKind::I16); }
