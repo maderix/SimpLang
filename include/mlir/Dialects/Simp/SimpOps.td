@@ -455,4 +455,88 @@ def Simp_Conv2DOp : Simp_Op<"conv2d", [NoSideEffect]> {
   }];
 }
 
+// ============================================================================
+// LLM/Transformer Operations
+// ============================================================================
+
+def Simp_RMSNormOp : Simp_Op<"rmsnorm", [NoSideEffect]> {
+  let summary = "Root Mean Square Layer Normalization";
+  let description = [{
+    Computes RMSNorm: output = (input / rms) * weight
+    where rms = sqrt(mean(input^2) + epsilon)
+
+    Used in LLaMA and other modern transformers instead of LayerNorm.
+  }];
+
+  let arguments = (ins
+    Simp_ArrayType:$input,    // Input array [size]
+    Simp_ArrayType:$weight,   // Learned weights [size]
+    Simp_ArrayType:$output,   // Output array [size] (pre-allocated)
+    I64:$size,                // Vector size
+    AnyFloat:$epsilon         // Numerical stability (typically 1e-5)
+  );
+
+  let results = (outs Simp_ArrayType:$result);
+
+  let assemblyFormat = [{
+    `(` $input `,` $weight `,` $output `,` $size `,` $epsilon `)`
+    attr-dict `:`
+    `(` type($input) `,` type($weight) `,` type($output) `,` type($size) `,` type($epsilon) `)`
+    `->` type($result)
+  }];
+}
+
+def Simp_SoftmaxOp : Simp_Op<"softmax", [NoSideEffect]> {
+  let summary = "Numerically stable softmax";
+  let description = [{
+    Computes softmax with max subtraction for numerical stability:
+    1. max_val = max(input)
+    2. exp_vals = exp(input - max_val)
+    3. sum_exp = sum(exp_vals)
+    4. output = exp_vals / sum_exp
+
+    Used in attention mechanisms.
+  }];
+
+  let arguments = (ins
+    Simp_ArrayType:$input,    // Input logits [size]
+    Simp_ArrayType:$output,   // Output probabilities [size] (pre-allocated)
+    I64:$size                 // Vector size
+  );
+
+  let results = (outs Simp_ArrayType:$result);
+
+  let assemblyFormat = [{
+    `(` $input `,` $output `,` $size `)`
+    attr-dict `:`
+    `(` type($input) `,` type($output) `,` type($size) `)`
+    `->` type($result)
+  }];
+}
+
+def Simp_SiLUOp : Simp_Op<"silu", [NoSideEffect]> {
+  let summary = "SiLU (Swish) activation function";
+  let description = [{
+    Computes SiLU activation: output = x / (1 + exp(-x))
+    Also known as Swish activation.
+
+    Used in SwiGLU feedforward networks.
+  }];
+
+  let arguments = (ins
+    Simp_ArrayType:$input,    // Input array [size]
+    Simp_ArrayType:$output,   // Output array [size] (pre-allocated)
+    I64:$size                 // Vector size
+  );
+
+  let results = (outs Simp_ArrayType:$result);
+
+  let assemblyFormat = [{
+    `(` $input `,` $output `,` $size `)`
+    attr-dict `:`
+    `(` type($input) `,` type($output) `,` type($size) `)`
+    `->` type($result)
+  }];
+}
+
 #endif // SIMP_OPS

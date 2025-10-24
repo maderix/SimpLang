@@ -60,6 +60,7 @@ add_mlir_dialect_library(simp_dialect
   MLIRAffine
   MLIRAffineTransforms
   MLIRArithmetic
+  MLIRMath
   MLIRMemRef
   MLIRLinalg
   MLIRLinalgTransforms
@@ -69,6 +70,7 @@ add_mlir_dialect_library(simp_dialect
   MLIRLLVMIR
   MLIRLLVMCommonConversion
   MLIRArithmeticToLLVM
+  MLIRMathToLLVM
   MLIRLinalgToLLVM
   MLIRMemRefToLLVM
   MLIRSCFToStandard

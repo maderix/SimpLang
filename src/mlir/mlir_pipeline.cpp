@@ -23,6 +23,7 @@
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/SCF.h"
 #include "mlir/Dialect/StandardOps/IR/Ops.h"
@@ -34,6 +35,7 @@
 #include "mlir/Conversion/LinalgToLLVM/LinalgToLLVM.h"
 #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
+#include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Conversion/SCFToStandard/SCFToStandard.h"
 #include "mlir/Conversion/StandardToLLVM/ConvertStandardToLLVM.h"
@@ -274,6 +276,9 @@ bool MLIRCompilationPipeline::runToLLVMDialectLowering() {
 
   // Add patterns for Arith → LLVM
   mlir::arith::populateArithmeticToLLVMConversionPatterns(typeConverter, patterns);
+
+  // Add patterns for Math → LLVM
+  mlir::populateMathToLLVMConversionPatterns(typeConverter, patterns);
 
   // Add patterns for MemRef → LLVM
   mlir::populateMemRefToLLVMConversionPatterns(typeConverter, patterns);

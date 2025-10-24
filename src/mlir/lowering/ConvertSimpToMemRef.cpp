@@ -9,6 +9,7 @@
 
 #include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/SCF.h"
 #include "mlir/Dialect/SCF/Transforms.h"
@@ -648,6 +649,199 @@ struct Conv2DOpLowering : public OpConversionPattern<simp::Conv2DOp> {
 };
 
 //===----------------------------------------------------------------------===//
+// LLM/Transformer Operations
+//===----------------------------------------------------------------------===//
+
+// RMSNorm: output = (input / sqrt(mean(input^2) + eps)) * weight
+struct RMSNormOpLowering : public OpConversionPattern<simp::RMSNormOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      simp::RMSNormOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+
+    auto loc = op.getLoc();
+    auto input = adaptor.input();
+    auto weight = adaptor.weight();
+    auto output = adaptor.output();
+    auto size = adaptor.size();
+    auto epsilon = adaptor.epsilon();
+
+    // Extract element type
+    auto inputType = input.getType().dyn_cast<MemRefType>();
+    auto elemType = inputType.getElementType();
+
+    // Constants
+    auto c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    auto c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    auto sizeIdx = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), size);
+    auto zeroFloat = rewriter.create<arith::ConstantOp>(loc, elemType, rewriter.getFloatAttr(elemType, 0.0));
+
+    // Cast epsilon to element type if needed
+    Value epsFloat = epsilon;
+    if (epsilon.getType() != elemType) {
+      if (epsilon.getType().cast<FloatType>().getWidth() > elemType.cast<FloatType>().getWidth()) {
+        epsFloat = rewriter.create<arith::TruncFOp>(loc, elemType, epsilon);
+      } else {
+        epsFloat = rewriter.create<arith::ExtFOp>(loc, elemType, epsilon);
+      }
+    }
+
+    // Step 1: Compute sum of squares
+    auto sumSqAlloc = rewriter.create<memref::AllocaOp>(loc, MemRefType::get({}, elemType));
+    rewriter.create<memref::StoreOp>(loc, zeroFloat, sumSqAlloc, ValueRange{});
+
+    auto sumLoop = rewriter.create<scf::ForOp>(loc, c0, sizeIdx, c1);
+    rewriter.setInsertionPointToStart(sumLoop.getBody());
+
+    auto i = sumLoop.getInductionVar();
+    auto val = rewriter.create<memref::LoadOp>(loc, input, ValueRange{i});
+    auto sq = rewriter.create<arith::MulFOp>(loc, val, val);
+    auto currentSum = rewriter.create<memref::LoadOp>(loc, sumSqAlloc, ValueRange());
+    auto newSum = rewriter.create<arith::AddFOp>(loc, currentSum, sq);
+    rewriter.create<memref::StoreOp>(loc, newSum, sumSqAlloc, ValueRange());
+
+    rewriter.setInsertionPointAfter(sumLoop);
+
+    // Step 2: Compute RMS = sqrt(mean + epsilon)
+    auto sumSq = rewriter.create<memref::LoadOp>(loc, sumSqAlloc, ValueRange());
+    auto sizeFloat = rewriter.create<arith::IndexCastOp>(loc, rewriter.getI64Type(), sizeIdx);
+    auto sizeFP = rewriter.create<arith::SIToFPOp>(loc, elemType, sizeFloat);
+    auto mean = rewriter.create<arith::DivFOp>(loc, sumSq, sizeFP);
+    auto meanEps = rewriter.create<arith::AddFOp>(loc, mean, epsFloat);
+    auto rms = rewriter.create<math::SqrtOp>(loc, meanEps);
+
+    // Step 3: Normalize and scale
+    auto normLoop = rewriter.create<scf::ForOp>(loc, c0, sizeIdx, c1);
+    rewriter.setInsertionPointToStart(normLoop.getBody());
+
+    auto normI = normLoop.getInductionVar();
+    auto normVal = rewriter.create<memref::LoadOp>(loc, input, ValueRange{normI});
+    auto w = rewriter.create<memref::LoadOp>(loc, weight, ValueRange{normI});
+    auto norm = rewriter.create<arith::DivFOp>(loc, normVal, rms);
+    auto scaled = rewriter.create<arith::MulFOp>(loc, norm, w);
+    rewriter.create<memref::StoreOp>(loc, scaled, output, ValueRange{normI});
+
+    rewriter.setInsertionPointAfter(normLoop);
+    rewriter.replaceOp(op, output);
+    return success();
+  }
+};
+
+// Softmax: output = exp(input - max) / sum(exp(input - max))
+struct SoftmaxOpLowering : public OpConversionPattern<simp::SoftmaxOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      simp::SoftmaxOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+
+    auto loc = op.getLoc();
+    auto input = adaptor.input();
+    auto output = adaptor.output();
+    auto size = adaptor.size();
+
+    auto inputType = input.getType().dyn_cast<MemRefType>();
+    auto elemType = inputType.getElementType();
+
+    auto c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    auto c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    auto sizeIdx = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), size);
+
+    // Step 1: Find max value
+    auto firstVal = rewriter.create<memref::LoadOp>(loc, input, ValueRange{c0});
+    auto maxAlloc = rewriter.create<memref::AllocaOp>(loc, MemRefType::get({}, elemType));
+    rewriter.create<memref::StoreOp>(loc, firstVal, maxAlloc, ValueRange());
+
+    auto maxLoop = rewriter.create<scf::ForOp>(loc, c1, sizeIdx, c1);
+    rewriter.setInsertionPointToStart(maxLoop.getBody());
+
+    auto i = maxLoop.getInductionVar();
+    auto val = rewriter.create<memref::LoadOp>(loc, input, ValueRange{i});
+    auto currentMax = rewriter.create<memref::LoadOp>(loc, maxAlloc, ValueRange());
+    // Use compare + select instead of MaxFOp
+    auto cmp = rewriter.create<arith::CmpFOp>(loc, arith::CmpFPredicate::OGT, val, currentMax);
+    auto newMax = rewriter.create<mlir::SelectOp>(loc, cmp, val, currentMax);
+    rewriter.create<memref::StoreOp>(loc, newMax, maxAlloc, ValueRange());
+
+    rewriter.setInsertionPointAfter(maxLoop);
+    auto maxVal = rewriter.create<memref::LoadOp>(loc, maxAlloc, ValueRange());
+
+    // Step 2: Compute exp(input - max) and sum
+    auto zeroFloat = rewriter.create<arith::ConstantOp>(loc, elemType, rewriter.getFloatAttr(elemType, 0.0));
+    auto sumAlloc = rewriter.create<memref::AllocaOp>(loc, MemRefType::get({}, elemType));
+    rewriter.create<memref::StoreOp>(loc, zeroFloat, sumAlloc, ValueRange());
+
+    auto expLoop = rewriter.create<scf::ForOp>(loc, c0, sizeIdx, c1);
+    rewriter.setInsertionPointToStart(expLoop.getBody());
+
+    auto expI = expLoop.getInductionVar();
+    auto expInputVal = rewriter.create<memref::LoadOp>(loc, input, ValueRange{expI});
+    auto shifted = rewriter.create<arith::SubFOp>(loc, expInputVal, maxVal);
+    auto expVal = rewriter.create<math::ExpOp>(loc, shifted);
+    rewriter.create<memref::StoreOp>(loc, expVal, output, ValueRange{expI});
+
+    auto currentSum = rewriter.create<memref::LoadOp>(loc, sumAlloc, ValueRange());
+    auto newSum = rewriter.create<arith::AddFOp>(loc, currentSum, expVal);
+    rewriter.create<memref::StoreOp>(loc, newSum, sumAlloc, ValueRange());
+
+    rewriter.setInsertionPointAfter(expLoop);
+
+    // Step 3: Normalize by sum
+    auto sumExp = rewriter.create<memref::LoadOp>(loc, sumAlloc, ValueRange());
+    auto normLoop = rewriter.create<scf::ForOp>(loc, c0, sizeIdx, c1);
+    rewriter.setInsertionPointToStart(normLoop.getBody());
+
+    auto normI = normLoop.getInductionVar();
+    auto normExpVal = rewriter.create<memref::LoadOp>(loc, output, ValueRange{normI});
+    auto prob = rewriter.create<arith::DivFOp>(loc, normExpVal, sumExp);
+    rewriter.create<memref::StoreOp>(loc, prob, output, ValueRange{normI});
+
+    rewriter.setInsertionPointAfter(normLoop);
+    rewriter.replaceOp(op, output);
+    return success();
+  }
+};
+
+// SiLU: output = x / (1 + exp(-x))
+struct SiLUOpLowering : public OpConversionPattern<simp::SiLUOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      simp::SiLUOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+
+    auto loc = op.getLoc();
+    auto input = adaptor.input();
+    auto output = adaptor.output();
+    auto size = adaptor.size();
+
+    auto inputType = input.getType().dyn_cast<MemRefType>();
+    auto elemType = inputType.getElementType();
+
+    auto c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    auto c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    auto sizeIdx = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), size);
+    auto oneFloat = rewriter.create<arith::ConstantOp>(loc, elemType, rewriter.getFloatAttr(elemType, 1.0));
+
+    auto siluLoop = rewriter.create<scf::ForOp>(loc, c0, sizeIdx, c1);
+    rewriter.setInsertionPointToStart(siluLoop.getBody());
+
+    auto i = siluLoop.getInductionVar();
+    auto x = rewriter.create<memref::LoadOp>(loc, input, ValueRange{i});
+    auto negX = rewriter.create<arith::NegFOp>(loc, x);
+    auto expNegX = rewriter.create<math::ExpOp>(loc, negX);
+    auto denom = rewriter.create<arith::AddFOp>(loc, oneFloat, expNegX);
+    auto result = rewriter.create<arith::DivFOp>(loc, x, denom);
+    rewriter.create<memref::StoreOp>(loc, result, output, ValueRange{i});
+
+    rewriter.setInsertionPointAfter(siluLoop);
+    rewriter.replaceOp(op, output);
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // Conversion Pass
 //===----------------------------------------------------------------------===//
 
@@ -659,6 +853,7 @@ struct ConvertSimpToMemRefPass
     registry.insert<memref::MemRefDialect>();
     registry.insert<arith::ArithmeticDialect>();
     registry.insert<linalg::LinalgDialect>();
+    registry.insert<math::MathDialect>();
   }
 
   void runOnOperation() override {
@@ -672,6 +867,7 @@ struct ConvertSimpToMemRefPass
     target.addLegalDialect<memref::MemRefDialect>();
     target.addLegalDialect<arith::ArithmeticDialect>();
     target.addLegalDialect<linalg::LinalgDialect>();
+    target.addLegalDialect<math::MathDialect>();
     target.addLegalDialect<StandardOpsDialect>();
     target.addLegalOp<ModuleOp>();
 
@@ -707,7 +903,10 @@ struct ConvertSimpToMemRefPass
         ModOpLowering,
         NegOpLowering,
         MatMulOpLowering,
-        Conv2DOpLowering
+        Conv2DOpLowering,
+        RMSNormOpLowering,
+        SoftmaxOpLowering,
+        SiLUOpLowering
     >(typeConverter, &getContext());
 
     // Add SCF structural type conversions to handle scf.while, scf.if, etc. with type changes
