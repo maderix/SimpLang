@@ -150,17 +150,24 @@ int main(int argc, char** argv) {
         memset(bias.aligned, 0, bias_size * sizeof(float));
         memset(output.aligned, 0, output_size * sizeof(float));
 
-        using KernelFunc = float(*)(MemRefDescriptor<float>, MemRefDescriptor<float>,
-                                     MemRefDescriptor<float>, MemRefDescriptor<float>,
-                                     int64_t, int64_t, int64_t, int64_t,
-                                     int64_t, int64_t, int64_t);
+        // MLIR expands each array into 5 parameters: allocated, aligned, offset, size, stride
+        using KernelFunc = float(*)(
+            float*, float*, int64_t, int64_t, int64_t,  // input
+            float*, float*, int64_t, int64_t, int64_t,  // weights
+            float*, float*, int64_t, int64_t, int64_t,  // bias
+            float*, float*, int64_t, int64_t, int64_t,  // output
+            int64_t, int64_t, int64_t, int64_t,         // batch, in_h, in_w, in_c
+            int64_t, int64_t, int64_t);                  // out_c, k_h, k_w
 
         auto kernel = (KernelFunc)dlsym(handle, "bench_conv2d_fp32_small");
         if (!kernel) {
             std::cerr << "Error: " << dlerror() << std::endl;
         } else {
             auto run = [&]() {
-                kernel(input, weights, bias, output,
+                kernel(input.allocated, input.aligned, input.offset, input.size, input.stride,
+                       weights.allocated, weights.aligned, weights.offset, weights.size, weights.stride,
+                       bias.allocated, bias.aligned, bias.offset, bias.size, bias.stride,
+                       output.allocated, output.aligned, output.offset, output.size, output.stride,
                        batch, in_h, in_w, in_c, out_c, k_h, k_w);
             };
 
@@ -210,17 +217,24 @@ int main(int argc, char** argv) {
         memset(bias.aligned, 0, bias_size * sizeof(float));
         memset(output.aligned, 0, output_size * sizeof(float));
 
-        using KernelFunc = float(*)(MemRefDescriptor<float>, MemRefDescriptor<float>,
-                                     MemRefDescriptor<float>, MemRefDescriptor<float>,
-                                     int64_t, int64_t, int64_t, int64_t,
-                                     int64_t, int64_t, int64_t);
+        // MLIR expands each array into 5 parameters: allocated, aligned, offset, size, stride
+        using KernelFunc = float(*)(
+            float*, float*, int64_t, int64_t, int64_t,  // input
+            float*, float*, int64_t, int64_t, int64_t,  // weights
+            float*, float*, int64_t, int64_t, int64_t,  // bias
+            float*, float*, int64_t, int64_t, int64_t,  // output
+            int64_t, int64_t, int64_t, int64_t,         // batch, in_h, in_w, in_c
+            int64_t, int64_t, int64_t);                  // out_c, k_h, k_w
 
         auto kernel = (KernelFunc)dlsym(handle, "bench_conv2d_fp32_medium");
         if (!kernel) {
             std::cerr << "Error: " << dlerror() << std::endl;
         } else {
             auto run = [&]() {
-                kernel(input, weights, bias, output,
+                kernel(input.allocated, input.aligned, input.offset, input.size, input.stride,
+                       weights.allocated, weights.aligned, weights.offset, weights.size, weights.stride,
+                       bias.allocated, bias.aligned, bias.offset, bias.size, bias.stride,
+                       output.allocated, output.aligned, output.offset, output.size, output.stride,
                        batch, in_h, in_w, in_c, out_c, k_h, k_w);
             };
 
@@ -269,17 +283,24 @@ int main(int argc, char** argv) {
         memset(bias.aligned, 0, bias_size * sizeof(uint16_t));
         memset(output.aligned, 0, output_size * sizeof(uint16_t));
 
-        using KernelFunc = uint16_t(*)(MemRefDescriptor<uint16_t>, MemRefDescriptor<uint16_t>,
-                                        MemRefDescriptor<uint16_t>, MemRefDescriptor<uint16_t>,
-                                        int64_t, int64_t, int64_t, int64_t,
-                                        int64_t, int64_t, int64_t);
+        // MLIR expands each array into 5 parameters: allocated, aligned, offset, size, stride
+        using KernelFunc = uint16_t(*)(
+            uint16_t*, uint16_t*, int64_t, int64_t, int64_t,  // input
+            uint16_t*, uint16_t*, int64_t, int64_t, int64_t,  // weights
+            uint16_t*, uint16_t*, int64_t, int64_t, int64_t,  // bias
+            uint16_t*, uint16_t*, int64_t, int64_t, int64_t,  // output
+            int64_t, int64_t, int64_t, int64_t,               // batch, in_h, in_w, in_c
+            int64_t, int64_t, int64_t);                        // out_c, k_h, k_w
 
         auto kernel = (KernelFunc)dlsym(handle, "bench_conv2d_fp16_small");
         if (!kernel) {
             std::cerr << "Error: " << dlerror() << std::endl;
         } else {
             auto run = [&]() {
-                kernel(input, weights, bias, output,
+                kernel(input.allocated, input.aligned, input.offset, input.size, input.stride,
+                       weights.allocated, weights.aligned, weights.offset, weights.size, weights.stride,
+                       bias.allocated, bias.aligned, bias.offset, bias.size, bias.stride,
+                       output.allocated, output.aligned, output.offset, output.size, output.stride,
                        batch, in_h, in_w, in_c, out_c, k_h, k_w);
             };
 
@@ -329,18 +350,25 @@ int main(int argc, char** argv) {
         memset(bias.aligned, 0, bias_size * sizeof(int8_t));
         memset(output.aligned, 0, output_size * sizeof(int8_t));
 
-        using KernelFunc = int8_t(*)(MemRefDescriptor<int8_t>, MemRefDescriptor<int8_t>,
-                                      MemRefDescriptor<int8_t>, MemRefDescriptor<int8_t>,
-                                      int64_t, int64_t, int64_t, int64_t,
-                                      int64_t, int64_t, int64_t,
-                                      int32_t, int32_t);
+        // MLIR expands each array into 5 parameters: allocated, aligned, offset, size, stride
+        using KernelFunc = int8_t(*)(
+            int8_t*, int8_t*, int64_t, int64_t, int64_t,  // input
+            int8_t*, int8_t*, int64_t, int64_t, int64_t,  // weights
+            int8_t*, int8_t*, int64_t, int64_t, int64_t,  // bias
+            int8_t*, int8_t*, int64_t, int64_t, int64_t,  // output
+            int64_t, int64_t, int64_t, int64_t,           // batch, in_h, in_w, in_c
+            int64_t, int64_t, int64_t,                     // out_c, k_h, k_w
+            int32_t, int32_t);                             // input_zp, output_zp
 
         auto kernel = (KernelFunc)dlsym(handle, "bench_conv2d_i8_small_quantized");
         if (!kernel) {
             std::cerr << "Error: " << dlerror() << std::endl;
         } else {
             auto run = [&]() {
-                kernel(input, weights, bias, output,
+                kernel(input.allocated, input.aligned, input.offset, input.size, input.stride,
+                       weights.allocated, weights.aligned, weights.offset, weights.size, weights.stride,
+                       bias.allocated, bias.aligned, bias.offset, bias.size, bias.stride,
+                       output.allocated, output.aligned, output.offset, output.size, output.stride,
                        batch, in_h, in_w, in_c, out_c, k_h, k_w,
                        input_zp, output_zp);
             };
