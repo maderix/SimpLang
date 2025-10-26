@@ -15,39 +15,13 @@ Whether you're building a high-performance compute kernel or exploring ML compil
 
 ## 🎬 See It In Action
 
-**Running LLaMA 110M Story Generation on CPU**
+**LLaMA 110M Story Generation** - Running a 110M parameter transformer at **42.95 tokens/s** on CPU:
 
-SimpLang can compile and run transformer models like LLaMA directly on CPU with competitive performance. Here's a real example:
+<p align="center">
+  <img src="assets/llama_demo.gif" alt="LLaMA 110M Demo" width="800"/>
+</p>
 
-```bash
-# Compile the model (MLIR backend with loop tiling)
-./build_mlir/src/simplang examples/llama2/stories110M.sl --emit-mlir -o /tmp/stories110M.o
-gcc -shared -o /tmp/stories110M.so /tmp/stories110M.o -lm
-
-# Run text generation
-g++ -o generate examples/llama2/generate_stories110M.cpp -ldl -O3
-./generate assets/models/stories110M.bin assets/models/tokenizer.bin /tmp/stories110M.so 0.0
-```
-
-**Generated Story:**
-
-> Once upon a time, there was a little girl named Lily. She loved to play outside in the sunshine. One day, she saw a big, red apple on a tree. She wanted to eat it, but it was too high up.
->
-> Lily asked her friend, a little bird, "Can you help me get the apple?"
->
-> The bird said, "Sure, I can fly up and get it for you."
->
-> The bird flew up to the apple and pecked it off the tree. Lily was so happy and took a big bite. But then, she saw a bug on the apple. She didn't like bugs, so she threw the apple away.
->
-> Later that day, Lily's mom asked her to help with the laundry. Lily saw a shirt that was too big for her. She asked her mom, "Can you make it fit me?"
->
-> Her mom said, "Yes, I can make it fit you."
->
-> Lily was happy that her shirt would fit her. She learned that sometimes things don't fit, but there is always a way to make them fit.
-
-**Performance:** ⚡ **42.95 tokens/s** on CPU (110M parameters, FP32, MLIR backend with 8×8×8 loop tiling)
-
-This demonstrates SimpLang's MLIR backend in action - compiling high-level tensor operations (matmul, RMSNorm, softmax, SiLU) down to optimized CPU code with automatic loop tiling and fusion.
+*MLIR backend compiling high-level tensor operations (MatMul, RMSNorm, Softmax, SiLU) to optimized CPU code - see `examples/llama2/stories110M.sl`*
 
 ## Getting Started
 
