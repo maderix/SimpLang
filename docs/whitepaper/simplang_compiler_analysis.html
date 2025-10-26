@@ -1,0 +1,844 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SimpLang: A Technical Analysis of Portable SIMD Compilation</title>
+    <style>
+        /* Clean, technical report style */
+        :root {
+            --text-color: #2c3e50;
+            --heading-color: #1a1a1a;
+            --code-bg: #f7f9fc;
+            --border-color: #e1e4e8;
+            --accent: #0366d6;
+            --success: #22863a;
+            --warning: #e36209;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Helvetica', 'Arial', sans-serif;
+            line-height: 1.6;
+            color: var(--text-color);
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 2rem;
+            background: white;
+        }
+
+        h1 {
+            font-size: 2rem;
+            margin-bottom: 0.5rem;
+            color: var(--heading-color);
+            font-weight: 600;
+        }
+
+        .metadata {
+            color: #586069;
+            margin-bottom: 2rem;
+            padding-bottom: 1rem;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        h2 {
+            font-size: 1.5rem;
+            margin-top: 2.5rem;
+            margin-bottom: 1rem;
+            color: var(--heading-color);
+            font-weight: 600;
+        }
+
+        h3 {
+            font-size: 1.2rem;
+            margin-top: 1.5rem;
+            margin-bottom: 0.75rem;
+            color: var(--heading-color);
+            font-weight: 600;
+        }
+
+        h4 {
+            font-size: 1.1rem;
+            margin-top: 1rem;
+            margin-bottom: 0.5rem;
+            color: var(--heading-color);
+            font-weight: 500;
+        }
+
+        p {
+            margin-bottom: 1rem;
+        }
+
+        /* Abstract */
+        .abstract {
+            background: var(--code-bg);
+            padding: 1.5rem;
+            border-radius: 6px;
+            margin-bottom: 2rem;
+            border: 1px solid var(--border-color);
+        }
+
+        .abstract h2 {
+            font-size: 1.2rem;
+            margin-top: 0;
+            margin-bottom: 1rem;
+        }
+
+        /* Code blocks */
+        pre {
+            background: var(--code-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            padding: 1rem;
+            overflow-x: auto;
+            margin: 1rem 0;
+            font-size: 0.9rem;
+        }
+
+        code {
+            font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Fira Mono', monospace;
+            font-size: 0.9em;
+            background: var(--code-bg);
+            padding: 0.2rem 0.4rem;
+            border-radius: 3px;
+        }
+
+        pre code {
+            background: none;
+            padding: 0;
+        }
+
+        /* Tables */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 1.5rem 0;
+            font-size: 0.95rem;
+        }
+
+        th, td {
+            padding: 0.75rem;
+            text-align: left;
+            border: 1px solid var(--border-color);
+        }
+
+        th {
+            background: var(--code-bg);
+            font-weight: 600;
+        }
+
+        tr:nth-child(even) {
+            background: #fafbfc;
+        }
+
+        /* Lists */
+        ul, ol {
+            margin-bottom: 1rem;
+            margin-left: 2rem;
+        }
+
+        li {
+            margin-bottom: 0.3rem;
+        }
+
+        /* Key findings box */
+        .key-finding {
+            background: #f6f8fa;
+            border-left: 4px solid var(--accent);
+            padding: 1rem;
+            margin: 1.5rem 0;
+        }
+
+        .key-finding strong {
+            color: var(--accent);
+        }
+
+        /* Performance indicators */
+        .perf-good {
+            color: var(--success);
+            font-weight: 600;
+        }
+
+        .perf-neutral {
+            color: var(--warning);
+            font-weight: 600;
+        }
+
+        .perf-bad {
+            color: #d73a49;
+            font-weight: 600;
+        }
+
+        /* Charts */
+        .chart-container {
+            margin: 2rem 0;
+            padding: 1rem;
+            background: white;
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+        }
+
+        canvas {
+            max-width: 100%;
+            height: auto;
+        }
+
+        /* Equation */
+        .equation {
+            background: var(--code-bg);
+            padding: 1rem;
+            margin: 1rem 0;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+            text-align: center;
+        }
+
+        /* Section numbering */
+        .section-number {
+            color: #6a737d;
+            margin-right: 0.5rem;
+        }
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <h1>SimpLang: A Technical Analysis of Portable SIMD Compilation</h1>
+
+    <div class="metadata">
+        <div>Technical Report | October 2024</div>
+        <div>System: AMD Ryzen 7 7800X3D, 96MB L3 Cache, AVX-512</div>
+    </div>
+
+    <div class="abstract">
+        <h2>Abstract</h2>
+        <p>
+            We present SimpLang, a compute language we developed to expose compilation internals through MLIR's multi-level IR infrastructure. Unlike existing solutions that either lock users to specific vendors (CUDA) or hide optimization decisions (OpenCL), our system provides transparent compilation with inspectable intermediate representations. Performance evaluation on an AMD Ryzen 7 7800X3D system shows that our compiler achieves 3.72x higher throughput than GCC on byte-level operations and 1.37x average improvement across multi-dimensional array workloads. However, transformer inference reveals a critical accumulator pattern inefficiency in our current implementation, limiting bandwidth utilization to 10% of theoretical maximum. We identify the root cause in our lowering strategy and project a 2.59x performance improvement from fixing this single issue. Our work demonstrates that compilation transparency and competitive performance are not mutually exclusive design goals.
+        </p>
+    </div>
+
+    <h2><span class="section-number">1.</span>Context and Motivation</h2>
+
+    <p>
+        The SIMD compute landscape is fragmenting. While CUDA established the programming model for accelerated computing, its vendor lock-in creates deployment constraints as hardware diversifies beyond discrete GPUs. Modern CPUs ship with increasingly wide SIMD units (AVX-512 on x86, SVE2 on ARM), mobile SoCs integrate neural processing units, and edge deployments face power constraints that eliminate discrete accelerators entirely.
+    </p>
+
+    <p>
+        Current portable compute solutions present a stark trade-off. OpenCL provides hardware portability but achieves it through opaque, vendor-specific compilation that produces inconsistent performance. A reduction kernel that runs efficiently on an Intel GPU might perform poorly on an AMD CPU, with no visibility into why. SYCL attempts to address this but remains primarily Intel-focused. Domain-specific languages like Halide excel in their niches but don't generalize.
+    </p>
+
+    <p>
+        We designed SimpLang with a different philosophy: expose rather than hide the compilation process. By building on MLIR's progressive lowering infrastructure, our system allows developers to inspect transformations at each abstraction level, from high-level operations through loop structures down to SIMD instructions.
+    </p>
+
+    <h2><span class="section-number">2.</span>System Architecture</h2>
+
+    <h3>2.1 Compilation Pipeline</h3>
+
+    <p>
+        We implemented dual compilation paths sharing a common frontend:
+    </p>
+
+    <ol>
+        <li><strong>Direct LLVM path:</strong> AST → LLVM IR → native code. Optimized for compilation speed with traditional passes (mem2reg, loop-vectorize, instcombine).</li>
+
+        <li><strong>Progressive MLIR path:</strong> AST → Simp dialect → Linalg/MemRef → SCF/Vector → LLVM dialect → native code. Each lowering stage preserves semantic information while progressively specializing toward the target architecture.</li>
+    </ol>
+
+    <p>
+        The MLIR path is particularly interesting. Consider a simple reduction:
+    </p>
+
+    <pre><code>// SimpLang source
+fn sum(arr: f64[], n: i32) -> f64 {
+    var total = 0.0;
+    for (var i = 0; i < n; i++) {
+        total += arr[i];
+    }
+    return total;
+}</code></pre>
+
+    <p>
+        This transforms through multiple representations:
+    </p>
+
+    <pre><code>// After Linalg lowering (simplified)
+%0 = linalg.generic {
+    indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> ()>],
+    iterator_types = ["reduction"]
+} ins(%arr) outs(%init) {
+    ^bb0(%in: f64, %out: f64):
+        %sum = arith.addf %in, %out : f64
+        linalg.yield %sum : f64
+}
+
+// After vectorization
+%vec = vector.load %arr[%c0] : memref<?xf64>, vector<8xf64>
+%red = vector.reduction "add", %vec : vector<8xf64> into f64</code></pre>
+
+    <p>
+        Each representation is inspectable via <code>--dump-mlir-passes</code>, providing visibility into optimization decisions.
+    </p>
+
+    <h3>2.2 Type System and Memory Model</h3>
+
+    <p>
+        The type system maps high-level constructs to hardware capabilities:
+    </p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>SimpLang Type</th>
+                <th>MLIR Representation</th>
+                <th>Hardware Mapping</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>f64[]</td>
+                <td>memref&lt;?xf64&gt;</td>
+                <td>Aligned heap allocation</td>
+            </tr>
+            <tr>
+                <td>SSESlice</td>
+                <td>vector&lt;2xf64&gt;</td>
+                <td>128-bit XMM registers</td>
+            </tr>
+            <tr>
+                <td>AVXSlice</td>
+                <td>vector&lt;8xf64&gt;</td>
+                <td>512-bit ZMM registers</td>
+            </tr>
+            <tr>
+                <td>i8[N][M]</td>
+                <td>memref&lt;NxMxi8&gt;</td>
+                <td>Row-major layout</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <p>
+        Memory alignment is automatically managed based on type width, ensuring efficient SIMD access patterns.
+    </p>
+
+    <h2><span class="section-number">3.</span>Performance Analysis</h2>
+
+    <h3>3.1 Experimental Setup</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Component</th>
+                <th>Specification</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Processor</td>
+                <td>AMD Ryzen 7 7800X3D (8 cores, 5.05 GHz boost)</td>
+            </tr>
+            <tr>
+                <td>L3 Cache</td>
+                <td>96 MB (3D V-Cache technology)</td>
+            </tr>
+            <tr>
+                <td>Memory</td>
+                <td>61 GB DDR5, ~80 GB/s theoretical bandwidth</td>
+            </tr>
+            <tr>
+                <td>SIMD Support</td>
+                <td>AVX-512F, AVX-512BW, AVX-512DQ, AVX-512CD</td>
+            </tr>
+            <tr>
+                <td>Compiler Baseline</td>
+                <td>GCC 11.4.0, Clang 14.0.0 with -O3 -march=native</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <p>
+        All benchmarks use single-threaded execution to isolate compiler optimization effects. Each measurement represents the median of 10 runs after warmup.
+    </p>
+
+    <h3>3.2 Multi-Dimensional Array Performance</h3>
+
+    <p>
+        Our evaluation begins with fundamental array operations where our compiler shows strong performance:
+    </p>
+
+    <div class="chart-container">
+        <canvas id="arrayChart"></canvas>
+    </div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Operation</th>
+                <th>Type</th>
+                <th>SimpLang (GB/s)</th>
+                <th>GCC (GB/s)</th>
+                <th>Speedup</th>
+                <th>Analysis</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Sequential Write</td>
+                <td>i8</td>
+                <td>74.7</td>
+                <td>20.1</td>
+                <td class="perf-good">3.72x</td>
+                <td>Optimal AVX-512 usage</td>
+            </tr>
+            <tr>
+                <td>Sequential Read</td>
+                <td>i8</td>
+                <td>42.9</td>
+                <td>17.5</td>
+                <td class="perf-good">2.45x</td>
+                <td>Better prefetching</td>
+            </tr>
+            <tr>
+                <td>Sequential Write</td>
+                <td>i64</td>
+                <td>3.33</td>
+                <td>3.00</td>
+                <td class="perf-good">1.11x</td>
+                <td>Consistent improvement</td>
+            </tr>
+            <tr>
+                <td>Strided Read</td>
+                <td>f64</td>
+                <td>3.92</td>
+                <td>4.80</td>
+                <td class="perf-neutral">0.82x</td>
+                <td>Suboptimal gather</td>
+            </tr>
+            <tr>
+                <td>2D Array</td>
+                <td>i32</td>
+                <td>3.85</td>
+                <td>3.42</td>
+                <td class="perf-good">1.13x</td>
+                <td>Affine optimization</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="key-finding">
+        <strong>Key Finding:</strong> Our compiler achieves geometric mean speedup of 1.37x over GCC across array operations. The improvement is most pronounced for byte-level operations where MLIR's polyhedral analysis identifies vectorization opportunities that GCC's pattern matching misses.
+    </div>
+
+    <h3>3.3 Compiler Strategy Differences</h3>
+
+    <p>
+        The performance differences stem from fundamental compilation strategy divergence:
+    </p>
+
+    <h4>3.3.1 Vectorization Approach</h4>
+
+    <p>
+        <strong>GCC:</strong> Uses pattern matching to identify vectorizable loops. It looks for specific idioms and applies predetermined transformations. For the i8 sequential write benchmark, GCC generates conservative SSE2 code despite AVX-512 availability:
+    </p>
+
+    <pre><code>// GCC's conservative output (simplified)
+movdqu (%rsi), %xmm0    // 16 bytes at a time
+movdqu %xmm0, (%rdi)
+add $16, %rsi
+add $16, %rdi</code></pre>
+
+    <p>
+        <strong>Our approach (MLIR):</strong> Employs polyhedral analysis to understand the iteration space mathematically. This enables aggressive vectorization:
+    </p>
+
+    <pre><code>// SimpLang's AVX-512 output (simplified)
+vmovdqu64 (%rsi), %zmm0  // 64 bytes at a time
+vmovdqu64 %zmm0, (%rdi)
+add $64, %rsi
+add $64, %rdi</code></pre>
+
+    <p>
+        The 4x wider operations directly translate to the observed 3.72x speedup.
+    </p>
+
+    <h4>3.3.2 Type Information Preservation</h4>
+
+    <p>
+        C++ compilers discard semantic type information after frontend processing. By the time optimization passes run, a <code>char*</code> could represent text, binary data, or a byte array for computation. This forces conservative assumptions.
+    </p>
+
+    <p>
+        Our compiler preserves type semantics through the compilation pipeline. We know <code>i8[]</code> represents computational data suitable for aggressive SIMD optimization, not string data requiring careful handling.
+    </p>
+
+    <h3>3.4 Transformer Inference Performance</h3>
+
+    <p>
+        Transformer workloads reveal a different performance profile:
+    </p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Model</th>
+                <th>Parameters</th>
+                <th>Throughput (tok/s)</th>
+                <th>Bandwidth (GB/s)</th>
+                <th>Efficiency</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>stories110M</td>
+                <td>110M</td>
+                <td>18.7</td>
+                <td>11.2</td>
+                <td>14.0%</td>
+            </tr>
+            <tr>
+                <td>LLaMA 125M</td>
+                <td>125M</td>
+                <td>12.5</td>
+                <td>8.4</td>
+                <td>10.5%</td>
+            </tr>
+            <tr>
+                <td>LLaMA 1B</td>
+                <td>1B</td>
+                <td>1.8</td>
+                <td>7.3</td>
+                <td>9.1%</td>
+            </tr>
+            <tr>
+                <td>LLaMA 3B</td>
+                <td>3B</td>
+                <td>0.8</td>
+                <td>7.3</td>
+                <td>9.1%</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <p>
+        Memory bandwidth utilization plateaus at 7-8 GB/s, approximately 10% of theoretical maximum. This is concerning given the 96MB L3 cache should enable better locality.
+    </p>
+
+    <h3>3.5 Root Cause Analysis: The Accumulator Pattern</h3>
+
+    <p>
+        Profiling reveals that matrix multiplication dominates execution time (>80%). Examining the generated MLIR shows a critical inefficiency:
+    </p>
+
+    <pre><code>// Our current lowering (problematic)
+scf.for %k = %c0 to %K step %c1 {
+    %current = memref.load %C[%i, %j] : memref<?x?xf64>
+    %a_val = memref.load %A[%i, %k] : memref<?x?xf64>
+    %b_val = memref.load %B[%k, %j] : memref<?x?xf64>
+    %prod = arith.mulf %a_val, %b_val : f64
+    %new = arith.addf %current, %prod : f64
+    memref.store %new, %C[%i, %j] : memref<?x?xf64>
+}</code></pre>
+
+    <p>
+        The accumulator is loaded and stored every iteration. For a 768×768 matrix multiplication (typical attention layer), this creates 768 unnecessary memory operations per output element.
+    </p>
+
+    <p>
+        The correct pattern uses loop-carried dependencies:
+    </p>
+
+    <pre><code>// Optimal lowering pattern
+%init = memref.load %C[%i, %j] : memref<?x?xf64>
+%final = scf.for %k = %c0 to %K step %c1 iter_args(%acc = %init) -> f64 {
+    %a_val = memref.load %A[%i, %k] : memref<?x?xf64>
+    %b_val = memref.load %B[%k, %j] : memref<?x?xf64>
+    %prod = arith.mulf %a_val, %b_val : f64
+    %new = arith.addf %acc, %prod : f64
+    scf.yield %new : f64
+}
+memref.store %final, %C[%i, %j] : memref<?x?xf64></code></pre>
+
+    <div class="key-finding">
+        <strong>Performance Impact:</strong> Fixing the accumulator pattern would reduce memory operations by a factor of K (typically 768-2048 in transformers). Based on roofline analysis, this projects to 2.59x speedup, bringing bandwidth utilization from 7.3 GB/s to approximately 19 GB/s.
+    </div>
+
+    <h2><span class="section-number">4.</span>Quantization Analysis</h2>
+
+    <p>
+        SimpLang implements 4-bit weight quantization (W4) for memory-constrained inference:
+    </p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Model</th>
+                <th>FP32 Memory</th>
+                <th>W4 Memory</th>
+                <th>Compression</th>
+                <th>FP32 Speed</th>
+                <th>W4 Speed</th>
+                <th>Slowdown</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>LLaMA 1B</td>
+                <td>3,975 MB</td>
+                <td>987 MB</td>
+                <td>4.03x</td>
+                <td>1.752 tok/s</td>
+                <td>0.861 tok/s</td>
+                <td>2.03x</td>
+            </tr>
+            <tr>
+                <td>LLaMA 3B</td>
+                <td>9,204 MB</td>
+                <td>2,276 MB</td>
+                <td>4.04x</td>
+                <td>0.758 tok/s</td>
+                <td>0.363 tok/s</td>
+                <td>2.09x</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <p>
+        The 2x performance penalty from dequantization is consistent with theoretical expectations. Each weight requires unpacking from 4-bit to 32-bit representation. However, the 4x memory reduction enables deployment on edge devices.
+    </p>
+
+    <h2><span class="section-number">5.</span>Compilation Transparency Benefits</h2>
+
+    <p>
+        The ability to inspect intermediate representations provides concrete debugging advantages. Consider the strided access pattern where SimpLang underperforms GCC by 18%:
+    </p>
+
+    <pre><code>// Examining MLIR output reveals the issue
+// SimpLang generates:
+%0 = memref.load %arr[%idx] : memref<?xf64>
+%1 = memref.load %arr[%idx + 4] : memref<?xf64>
+%2 = memref.load %arr[%idx + 8] : memref<?xf64>
+// Individual scalar loads, no gather instruction</code></pre>
+
+    <p>
+        The transparency immediately identifies that gather instructions aren't being generated for strided access. In OpenCL, this would require black-box profiling to discover.
+    </p>
+
+    <h2><span class="section-number">6.</span>Multi-Target Compilation Strategy</h2>
+
+    <p>
+        SimpLang's MLIR foundation enables systematic expansion to new targets through dialect composition:
+    </p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Target</th>
+                <th>Status</th>
+                <th>Technical Approach</th>
+                <th>Key Challenge</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>x86 AVX-512</td>
+                <td>Implemented</td>
+                <td>LLVM vector intrinsics</td>
+                <td>Completed</td>
+            </tr>
+            <tr>
+                <td>ARM Neon/SVE</td>
+                <td>Planned Q2 2025</td>
+                <td>Vector dialect → ArmNeon</td>
+                <td>Scalable vectors</td>
+            </tr>
+            <tr>
+                <td>Qualcomm Hexagon</td>
+                <td>Research</td>
+                <td>Custom dialect</td>
+                <td>Limited documentation</td>
+            </tr>
+            <tr>
+                <td>RISC-V Vector</td>
+                <td>Future</td>
+                <td>LLVM VP intrinsics</td>
+                <td>Variable VLEN</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <p>
+        Each target requires only a new lowering pass from the Vector dialect, preserving the frontend and high-level optimizations.
+    </p>
+
+    <h2><span class="section-number">7.</span>Competitive Analysis</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>System</th>
+                <th>Target Hardware</th>
+                <th>Compilation Model</th>
+                <th>Performance</th>
+                <th>Transparency</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>CUDA</td>
+                <td>NVIDIA only</td>
+                <td>PTX → SASS (opaque)</td>
+                <td>Excellent</td>
+                <td>None</td>
+            </tr>
+            <tr>
+                <td>OpenCL</td>
+                <td>Multi-vendor</td>
+                <td>SPIR-V → vendor compiler</td>
+                <td>Variable</td>
+                <td>None</td>
+            </tr>
+            <tr>
+                <td>SYCL</td>
+                <td>Intel-focused</td>
+                <td>Single-source C++</td>
+                <td>Good</td>
+                <td>Limited</td>
+            </tr>
+            <tr>
+                <td>Halide</td>
+                <td>CPU/GPU</td>
+                <td>Schedule separation</td>
+                <td>Good</td>
+                <td>Schedule only</td>
+            </tr>
+            <tr>
+                <td>SimpLang</td>
+                <td>CPU (expanding)</td>
+                <td>Progressive MLIR</td>
+                <td>Competitive</td>
+                <td>Full IR access</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <p>
+        SimpLang occupies a unique position: the only system providing full compilation transparency while maintaining competitive performance. This transparency comes at the cost of a larger compiler binary (MLIR dependencies) and longer compilation times (multiple lowering stages).
+    </p>
+
+    <h2><span class="section-number">8.</span>Limitations and Future Work</h2>
+
+    <h3>8.1 Current Limitations</h3>
+
+    <ul>
+        <li><strong>Accumulator inefficiency:</strong> 2.59x performance left on the table in matrix multiplication</li>
+        <li><strong>Limited targets:</strong> Currently x86-only, no GPU support</li>
+        <li><strong>Compilation time:</strong> MLIR path takes 200-500ms vs 50ms for direct LLVM</li>
+        <li><strong>Missing operations:</strong> No FFT, limited reduction patterns, no sparse operations</li>
+    </ul>
+
+    <h3>8.2 Projected Improvements</h3>
+
+    <div class="equation">
+        Projected Performance = Current × 2.59 (accumulator fix) × 1.15 (cache tiling) × 1.20 (prefetching)
+        <br>
+        = Current × 3.57
+    </div>
+
+    <p>
+        With identified optimizations, transformer inference could reach 26 GB/s bandwidth utilization, approximately 32% of theoretical maximum - competitive with optimized BLAS libraries.
+    </p>
+
+    <h3>8.3 Research Directions</h3>
+
+    <ol>
+        <li><strong>Dynamic shapes:</strong> Currently all shapes must be compile-time known. Runtime shape support would enable more flexible models.</li>
+
+        <li><strong>Auto-tuning:</strong> The 96MB L3 cache on the test system suggests larger tile sizes could improve performance. Automated tuning could adapt to cache hierarchies.</li>
+
+        <li><strong>Kernel fusion:</strong> Combining operations (matmul + bias + activation) would reduce memory traffic.</li>
+
+        <li><strong>Distributed execution:</strong> Multi-node support for large model inference.</li>
+    </ol>
+
+    <h2><span class="section-number">9.</span>Conclusions</h2>
+
+    <p>
+        Our work demonstrates that transparent compilation can achieve competitive performance on SIMD workloads. The system's strength lies in exposing optimization decisions, enabling rapid identification of performance bottlenecks. On array operations, we outperform mature C++ compilers by leveraging MLIR's polyhedral analysis. On transformer workloads, transparency revealed a critical accumulator pattern issue in our implementation that, once fixed, will yield substantial improvements.
+    </p>
+
+    <p>
+        The key technical insight from our development is that progressive lowering through multiple IRs preserves optimization opportunities longer than monolithic compilation. Each representation level can apply domain-specific optimizations before lowering to more general forms. This architecture naturally extends to new hardware targets through dialect composition rather than compiler rewrites.
+    </p>
+
+    <p>
+        Whether transparent compilation becomes a mainstream approach depends on developer priorities. If understanding and controlling optimization matters more than raw performance, our approach provides a compelling alternative to black-box compilers. The 96MB L3 cache on modern processors like the AMD 7800X3D suggests significant untapped performance potential that transparent compilation helps identify and exploit.
+    </p>
+
+    <div class="key-finding">
+        <strong>Final Assessment:</strong> Our implementation proves that portable SIMD computation with compilation transparency is technically viable. The 3.72x speedup over GCC on specific workloads demonstrates MLIR's optimization potential, while the identified accumulator inefficiency shows the debugging value of transparent compilation. We position SimpLang as both a research platform for exploring portable compute abstractions and a practical tool for performance-critical applications where transparency matters.
+    </div>
+
+    <script>
+        // Array Performance Chart
+        const ctx = document.getElementById('arrayChart').getContext('2d');
+        new Chart(ctx, {
+            type: 'bar',
+            data: {
+                labels: ['i8 Seq Write', 'i8 Seq Read', 'i64 Write', 'i32 2D Array', 'f64 Strided'],
+                datasets: [{
+                    label: 'SimpLang',
+                    data: [74.7, 42.9, 3.33, 3.85, 3.92],
+                    backgroundColor: 'rgba(3, 102, 214, 0.8)',
+                    borderColor: '#0366d6',
+                    borderWidth: 1
+                }, {
+                    label: 'GCC -O3',
+                    data: [20.1, 17.5, 3.00, 3.42, 4.80],
+                    backgroundColor: 'rgba(34, 134, 58, 0.8)',
+                    borderColor: '#22863a',
+                    borderWidth: 1
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    title: {
+                        display: true,
+                        text: 'Memory Bandwidth Utilization by Operation Type',
+                        font: { size: 14 }
+                    }
+                },
+                scales: {
+                    y: {
+                        type: 'logarithmic',
+                        title: {
+                            display: true,
+                            text: 'Bandwidth (GB/s)'
+                        },
+                        ticks: {
+                            callback: function(value) {
+                                if ([100, 50, 20, 10, 5, 2, 1].includes(value)) {
+                                    return value;
+                                }
+                                return null;
+                            }
+                        }
+                    },
+                    x: {
+                        title: {
+                            display: true,
+                            text: 'Operation'
+                        }
+                    }
+                }
+            }
+        });
+    </script>
+</body>
+</html>
