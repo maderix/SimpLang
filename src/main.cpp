@@ -11,6 +11,7 @@
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/Host.h>
+#include <llvm/MC/SubtargetFeature.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/Transforms/Vectorize.h>
 #include <llvm/Analysis/TargetTransformInfo.h>
@@ -21,6 +22,7 @@
 #include "mlir/mlir_codegen.hpp"
 #include "mlir/mlir_pipeline.hpp"
 #include "mlir/ExecutionEngine/OptUtils.h"
+#include "mlir/PromoteLargeAllocaToHeap.h"
 #include "ast/transforms/normalize_returns.hpp"
 #endif
 
@@ -32,7 +34,8 @@ int main(int argc, char** argv) {
     bool debug = false;
     bool printIR = false;
     bool emitMLIR = false;
-    bool enableTiling = false;  // MLIR tiling optimization
+    bool enableTiling = true;  // MLIR tiling optimization (enabled by default)
+    int tileSize = 8;  // Default optimal tile size
     bool dumpMLIRPasses = false;  // Dump MLIR at each pipeline stage
     std::string outputPath;
     std::string logLevel = "INFO";  // Default log level
@@ -45,7 +48,9 @@ int main(int argc, char** argv) {
         std::cerr << "  --print-ir:        Print LLVM IR to console" << std::endl;
 #ifdef USE_MLIR
         std::cerr << "  --emit-mlir:       Emit MLIR instead of LLVM IR" << std::endl;
-        std::cerr << "  --enable-tiling:   Enable loop tiling optimization for matmul" << std::endl;
+        std::cerr << "  --enable-tiling:   Enable loop tiling optimization for matmul (default: on)" << std::endl;
+        std::cerr << "  --no-tiling:       Disable loop tiling optimization" << std::endl;
+        std::cerr << "  --tile-size N:     Set tile size for matmul (default: 8)" << std::endl;
         std::cerr << "  --dump-mlir-passes: Dump MLIR IR at each pipeline stage" << std::endl;
 #endif
         return 1;
@@ -81,6 +86,16 @@ int main(int argc, char** argv) {
         }
         else if (strcmp(argv[i], "--enable-tiling") == 0) {
             enableTiling = true;
+        }
+        else if (strcmp(argv[i], "--no-tiling") == 0) {
+            enableTiling = false;
+        }
+        else if (strcmp(argv[i], "--tile-size") == 0 && i + 1 < argc) {
+            tileSize = std::atoi(argv[++i]);
+            if (tileSize <= 0) {
+                std::cerr << "Error: Invalid tile size " << tileSize << std::endl;
+                return 1;
+            }
         }
         else if (strcmp(argv[i], "--dump-mlir-passes") == 0) {
             dumpMLIRPasses = true;
@@ -182,8 +197,9 @@ int main(int argc, char** argv) {
 
         // Configure pipeline options
         pipeline.setEnableTiling(enableTiling);
+        pipeline.setTileSize(tileSize);
         if (enableTiling) {
-            LOG_INFO("Loop tiling optimization enabled (32x32x32)");
+            LOG_INFO("Loop tiling optimization enabled (" + std::to_string(tileSize) + "x" + std::to_string(tileSize) + "x" + std::to_string(tileSize) + ")");
         }
 
         pipeline.setDumpIntermediateIR(dumpMLIRPasses);
@@ -248,8 +264,16 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        auto cpu = "generic";
-        auto features = "";
+        // Use native CPU features for maximum performance
+        std::string cpu = llvm::sys::getHostCPUName().str();
+        llvm::StringMap<bool> featureMap;
+        llvm::sys::getHostCPUFeatures(featureMap);
+        llvm::SubtargetFeatures subtargetFeatures;
+        for (auto &feature : featureMap) {
+            subtargetFeatures.AddFeature(feature.first(), feature.second);
+        }
+        std::string features = subtargetFeatures.getString();
+
         llvm::TargetOptions opt;
         auto rm = llvm::Optional<llvm::Reloc::Model>();
         auto targetMachine = target->createTargetMachine(targetTriple, cpu, features, opt, rm);
@@ -269,6 +293,15 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        // AFTER O3: Promote large stack allocations to heap
+        // This must run AFTER optimization because O3 can recreate large allocas
+        LOG_INFO("Promoting large stack allocations to heap...");
+        {
+            llvm::legacy::PassManager heapPromotionPM;
+            heapPromotionPM.add(llvm::createPromoteLargeAllocaToHeapPass());
+            heapPromotionPM.run(*llvmModule);
+        }
+
         // Print optimized IR if requested
         if (printIR) {
             std::cout << "\n=== Optimized LLVM IR (After O3) ===" << std::endl;
@@ -285,6 +318,12 @@ int main(int argc, char** argv) {
         }
 
         llvm::legacy::PassManager pass;
+
+        // Run heap promotion AGAIN before codegen
+        // Some late optimization passes recreate large allocas, so we promote them again
+        LOG_INFO("Final heap promotion pass before codegen...");
+        pass.add(llvm::createPromoteLargeAllocaToHeapPass());
+
         auto fileType = llvm::CGFT_ObjectFile;
 
         if (targetMachine->addPassesToEmitFile(pass, destObj, nullptr, fileType)) {
@@ -353,14 +392,18 @@ int main(int argc, char** argv) {
 
     // Run module-level optimization passes including vectorization
     llvm::legacy::PassManager modulePM;
-    
+
+    // FIRST: Promote large stack allocations to heap
+    // This must run BEFORE any optimization to fix MLIR's stack allocation bug
+    modulePM.add(llvm::createPromoteLargeAllocaToHeapPass());
+
     // Add target transform info for vectorizer
     modulePM.add(llvm::createTargetTransformInfoWrapperPass(context.getTargetMachine()->getTargetIRAnalysis()));
-    
+
     // Add vectorization passes directly
     modulePM.add(llvm::createLoopVectorizePass());        // Loop vectorizer
     modulePM.add(llvm::createSLPVectorizerPass());        // SLP vectorizer
-    
+
     // Run the optimization passes
     modulePM.run(*context.getModule());
 

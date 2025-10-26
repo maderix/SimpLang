@@ -360,13 +360,16 @@ def Simp_MatMulOp : Simp_Op<"matmul", [NoSideEffect]> {
     Simp_ArrayType:$output, // C: MxN matrix as 1D array (pre-allocated output buffer)
     I64:$m,                 // Rows of A
     I64:$k,                 // Cols of A / Rows of B
-    I64:$n                  // Cols of B
+    I64:$n,                 // Cols of B
+    I64:$lhs_offset,        // Offset into lhs array
+    I64:$rhs_offset,        // Offset into rhs array
+    I64:$output_offset      // Offset into output array
   );
   let results = (outs Simp_ArrayType:$result);  // Returns the same output buffer (for chaining)
 
   let assemblyFormat = [{
-    $lhs `,` $rhs `,` $output `,` $m `,` $k `,` $n attr-dict `:`
-    `(` type($lhs) `,` type($rhs) `,` type($output) `,` type($m) `,` type($k) `,` type($n) `)` `->` type($result)
+    $lhs `,` $rhs `,` $output `,` $m `,` $k `,` $n `,` $lhs_offset `,` $rhs_offset `,` $output_offset attr-dict `:`
+    `(` type($lhs) `,` type($rhs) `,` type($output) `,` type($m) `,` type($k) `,` type($n) `,` type($lhs_offset) `,` type($rhs_offset) `,` type($output_offset) `)` `->` type($result)
   }];
 }
 
@@ -473,15 +476,16 @@ def Simp_RMSNormOp : Simp_Op<"rmsnorm", [NoSideEffect]> {
     Simp_ArrayType:$weight,   // Learned weights [size]
     Simp_ArrayType:$output,   // Output array [size] (pre-allocated)
     I64:$size,                // Vector size
-    AnyFloat:$epsilon         // Numerical stability (typically 1e-5)
+    AnyFloat:$epsilon,        // Numerical stability (typically 1e-5)
+    I64:$weight_offset        // Offset into weight array for layer-specific weights
   );
 
   let results = (outs Simp_ArrayType:$result);
 
   let assemblyFormat = [{
-    `(` $input `,` $weight `,` $output `,` $size `,` $epsilon `)`
+    `(` $input `,` $weight `,` $output `,` $size `,` $epsilon `,` $weight_offset `)`
     attr-dict `:`
-    `(` type($input) `,` type($weight) `,` type($output) `,` type($size) `,` type($epsilon) `)`
+    `(` type($input) `,` type($weight) `,` type($output) `,` type($size) `,` type($epsilon) `,` type($weight_offset) `)`
     `->` type($result)
   }];
 }
@@ -490,10 +494,10 @@ def Simp_SoftmaxOp : Simp_Op<"softmax", [NoSideEffect]> {
   let summary = "Numerically stable softmax";
   let description = [{
     Computes softmax with max subtraction for numerical stability:
-    1. max_val = max(input)
+    1. max_val = max(input[input_offset:input_offset+size])
     2. exp_vals = exp(input - max_val)
     3. sum_exp = sum(exp_vals)
-    4. output = exp_vals / sum_exp
+    4. output[output_offset:output_offset+size] = exp_vals / sum_exp
 
     Used in attention mechanisms.
   }];
@@ -501,15 +505,17 @@ def Simp_SoftmaxOp : Simp_Op<"softmax", [NoSideEffect]> {
   let arguments = (ins
     Simp_ArrayType:$input,    // Input logits [size]
     Simp_ArrayType:$output,   // Output probabilities [size] (pre-allocated)
-    I64:$size                 // Vector size
+    I64:$size,                // Vector size
+    I64:$input_offset,        // Offset into input array
+    I64:$output_offset        // Offset into output array
   );
 
   let results = (outs Simp_ArrayType:$result);
 
   let assemblyFormat = [{
-    `(` $input `,` $output `,` $size `)`
+    `(` $input `,` $output `,` $size `,` $input_offset `,` $output_offset `)`
     attr-dict `:`
-    `(` type($input) `,` type($output) `,` type($size) `)`
+    `(` type($input) `,` type($output) `,` type($size) `,` type($input_offset) `,` type($output_offset) `)`
     `->` type($result)
   }];
 }
@@ -535,6 +541,93 @@ def Simp_SiLUOp : Simp_Op<"silu", [NoSideEffect]> {
     `(` $input `,` $output `,` $size `)`
     attr-dict `:`
     `(` type($input) `,` type($output) `,` type($size) `)`
+    `->` type($result)
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// Quantization Operations
+//===----------------------------------------------------------------------===//
+
+def Simp_DequantW4Op : Simp_Op<"dequant_w4", [NoSideEffect]> {
+  let summary = "Dequantize W4 (4-bit) weight value";
+  let description = [{
+    Dequantizes a single 4-bit weight value from packed int8 array using per-group scales and zeros.
+
+    Formula:
+      qval = extract_4bit(qweights[idx/2], idx%2)
+      result = (qval - zeros[idx/group_size]) * scales[idx/group_size]
+
+    Used in quantized inference to convert 4-bit weights to FP32 on-the-fly.
+  }];
+
+  let arguments = (ins
+    Simp_ArrayType:$qweights,    // Packed int8 array (2 weights per byte)
+    Simp_ArrayType:$scales,      // FP32 scales per group
+    Simp_ArrayType:$zeros,       // FP32 zero points per group
+    I64:$idx,                    // Weight index to dequantize
+    I64:$group_size              // Quantization group size (e.g., 128)
+  );
+
+  let results = (outs F32:$result);  // Dequantized FP32 value
+
+  let assemblyFormat = [{
+    `(` $qweights `,` $scales `,` $zeros `,` $idx `,` $group_size `)`
+    attr-dict `:`
+    `(` type($qweights) `,` type($scales) `,` type($zeros) `,` type($idx) `,` type($group_size) `)`
+    `->` type($result)
+  }];
+}
+
+def Simp_MatMulQuantOp : Simp_Op<"matmul_quant", [NoSideEffect]> {
+  let summary = "Quantized matrix multiplication with on-the-fly dequantization";
+  let description = [{
+    Performs matrix multiplication with 4-bit quantized weights:
+      output = qweights @ input
+
+    Where:
+      - qweights: MxK quantized matrix (W4 format, packed in int8 array)
+      - input: Kx1 FP32 vector
+      - output: Mx1 FP32 vector
+
+    The operation dequantizes weights on-the-fly using per-group scales and zeros:
+      for i in range(M):
+        sum = 0
+        for j in range(K):
+          w_idx = offset + i*K + j
+          w_val = dequant_w4(qweights, scales, zeros, w_idx, group_size)
+          sum += w_val * input[j]
+        output[i] = sum
+
+    Lowering Path:
+    ```
+    simp.matmul_quant
+      → tiled loops with dequantization
+      → [tiling + vectorization optimizations]
+      → loops + arith ops
+    ```
+  }];
+
+  let arguments = (ins
+    Simp_ArrayType:$qweights,    // Packed W4 weights as int8 array
+    Simp_ArrayType:$scales,      // FP32 scales per group
+    Simp_ArrayType:$zeros,       // FP32 zero points per group
+    Simp_ArrayType:$input,       // FP32 input vector/matrix
+    Simp_ArrayType:$output,      // FP32 output buffer (pre-allocated)
+    I64:$rows,                   // M: rows of weight matrix
+    I64:$cols,                   // K: cols of weight matrix / length of input
+    I64:$group_size,             // Quantization group size
+    I64:$offset                  // Offset into qweights for layer-specific weights
+  );
+
+  let results = (outs Simp_ArrayType:$result);  // Returns output buffer
+
+  let assemblyFormat = [{
+    `(` $qweights `,` $scales `,` $zeros `,` $input `,` $output `,`
+        $rows `,` $cols `,` $group_size `,` $offset `)`
+    attr-dict `:`
+    `(` type($qweights) `,` type($scales) `,` type($zeros) `,` type($input) `,` type($output) `,`
+        type($rows) `,` type($cols) `,` type($group_size) `,` type($offset) `)`
     `->` type($result)
   }];
 }

@@ -69,7 +69,12 @@ enum BinaryOp {
     OpGE  = 257,
     OpEQ  = 258,
     OpNE  = 259,
-    OpMod = '%'  // Modulo operator
+    OpMod = '%',  // Modulo operator
+    OpAnd = 260,  // Bitwise AND
+    OpOr  = 261,  // Bitwise OR
+    OpXor = 262,  // Bitwise XOR
+    OpLShift = 263,  // Left shift
+    OpRShift = 264   // Right shift
 };
 
 // Unary operators

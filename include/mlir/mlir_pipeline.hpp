@@ -79,6 +79,9 @@ public:
   /// Enable/disable loop tiling optimization for matmul
   void setEnableTiling(bool enable) { enableTiling = enable; }
 
+  /// Set tile size for matmul optimization (default: 8)
+  void setTileSize(int size) { tileSize = size; }
+
   /// Enable/disable IR dumping at each pipeline stage
   void setDumpIntermediateIR(bool enable) { dumpIntermediateIR = enable; }
 
@@ -90,8 +93,11 @@ private:
   /// The MLIR module being compiled
   mlir::ModuleOp module;
 
-  /// Enable loop tiling optimization (default: false)
-  bool enableTiling = false;
+  /// Enable loop tiling optimization (default: true)
+  bool enableTiling = true;
+
+  /// Tile size for matmul optimization (default: 8)
+  int tileSize = 8;
 
   /// Enable IR dumping at each pipeline stage (default: false)
   bool dumpIntermediateIR = false;

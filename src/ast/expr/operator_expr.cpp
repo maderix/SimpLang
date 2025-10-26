@@ -117,6 +117,44 @@ llvm::Value* BinaryExprAST::codeGen(CodeGenContext& context) {
             return useIntegerOps ?
                 context.getBuilder().CreateICmpNE(lhs, rhs, "cmptmp") :
                 context.getBuilder().CreateFCmpUNE(lhs, rhs, "cmptmp");
+
+        // Bitwise operations - only valid for integers
+        case BinaryOp::OpAnd:
+            if (!useIntegerOps) {
+                LOG_ERROR("Bitwise AND (&) can only be applied to integer types");
+                return nullptr;
+            }
+            return context.getBuilder().CreateAnd(lhs, rhs, "andtmp");
+
+        case BinaryOp::OpOr:
+            if (!useIntegerOps) {
+                LOG_ERROR("Bitwise OR (|) can only be applied to integer types");
+                return nullptr;
+            }
+            return context.getBuilder().CreateOr(lhs, rhs, "ortmp");
+
+        case BinaryOp::OpXor:
+            if (!useIntegerOps) {
+                LOG_ERROR("Bitwise XOR (^) can only be applied to integer types");
+                return nullptr;
+            }
+            return context.getBuilder().CreateXor(lhs, rhs, "xortmp");
+
+        case BinaryOp::OpLShift:
+            if (!useIntegerOps) {
+                LOG_ERROR("Left shift (<<) can only be applied to integer types");
+                return nullptr;
+            }
+            return context.getBuilder().CreateShl(lhs, rhs, "shltmp");
+
+        case BinaryOp::OpRShift:
+            if (!useIntegerOps) {
+                LOG_ERROR("Right shift (>>) can only be applied to integer types");
+                return nullptr;
+            }
+            // Use arithmetic right shift (sign-extending)
+            return context.getBuilder().CreateAShr(lhs, rhs, "ashrtmp");
+
         default:
             LOG_ERROR("Invalid binary operator");
             return nullptr;

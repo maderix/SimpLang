@@ -19,6 +19,7 @@
 // MLIR Dialects
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/Passes.h"
+#include "mlir/Dialect/Affine/LoopUtils.h"
 #include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -27,6 +28,10 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/SCF.h"
 #include "mlir/Dialect/StandardOps/IR/Ops.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/Dialect/Vector/Transforms/VectorTransforms.h"
+#include "mlir/Dialect/Vector/Transforms/VectorRewritePatterns.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 // MLIR Conversion Passes
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
@@ -39,7 +44,10 @@
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Conversion/SCFToStandard/SCFToStandard.h"
 #include "mlir/Conversion/StandardToLLVM/ConvertStandardToLLVM.h"
+#include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
+#include "mlir/Conversion/VectorToSCF/VectorToSCF.h"
 #include "mlir/Dialect/Linalg/Passes.h"
+#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Transforms/DialectConversion.h"
 
 // MLIR to LLVM IR Translation
@@ -174,7 +182,7 @@ bool MLIRCompilationPipeline::runSimpToMemRefLowering() {
 }
 
 //===----------------------------------------------------------------------===//
-// Phase 2: Linalg → SCF Loops (with optimizations)
+// Phase 2: Linalg Vectorization and Loop Lowering
 //===----------------------------------------------------------------------===//
 
 bool MLIRCompilationPipeline::runLinalgToLoopsLowering() {
@@ -183,27 +191,62 @@ bool MLIRCompilationPipeline::runLinalgToLoopsLowering() {
   // Enable IR printing for debugging (comment out for production)
   // pm.enableIRPrinting();
 
-  // OPTIONAL: Tile matmul for better cache locality (enabled via --enable-tiling flag)
+  // OPTIONAL: Tile matmul BEFORE vectorization (enabled by default)
+  // Vectorizing large matrices (768x768) directly causes 1.6GB memory usage and hangs
+  // Tiling first breaks the matrix into small chunks that vectorize efficiently
   if (enableTiling) {
-    // Tile sizes: 32x32x32 is good for L1 cache (32*32*4 bytes = 4KB per tile)
+    // Use tile size from pipeline configuration (default: 8x8x8)
     // For matmul(MxK, KxN, MxN), we tile all 3 dimensions
-    llvm::SmallVector<int64_t, 3> tileSizes = {32, 32, 32};
+    llvm::SmallVector<int64_t, 3> tileSizes = {tileSize, tileSize, tileSize};
     pm.addNestedPass<mlir::FuncOp>(
-        mlir::createLinalgTilingPass(tileSizes)); // Tile to 32x32x32 blocks
+        mlir::createLinalgTilingPass(tileSizes));
+
+    // Canonicalize after tiling
+    pm.addPass(mlir::createCanonicalizerPass());
   }
 
-  // Lower Linalg ops (matmul, fill) to SCF loops
-  // NOTE: Affine lowering doesn't work even with static shapes for linalg.matmul
-  // TODO: Custom matmul lowering with iter_args for proper accumulator handling
-  pm.addNestedPass<mlir::FuncOp>(mlir::createConvertLinalgToLoopsPass());
+  // VECTORIZATION: Convert linalg operations to vector dialect
+  // The strategy passes work together: Enable → Vectorize → LowerVectors
 
-  // Apply general canonicalization and CSE to clean up generated loops
+  // Step 1: Enable vectorization strategy (marks ops for vectorization)
+  pm.addNestedPass<mlir::FuncOp>(
+      mlir::createLinalgStrategyEnablePass());
+
+  // Step 2: Vectorize marked linalg operations
+  pm.addNestedPass<mlir::FuncOp>(
+      mlir::createLinalgStrategyVectorizePass(""));
+
+  // Canonicalize after vectorization to clean up
   pm.addPass(mlir::createCanonicalizerPass());
   pm.addPass(mlir::createCSEPass());
 
-  // Run the pass
+  // Step 3: Lower vector dialect operations
+  // These passes convert high-level vector ops (like vector.contract) to LLVM-compatible ops
+  pm.addNestedPass<mlir::FuncOp>(
+      mlir::createLinalgStrategyLowerVectorsPass());
+
+  // Apply canonicalization after vector lowering
+  pm.addPass(mlir::createCanonicalizerPass());
+  pm.addPass(mlir::createCSEPass());
+
+  // Lower remaining Linalg ops (non-vectorized) to SCF loops
+  // Only operations that couldn't be vectorized will go through this
+  pm.addNestedPass<mlir::FuncOp>(mlir::createConvertLinalgToLoopsPass());
+
+  // Apply general canonicalization and CSE to clean up generated code
+  pm.addPass(mlir::createCanonicalizerPass());
+  pm.addPass(mlir::createCSEPass());
+
+  // OPTIMIZATION: Optimize loops for better performance
+  // Apply loop invariant code motion to hoist invariant operations
+  pm.addNestedPass<mlir::FuncOp>(mlir::createLoopInvariantCodeMotionPass());
+
+  // Apply loop unrolling for better ILP
+  pm.addNestedPass<mlir::FuncOp>(mlir::createLoopUnrollPass(4));
+
+  // Run the passes
   if (failed(pm.run(module))) {
-    llvm::errs() << "Error: Linalg to Loops pass failed\n";
+    llvm::errs() << "Error: Linalg vectorization/lowering pass failed\n";
     module.dump();
     return false;
   }
@@ -247,7 +290,20 @@ bool MLIRCompilationPipeline::runToLLVMDialectLowering() {
   // Follow the Toy Chapter 6 pattern for lowering to LLVM dialect
   // This uses pattern-based conversion with full dialect conversion
 
-  // 1. First, lower Affine and SCF to Standard dialect control flow
+  // 1. First, lower Vector transfer ops to simpler vector operations
+  {
+    mlir::PassManager pm(module.getContext());
+    // Lower vector.transfer_read/write to simpler vector operations
+    // This converts high-level vector ops to operations LLVM can handle
+    pm.addNestedPass<mlir::FuncOp>(mlir::createConvertVectorToSCFPass());
+    if (failed(pm.run(module))) {
+      llvm::errs() << "Error: Vector to SCF lowering failed\n";
+      module.dump();
+      return false;
+    }
+  }
+
+  // 2. Lower Affine and SCF to Standard dialect control flow
   {
     mlir::PassManager pm(module.getContext());
     // Lower Affine ops (affine.min, etc.) to Standard
@@ -261,8 +317,33 @@ bool MLIRCompilationPipeline::runToLLVMDialectLowering() {
     }
   }
 
-  // 2. Lower MemRef, Arith, and Standard to LLVM dialect
+  // 3. Lower MemRef, Arith, Vector, and Standard to LLVM dialect
   //    Using pattern-based conversion like Toy Ch6
+
+  // CRITICAL: Lower vector operations to simpler forms BEFORE LLVM conversion
+  {
+    mlir::PassManager pm(module.getContext());
+    mlir::RewritePatternSet patterns(module.getContext());
+
+    // Lower vector.contract to outer products
+    mlir::vector::VectorTransformsOptions vectorOptions;
+    vectorOptions.setVectorTransformsOptions(mlir::vector::VectorContractLowering::OuterProduct);
+    mlir::vector::populateVectorContractLoweringPatterns(patterns, vectorOptions);
+
+    // Lower vector.transpose, vector.broadcast, etc.
+    mlir::vector::populateVectorToVectorCanonicalizationPatterns(patterns);
+    mlir::vector::populateVectorBroadcastLoweringPatterns(patterns);
+    mlir::vector::populateVectorMaskOpLoweringPatterns(patterns);
+
+    if (failed(mlir::applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
+      llvm::errs() << "Warning: Vector lowering patterns failed\n";
+    }
+    pm.addPass(mlir::createCanonicalizerPass());
+    if (failed(pm.run(module))) {
+      llvm::errs() << "Error: Post-vector-lowering canonicalization failed\n";
+      return false;
+    }
+  }
 
   // Define the conversion target - only LLVM dialect operations are legal
   mlir::LLVMConversionTarget target(*module.getContext());
@@ -282,6 +363,12 @@ bool MLIRCompilationPipeline::runToLLVMDialectLowering() {
 
   // Add patterns for MemRef → LLVM
   mlir::populateMemRefToLLVMConversionPatterns(typeConverter, patterns);
+
+  // Add patterns for Vector → LLVM (CRITICAL for vectorization)
+  // First, add matrix intrinsics patterns for vector.contract operations
+  mlir::populateVectorToLLVMMatrixConversionPatterns(typeConverter, patterns);
+  // Then, add general vector to LLVM patterns
+  mlir::populateVectorToLLVMConversionPatterns(typeConverter, patterns);
 
   // Add patterns for Standard → LLVM
   mlir::populateStdToLLVMConversionPatterns(typeConverter, patterns);

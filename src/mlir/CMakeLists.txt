@@ -44,6 +44,7 @@ add_mlir_dialect_library(simp_dialect
   lowering/ConvertSimpToMemRef.cpp
   lowering/ConvertSimpToLinalg.cpp
   lowering/SpecializeShapes.cpp
+  PromoteLargeAllocaToHeap.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${CMAKE_SOURCE_DIR}/include/mlir
@@ -77,6 +78,8 @@ add_mlir_dialect_library(simp_dialect
   MLIRStandardToLLVM
   MLIRTargetLLVMIRExport
   MLIRLLVMToLLVMIRTranslation
+  mlir_c_runner_utils
+  mlir_runner_utils
 )
 
 # Disable RTTI and exceptions to match LLVM/MLIR build

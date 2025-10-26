@@ -17,6 +17,9 @@
 #include "mlir/Dialect/SCF/SCF.h"
 #include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/tensor_layout.hpp"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/raw_ostream.h"
@@ -48,6 +51,10 @@ void MLIRCodeGenContext::initializeMLIRContext() {
   mlirContext.getOrLoadDialect<mlir::StandardOpsDialect>();
   mlirContext.getOrLoadDialect<mlir::scf::SCFDialect>();
   mlirContext.getOrLoadDialect<mlir::arith::ArithmeticDialect>();
+  mlirContext.getOrLoadDialect<mlir::math::MathDialect>();
+  mlirContext.getOrLoadDialect<mlir::vector::VectorDialect>();  // For vectorization
+  mlirContext.getOrLoadDialect<mlir::memref::MemRefDialect>();  // For memref ops
+  mlirContext.getOrLoadDialect<mlir::linalg::LinalgDialect>();  // For linalg ops
 }
 
 void MLIRCodeGenContext::createModule(const std::string& moduleName) {
@@ -683,6 +690,50 @@ mlir::Value MLIRCodeGenContext::lowerBinaryOp(BinaryExprAST* binOp) {
             loc, mlir::arith::CmpFPredicate::ONE, lhs, rhs);
       }
 
+    // Bitwise operations - only valid for integer types
+    case OpAnd:
+      if (!lhs.getType().isa<mlir::IntegerType>()) {
+        llvm::errs() << "Error: Bitwise AND (&) can only be applied to integer types\n";
+        return nullptr;
+      }
+      return builder.create<mlir::arith::AndIOp>(loc, lhs, rhs);
+
+    case OpOr:
+      if (!lhs.getType().isa<mlir::IntegerType>()) {
+        llvm::errs() << "Error: Bitwise OR (|) can only be applied to integer types\n";
+        return nullptr;
+      }
+      return builder.create<mlir::arith::OrIOp>(loc, lhs, rhs);
+
+    case OpXor:
+      if (!lhs.getType().isa<mlir::IntegerType>()) {
+        llvm::errs() << "Error: Bitwise XOR (^) can only be applied to integer types\n";
+        return nullptr;
+      }
+      return builder.create<mlir::arith::XOrIOp>(loc, lhs, rhs);
+
+    case OpLShift:
+      if (!lhs.getType().isa<mlir::IntegerType>()) {
+        llvm::errs() << "Error: Left shift (<<) can only be applied to integer types\n";
+        return nullptr;
+      }
+      return builder.create<mlir::arith::ShLIOp>(loc, lhs, rhs);
+
+    case OpRShift:
+      if (!lhs.getType().isa<mlir::IntegerType>()) {
+        llvm::errs() << "Error: Right shift (>>) can only be applied to integer types\n";
+        return nullptr;
+      }
+      // Use arithmetic right shift (sign-extending for signed integers)
+      return builder.create<mlir::arith::ShRSIOp>(loc, lhs, rhs);
+
+    case OpMod:
+      if (lhs.getType().isa<mlir::IntegerType>()) {
+        return builder.create<mlir::arith::RemSIOp>(loc, lhs, rhs);
+      } else {
+        return builder.create<mlir::arith::RemFOp>(loc, lhs, rhs);
+      }
+
     default:
       llvm::errs() << "Error: Unsupported binary operator: " << binOp->getOp() << "\n";
       return nullptr;
@@ -1067,6 +1118,25 @@ mlir::Value MLIRCodeGenContext::lowerMatMul(MatMulExprAST* matmul) {
     return nullptr;
   }
 
+  // Lower the offset arguments
+  mlir::Value lhs_offset = lowerExpression(matmul->getLHSOffset());
+  if (!lhs_offset) {
+    llvm::errs() << "Error: Failed to lower matmul lhs_offset\n";
+    return nullptr;
+  }
+
+  mlir::Value rhs_offset = lowerExpression(matmul->getRHSOffset());
+  if (!rhs_offset) {
+    llvm::errs() << "Error: Failed to lower matmul rhs_offset\n";
+    return nullptr;
+  }
+
+  mlir::Value output_offset = lowerExpression(matmul->getOutputOffset());
+  if (!output_offset) {
+    llvm::errs() << "Error: Failed to lower matmul output_offset\n";
+    return nullptr;
+  }
+
   // Get the array type
   auto arrayType = output.getType().dyn_cast<mlir::simp::ArrayType>();
   if (!arrayType) {
@@ -1074,10 +1144,10 @@ mlir::Value MLIRCodeGenContext::lowerMatMul(MatMulExprAST* matmul) {
     return nullptr;
   }
 
-  // Create the simp.matmul operation
+  // Create the simp.matmul operation with provided offsets
   // The output buffer is pre-allocated - matmul writes in-place
   return builder.create<mlir::simp::MatMulOp>(
-      loc, arrayType, lhs, rhs, output, m, k, n);
+      loc, arrayType, lhs, rhs, output, m, k, n, lhs_offset, rhs_offset, output_offset);
 }
 
 mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
@@ -1135,6 +1205,201 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
     );
 
     return conv2dOp.getResult();
+  }
+
+  // Handle builtin: matmul(lhs, rhs, output, m, k, n, lhs_offset, rhs_offset, output_offset)
+  if (calleeName == "matmul") {
+    if (args.size() != 9) {
+      llvm::errs() << "Error: matmul requires 9 arguments (got " << args.size() << ")\n";
+      return nullptr;
+    }
+
+    mlir::Value lhs = args[0];
+    mlir::Value rhs = args[1];
+    mlir::Value output = args[2];
+    mlir::Value m = args[3];
+    mlir::Value k = args[4];
+    mlir::Value n = args[5];
+    mlir::Value lhs_offset = args[6];
+    mlir::Value rhs_offset = args[7];
+    mlir::Value output_offset = args[8];
+
+    mlir::Type outputArrayType = output.getType();
+
+    auto matmulOp = builder.create<simp::MatMulOp>(
+        loc, outputArrayType,
+        lhs, rhs, output, m, k, n, lhs_offset, rhs_offset, output_offset
+    );
+
+    return matmulOp.getResult();
+  }
+
+  // Handle builtin: rmsnorm(input, weight, output, size, epsilon, weight_offset)
+  if (calleeName == "rmsnorm") {
+    if (args.size() != 6) {
+      llvm::errs() << "Error: rmsnorm requires 6 arguments (got " << args.size() << ")\n";
+      return nullptr;
+    }
+
+    mlir::Value input = args[0];
+    mlir::Value weight = args[1];
+    mlir::Value output = args[2];
+    mlir::Value size = args[3];
+    mlir::Value epsilon = args[4];
+    mlir::Value weight_offset = args[5];
+
+    mlir::Type outputArrayType = output.getType();
+
+    auto rmsnormOp = builder.create<simp::RMSNormOp>(
+        loc, outputArrayType,
+        input, weight, output, size, epsilon, weight_offset
+    );
+
+    return rmsnormOp.getResult();
+  }
+
+  // Handle builtin: softmax(input, output, size, input_offset, output_offset)
+  if (calleeName == "softmax") {
+    if (args.size() != 5) {
+      llvm::errs() << "Error: softmax requires 5 arguments (got " << args.size() << ")\n";
+      return nullptr;
+    }
+
+    mlir::Value input = args[0];
+    mlir::Value output = args[1];
+    mlir::Value size = args[2];
+    mlir::Value input_offset = args[3];
+    mlir::Value output_offset = args[4];
+
+    mlir::Type outputArrayType = output.getType();
+
+    auto softmaxOp = builder.create<simp::SoftmaxOp>(
+        loc, outputArrayType,
+        input, output, size, input_offset, output_offset
+    );
+
+    return softmaxOp.getResult();
+  }
+
+  // Handle builtin: silu(input, output, size)
+  if (calleeName == "silu") {
+    if (args.size() != 3) {
+      llvm::errs() << "Error: silu requires 3 arguments (got " << args.size() << ")\n";
+      return nullptr;
+    }
+
+    mlir::Value input = args[0];
+    mlir::Value output = args[1];
+    mlir::Value size = args[2];
+
+    mlir::Type outputArrayType = output.getType();
+
+    auto siluOp = builder.create<simp::SiLUOp>(
+        loc, outputArrayType,
+        input, output, size
+    );
+
+    return siluOp.getResult();
+  }
+
+  // Handle builtin: dequant_w4(qweights, scales, zeros, idx, group_size)
+  if (calleeName == "dequant_w4") {
+    if (args.size() != 5) {
+      llvm::errs() << "Error: dequant_w4 requires 5 arguments (got " << args.size() << ")\n";
+      return nullptr;
+    }
+
+    mlir::Value qweights = args[0];
+    mlir::Value scales = args[1];
+    mlir::Value zeros = args[2];
+    mlir::Value idx = args[3];
+    mlir::Value group_size = args[4];
+
+    // Result type is f32
+    mlir::Type f32Type = builder.getF32Type();
+
+    auto dequantOp = builder.create<simp::DequantW4Op>(
+        loc, f32Type,
+        qweights, scales, zeros, idx, group_size
+    );
+
+    return dequantOp.getResult();
+  }
+
+  // Handle builtin: matmul_quant(qweights, scales, zeros, input, output, rows, cols, group_size, offset)
+  if (calleeName == "matmul_quant") {
+    if (args.size() != 9) {
+      llvm::errs() << "Error: matmul_quant requires 9 arguments (got " << args.size() << ")\n";
+      return nullptr;
+    }
+
+    mlir::Value qweights = args[0];
+    mlir::Value scales = args[1];
+    mlir::Value zeros = args[2];
+    mlir::Value input = args[3];
+    mlir::Value output = args[4];
+    mlir::Value rows = args[5];
+    mlir::Value cols = args[6];
+    mlir::Value group_size = args[7];
+    mlir::Value offset = args[8];
+
+    mlir::Type outputArrayType = output.getType();
+
+    auto matmulQuantOp = builder.create<simp::MatMulQuantOp>(
+        loc, outputArrayType,
+        qweights, scales, zeros, input, output, rows, cols, group_size, offset
+    );
+
+    return matmulQuantOp.getResult();
+  }
+
+  // Handle builtin math functions: sqrt, exp
+  if (calleeName == "sqrt") {
+    if (args.size() != 1) {
+      llvm::errs() << "Error: sqrt requires 1 argument (got " << args.size() << ")\n";
+      return nullptr;
+    }
+    return builder.create<math::SqrtOp>(loc, args[0]);
+  }
+
+  if (calleeName == "exp") {
+    if (args.size() != 1) {
+      llvm::errs() << "Error: exp requires 1 argument (got " << args.size() << ")\n";
+      return nullptr;
+    }
+    return builder.create<math::ExpOp>(loc, args[0]);
+  }
+
+  if (calleeName == "log") {
+    if (args.size() != 1) {
+      llvm::errs() << "Error: log requires 1 argument (got " << args.size() << ")\n";
+      return nullptr;
+    }
+    return builder.create<math::LogOp>(loc, args[0]);
+  }
+
+  if (calleeName == "pow") {
+    if (args.size() != 2) {
+      llvm::errs() << "Error: pow requires 2 arguments (got " << args.size() << ")\n";
+      return nullptr;
+    }
+    return builder.create<math::PowFOp>(loc, args[0], args[1]);
+  }
+
+  if (calleeName == "cos") {
+    if (args.size() != 1) {
+      llvm::errs() << "Error: cos requires 1 argument (got " << args.size() << ")\n";
+      return nullptr;
+    }
+    return builder.create<math::CosOp>(loc, args[0]);
+  }
+
+  if (calleeName == "sin") {
+    if (args.size() != 1) {
+      llvm::errs() << "Error: sin requires 1 argument (got " << args.size() << ")\n";
+      return nullptr;
+    }
+    return builder.create<math::SinOp>(loc, args[0]);
   }
 
   // Look up user-defined functions in the module

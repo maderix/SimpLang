@@ -60,13 +60,18 @@
 %token TCOMMA TSEMICOLON
 %token TMAKE TARRAY TSSESLICE TAVXSLICE TLBRACKET TRBRACKET TMATMUL
 %token UNARY_MINUS  /* Add this token for unary minus */
-%token TOK_MOD
+%token TOK_MOD TOK_AND TOK_OR TOK_XOR TOK_LSHIFT TOK_RSHIFT
 %token <string> IDENTIFIER
 %token <double> NUMBER
 %token SSE AVX
 
 %left TLBRACKET    /* For array subscripting */
-%left TCEQ TCNE TCLE TCGE '<' '>'  /* Comparison operators */
+%left TOK_OR       /* Bitwise OR (lowest) */
+%left TOK_XOR      /* Bitwise XOR */
+%left TOK_AND      /* Bitwise AND */
+%left TCEQ TCNE    /* Equality operators */
+%left TCLE TCGE '<' '>'  /* Comparison operators */
+%left TOK_LSHIFT TOK_RSHIFT  /* Shift operators */
 %left '+' '-'
 %left '*' '/' TOK_MOD
 %left UNARY_MINUS  /* Add precedence for unary minus */
@@ -106,6 +111,11 @@ expr : expr '+' expr   { $$ = new BinaryExprAST(static_cast<BinaryOp>('+'), make
      | expr '*' expr   { $$ = new BinaryExprAST(static_cast<BinaryOp>('*'), makeUnique($1), makeUnique($3)); }
      | expr '/' expr   { $$ = new BinaryExprAST(static_cast<BinaryOp>('/'), makeUnique($1), makeUnique($3)); }
      | expr TOK_MOD expr   { $$ = new BinaryExprAST(BinaryOp::OpMod, makeUnique($1), makeUnique($3)); }
+     | expr TOK_AND expr   { $$ = new BinaryExprAST(BinaryOp::OpAnd, makeUnique($1), makeUnique($3)); }
+     | expr TOK_OR expr    { $$ = new BinaryExprAST(BinaryOp::OpOr, makeUnique($1), makeUnique($3)); }
+     | expr TOK_XOR expr   { $$ = new BinaryExprAST(BinaryOp::OpXor, makeUnique($1), makeUnique($3)); }
+     | expr TOK_LSHIFT expr { $$ = new BinaryExprAST(BinaryOp::OpLShift, makeUnique($1), makeUnique($3)); }
+     | expr TOK_RSHIFT expr { $$ = new BinaryExprAST(BinaryOp::OpRShift, makeUnique($1), makeUnique($3)); }
      | '-' expr %prec UNARY_MINUS { $$ = new UnaryExprAST(OpNeg, makeUnique($2)); }
      | expr TCEQ expr  { $$ = new BinaryExprAST(BinaryOp::OpEQ, makeUnique($1), makeUnique($3)); }
      | expr TCNE expr  { $$ = new BinaryExprAST(BinaryOp::OpNE, makeUnique($1), makeUnique($3)); }
@@ -271,13 +281,31 @@ call_expr : ident TLPAREN call_args TRPAREN {
           ;
 
 matmul_expr : TMATMUL TLPAREN expr TCOMMA expr TCOMMA expr TCOMMA expr TCOMMA expr TCOMMA expr TRPAREN {
+                // 6-arg version: matmul(lhs, rhs, output, m, k, n) with zero offsets
                 $$ = new MatMulExprAST(
-                    makeUnique($3),   // lhs: A matrix (MxK as 1D array)
-                    makeUnique($5),   // rhs: B matrix (KxN as 1D array)
-                    makeUnique($7),   // output: C matrix (MxN as 1D array, pre-allocated)
-                    makeUnique($9),   // m: rows of A
-                    makeUnique($11),  // k: cols of A / rows of B
-                    makeUnique($13)   // n: cols of B
+                    makeUnique($3),   // lhs
+                    makeUnique($5),   // rhs
+                    makeUnique($7),   // output
+                    makeUnique($9),   // m
+                    makeUnique($11),  // k
+                    makeUnique($13),  // n
+                    std::make_unique<NumberExprAST>(0, true),  // lhs_offset = 0
+                    std::make_unique<NumberExprAST>(0, true),  // rhs_offset = 0
+                    std::make_unique<NumberExprAST>(0, true)   // output_offset = 0
+                );
+            }
+            | TMATMUL TLPAREN expr TCOMMA expr TCOMMA expr TCOMMA expr TCOMMA expr TCOMMA expr TCOMMA expr TCOMMA expr TCOMMA expr TRPAREN {
+                // 9-arg version: matmul(lhs, rhs, output, m, k, n, lhs_offset, rhs_offset, output_offset)
+                $$ = new MatMulExprAST(
+                    makeUnique($3),   // lhs
+                    makeUnique($5),   // rhs
+                    makeUnique($7),   // output
+                    makeUnique($9),   // m
+                    makeUnique($11),  // k
+                    makeUnique($13),  // n
+                    makeUnique($15),  // lhs_offset
+                    makeUnique($17),  // rhs_offset
+                    makeUnique($19)   // output_offset
                 );
             }
             ;

@@ -21,6 +21,7 @@
 #include "mlir/simp_ops.hpp"
 #include "mlir/simp_types.hpp"
 #include "llvm/ADT/Optional.h"
+#include <optional>
 
 using namespace mlir;
 using namespace mlir::simp;
@@ -47,6 +48,24 @@ public:
                                    ValueRange inputs, Location loc) -> Value {
       // Materialize memref from simp.array for function arguments
       // Just create an unrealized cast that later passes will clean up
+      if (inputs.size() == 1)
+        return builder.create<UnrealizedConversionCastOp>(loc, resultType, inputs[0]).getResult(0);
+      return nullptr;
+    });
+
+    // Add source materialization: converts memref back to simp.array when needed
+    // This is crucial for loop-carried values that cross function boundaries
+    addSourceMaterialization([](OpBuilder &builder, Type resultType,
+                                ValueRange inputs, Location loc) -> Value {
+      if (inputs.size() == 1)
+        return builder.create<UnrealizedConversionCastOp>(loc, resultType, inputs[0]).getResult(0);
+      return nullptr;
+    });
+
+    // Add target materialization: converts simp.array to memref for results
+    // This handles conversions in return values and yields
+    addTargetMaterialization([](OpBuilder &builder, Type resultType,
+                                ValueRange inputs, Location loc) -> Value {
       if (inputs.size() == 1)
         return builder.create<UnrealizedConversionCastOp>(loc, resultType, inputs[0]).getResult(0);
       return nullptr;
@@ -342,6 +361,30 @@ struct NegOpLowering : public OpConversionPattern<simp::NegOp> {
   }
 };
 
+/// Convert CallOp to handle type conversions
+struct CallOpLowering : public OpConversionPattern<CallOp> {
+  using OpConversionPattern<CallOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      CallOp callOp, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+
+    // Convert result types
+    SmallVector<Type, 1> resultTypes;
+    if (failed(getTypeConverter()->convertTypes(callOp.getResultTypes(), resultTypes)))
+      return failure();
+
+    // Create new call with converted operands and result types
+    rewriter.replaceOpWithNewOp<CallOp>(
+        callOp,
+        callOp.getCallee(),
+        resultTypes,
+        adaptor.getOperands());
+
+    return success();
+  }
+};
+
 /// Convert simp.matmul to linalg.matmul
 /// Operands are already converted to memrefs by the type converter
 struct MatMulOpLowering : public OpConversionPattern<simp::MatMulOp> {
@@ -355,12 +398,15 @@ struct MatMulOpLowering : public OpConversionPattern<simp::MatMulOp> {
 
     // Get converted operands (now memref<?xT> after type conversion)
     auto operands = adaptor.getOperands();
-    Value lhs = operands[0];     // A: memref<?xT>
-    Value rhs = operands[1];     // B: memref<?xT>
-    Value output = operands[2];  // C: memref<?xT> (pre-allocated by caller)
-    Value m = operands[3];       // Rows of A
-    Value k = operands[4];       // Cols of A / Rows of B
-    Value n = operands[5];       // Cols of B
+    Value lhs = operands[0];          // A: memref<?xT>
+    Value rhs = operands[1];          // B: memref<?xT>
+    Value output = operands[2];       // C: memref<?xT> (pre-allocated by caller)
+    Value m = operands[3];            // Rows of A
+    Value k = operands[4];            // Cols of A / Rows of B
+    Value n = operands[5];            // Cols of B
+    Value lhs_offset = operands[6];   // Offset into lhs array
+    Value rhs_offset = operands[7];   // Offset into rhs array
+    Value output_offset = operands[8]; // Offset into output array
 
     // Get element type
     auto lhsMemRefType = lhs.getType().cast<MemRefType>();
@@ -377,28 +423,79 @@ struct MatMulOpLowering : public OpConversionPattern<simp::MatMulOp> {
       n = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), n);
     }
 
+    // Convert offsets to index type
+    if (!lhs_offset.getType().isIndex()) {
+      lhs_offset = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), lhs_offset);
+    }
+    if (!rhs_offset.getType().isIndex()) {
+      rhs_offset = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), rhs_offset);
+    }
+    if (!output_offset.getType().isIndex()) {
+      output_offset = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), output_offset);
+    }
+
+    // Try to extract constant dimensions for static shapes (enables vectorization)
+    std::optional<int64_t> mConst, kConst, nConst;
+
+    // Check if m is constant
+    if (auto constOp = m.getDefiningOp<arith::ConstantIndexOp>()) {
+      mConst = constOp.value();
+    } else if (auto indexCast = m.getDefiningOp<arith::IndexCastOp>()) {
+      if (auto constInt = indexCast.getIn().getDefiningOp<arith::ConstantIntOp>()) {
+        mConst = constInt.value();
+      }
+    }
+
+    // Check if k is constant
+    if (auto constOp = k.getDefiningOp<arith::ConstantIndexOp>()) {
+      kConst = constOp.value();
+    } else if (auto indexCast = k.getDefiningOp<arith::IndexCastOp>()) {
+      if (auto constInt = indexCast.getIn().getDefiningOp<arith::ConstantIntOp>()) {
+        kConst = constInt.value();
+      }
+    }
+
+    // Check if n is constant
+    if (auto constOp = n.getDefiningOp<arith::ConstantIndexOp>()) {
+      nConst = constOp.value();
+    } else if (auto indexCast = n.getDefiningOp<arith::IndexCastOp>()) {
+      if (auto constInt = indexCast.getIn().getDefiningOp<arith::ConstantIntOp>()) {
+        nConst = constInt.value();
+      }
+    }
+
     // Create 2D memref types for matrices
-    auto matrixAType = MemRefType::get({-1, -1}, elemType);  // MxK
-    auto matrixBType = MemRefType::get({-1, -1}, elemType);  // KxN
-    auto matrixCType = MemRefType::get({-1, -1}, elemType);  // MxN
+    // Use static shapes if all dimensions are constant (enables MLIR vectorization)
+    MemRefType matrixAType, matrixBType, matrixCType;
+
+    if (mConst && kConst && nConst) {
+      // All dimensions are constant - use static shapes for vectorization!
+      matrixAType = MemRefType::get({*mConst, *kConst}, elemType);  // MxK
+      matrixBType = MemRefType::get({*kConst, *nConst}, elemType);  // KxN
+      matrixCType = MemRefType::get({*mConst, *nConst}, elemType);  // MxN
+    } else {
+      // Dynamic shapes (fallback for runtime dimensions)
+      matrixAType = MemRefType::get({-1, -1}, elemType);  // MxK
+      matrixBType = MemRefType::get({-1, -1}, elemType);  // KxN
+      matrixCType = MemRefType::get({-1, -1}, elemType);  // MxN
+    }
 
     // Create stride constants
-    Value zeroOffset = rewriter.create<arith::ConstantIndexOp>(loc, 0);
     Value oneStride = rewriter.create<arith::ConstantIndexOp>(loc, 1);
 
-    // Reinterpret 1D arrays as 2D matrices
+    // Reinterpret 1D arrays as 2D matrices using provided offsets
     auto lhs2D = rewriter.create<memref::ReinterpretCastOp>(
-        loc, matrixAType, lhs, zeroOffset,
+        loc, matrixAType, lhs, lhs_offset,
         ValueRange{m, k}, ValueRange{k, oneStride});
 
     auto rhs2D = rewriter.create<memref::ReinterpretCastOp>(
-        loc, matrixBType, rhs, zeroOffset,
+        loc, matrixBType, rhs, rhs_offset,
         ValueRange{k, n}, ValueRange{n, oneStride});
 
     // Use the pre-allocated output buffer (host-kernel model: no allocations in kernel)
     // Reinterpret output as 2D matrix
     auto output2D = rewriter.create<memref::ReinterpretCastOp>(
-        loc, matrixCType, output, zeroOffset,
+        loc, matrixCType, output, output_offset,
         ValueRange{m, n}, ValueRange{n, oneStride});
 
     // NOTE: linalg.matmul performs C += A * B (accumulation, not overwrite)
@@ -666,6 +763,7 @@ struct RMSNormOpLowering : public OpConversionPattern<simp::RMSNormOp> {
     auto output = adaptor.output();
     auto size = adaptor.size();
     auto epsilon = adaptor.epsilon();
+    auto weight_offset = adaptor.weight_offset();
 
     // Extract element type
     auto inputType = input.getType().dyn_cast<MemRefType>();
@@ -717,7 +815,12 @@ struct RMSNormOpLowering : public OpConversionPattern<simp::RMSNormOp> {
 
     auto normI = normLoop.getInductionVar();
     auto normVal = rewriter.create<memref::LoadOp>(loc, input, ValueRange{normI});
-    auto w = rewriter.create<memref::LoadOp>(loc, weight, ValueRange{normI});
+
+    // Add weight_offset to index for layer-specific weights
+    auto offsetIdx = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), weight_offset);
+    auto weightIdx = rewriter.create<arith::AddIOp>(loc, offsetIdx, normI);
+    auto w = rewriter.create<memref::LoadOp>(loc, weight, ValueRange{weightIdx});
+
     auto norm = rewriter.create<arith::DivFOp>(loc, normVal, rms);
     auto scaled = rewriter.create<arith::MulFOp>(loc, norm, w);
     rewriter.create<memref::StoreOp>(loc, scaled, output, ValueRange{normI});
@@ -740,6 +843,8 @@ struct SoftmaxOpLowering : public OpConversionPattern<simp::SoftmaxOp> {
     auto input = adaptor.input();
     auto output = adaptor.output();
     auto size = adaptor.size();
+    auto input_offset = adaptor.input_offset();
+    auto output_offset = adaptor.output_offset();
 
     auto inputType = input.getType().dyn_cast<MemRefType>();
     auto elemType = inputType.getElementType();
@@ -748,8 +853,13 @@ struct SoftmaxOpLowering : public OpConversionPattern<simp::SoftmaxOp> {
     auto c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
     auto sizeIdx = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), size);
 
+    // Convert offsets to index type
+    auto inputOffsetIdx = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), input_offset);
+    auto outputOffsetIdx = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), output_offset);
+
     // Step 1: Find max value
-    auto firstVal = rewriter.create<memref::LoadOp>(loc, input, ValueRange{c0});
+    auto firstIdx = rewriter.create<arith::AddIOp>(loc, c0, inputOffsetIdx);
+    auto firstVal = rewriter.create<memref::LoadOp>(loc, input, ValueRange{firstIdx});
     auto maxAlloc = rewriter.create<memref::AllocaOp>(loc, MemRefType::get({}, elemType));
     rewriter.create<memref::StoreOp>(loc, firstVal, maxAlloc, ValueRange());
 
@@ -757,7 +867,8 @@ struct SoftmaxOpLowering : public OpConversionPattern<simp::SoftmaxOp> {
     rewriter.setInsertionPointToStart(maxLoop.getBody());
 
     auto i = maxLoop.getInductionVar();
-    auto val = rewriter.create<memref::LoadOp>(loc, input, ValueRange{i});
+    auto inputIdx = rewriter.create<arith::AddIOp>(loc, i, inputOffsetIdx);
+    auto val = rewriter.create<memref::LoadOp>(loc, input, ValueRange{inputIdx});
     auto currentMax = rewriter.create<memref::LoadOp>(loc, maxAlloc, ValueRange());
     // Use compare + select instead of MaxFOp
     auto cmp = rewriter.create<arith::CmpFOp>(loc, arith::CmpFPredicate::OGT, val, currentMax);
@@ -776,10 +887,12 @@ struct SoftmaxOpLowering : public OpConversionPattern<simp::SoftmaxOp> {
     rewriter.setInsertionPointToStart(expLoop.getBody());
 
     auto expI = expLoop.getInductionVar();
-    auto expInputVal = rewriter.create<memref::LoadOp>(loc, input, ValueRange{expI});
+    auto expInputIdx = rewriter.create<arith::AddIOp>(loc, expI, inputOffsetIdx);
+    auto expOutputIdx = rewriter.create<arith::AddIOp>(loc, expI, outputOffsetIdx);
+    auto expInputVal = rewriter.create<memref::LoadOp>(loc, input, ValueRange{expInputIdx});
     auto shifted = rewriter.create<arith::SubFOp>(loc, expInputVal, maxVal);
     auto expVal = rewriter.create<math::ExpOp>(loc, shifted);
-    rewriter.create<memref::StoreOp>(loc, expVal, output, ValueRange{expI});
+    rewriter.create<memref::StoreOp>(loc, expVal, output, ValueRange{expOutputIdx});
 
     auto currentSum = rewriter.create<memref::LoadOp>(loc, sumAlloc, ValueRange());
     auto newSum = rewriter.create<arith::AddFOp>(loc, currentSum, expVal);
@@ -793,9 +906,10 @@ struct SoftmaxOpLowering : public OpConversionPattern<simp::SoftmaxOp> {
     rewriter.setInsertionPointToStart(normLoop.getBody());
 
     auto normI = normLoop.getInductionVar();
-    auto normExpVal = rewriter.create<memref::LoadOp>(loc, output, ValueRange{normI});
+    auto normOutputIdx = rewriter.create<arith::AddIOp>(loc, normI, outputOffsetIdx);
+    auto normExpVal = rewriter.create<memref::LoadOp>(loc, output, ValueRange{normOutputIdx});
     auto prob = rewriter.create<arith::DivFOp>(loc, normExpVal, sumExp);
-    rewriter.create<memref::StoreOp>(loc, prob, output, ValueRange{normI});
+    rewriter.create<memref::StoreOp>(loc, prob, output, ValueRange{normOutputIdx});
 
     rewriter.setInsertionPointAfter(normLoop);
     rewriter.replaceOp(op, output);
@@ -842,6 +956,240 @@ struct SiLUOpLowering : public OpConversionPattern<simp::SiLUOp> {
 };
 
 //===----------------------------------------------------------------------===//
+// Quantization Operations
+//===----------------------------------------------------------------------===//
+
+// DequantW4: Dequantize single 4-bit weight value
+struct DequantW4OpLowering : public OpConversionPattern<simp::DequantW4Op> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      simp::DequantW4Op op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+
+    auto loc = op.getLoc();
+    auto qweights = adaptor.qweights();
+    auto scales = adaptor.scales();
+    auto zeros = adaptor.zeros();
+    auto idx = adaptor.idx();
+    auto group_size = adaptor.group_size();
+
+    auto i8Type = rewriter.getIntegerType(8);
+    auto f32Type = rewriter.getF32Type();
+
+    // g = idx / group_size
+    auto idxCast = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), idx);
+    auto groupSizeCast = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), group_size);
+    auto gIdx = rewriter.create<arith::DivUIOp>(loc, idxCast, groupSizeCast);
+
+    // Load scale and zero for this group
+    auto scale = rewriter.create<memref::LoadOp>(loc, scales, ValueRange{gIdx});
+    auto zero = rewriter.create<memref::LoadOp>(loc, zeros, ValueRange{gIdx});
+
+    // byte_idx = idx / 2
+    auto c2Idx = rewriter.create<arith::ConstantIndexOp>(loc, 2);
+    auto byteIdx = rewriter.create<arith::DivUIOp>(loc, idxCast, c2Idx);
+
+    // Load packed byte
+    auto qbyte_i8 = rewriter.create<memref::LoadOp>(loc, qweights, ValueRange{byteIdx});
+
+    // Convert i8 to i32 for bitwise operations
+    auto qbyte = rewriter.create<arith::ExtUIOp>(loc, rewriter.getI32Type(), qbyte_i8);
+
+    // Extract 4-bit value based on idx % 2
+    auto c2I64 = rewriter.create<arith::ConstantOp>(loc, idx.getType(), rewriter.getIntegerAttr(idx.getType(), 2));
+    auto idxMod2 = rewriter.create<arith::RemUIOp>(loc, idx, c2I64);
+    auto c0I64 = rewriter.create<arith::ConstantOp>(loc, idx.getType(), rewriter.getIntegerAttr(idx.getType(), 0));
+    auto isEven = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, idxMod2, c0I64);
+
+    // if (idx % 2 == 0): qval = qbyte & 15
+    // else: qval = (qbyte >> 4) & 15
+    auto c4I32 = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(4));
+    auto c15I32 = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(15));
+
+    auto qbyteShifted = rewriter.create<arith::ShRUIOp>(loc, qbyte, c4I32);
+    auto qvalEven = rewriter.create<arith::AndIOp>(loc, qbyte, c15I32);
+    auto qvalOdd = rewriter.create<arith::AndIOp>(loc, qbyteShifted, c15I32);
+    auto qval_i32 = rewriter.create<SelectOp>(loc, isEven, qvalEven, qvalOdd);
+
+    // Convert qval to float
+    auto qval_f = rewriter.create<arith::UIToFPOp>(loc, f32Type, qval_i32);
+
+    // result = qval_f * scale + zero
+    auto scaled = rewriter.create<arith::MulFOp>(loc, qval_f, scale);
+    auto result = rewriter.create<arith::AddFOp>(loc, scaled, zero);
+
+    rewriter.replaceOp(op, result.getResult());
+    return success();
+  }
+};
+
+// MatMulQuant: Quantized matrix multiplication with tile-based dequantization
+// Strategy: Keep weights in W4 format, dequantize tiles on-the-fly for vectorization
+// For W[M×K] @ input[K] = output[M], process in tiles of size TILE×K
+struct MatMulQuantOpLowering : public OpConversionPattern<simp::MatMulQuantOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      simp::MatMulQuantOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+
+    auto loc = op.getLoc();
+    auto qweights = adaptor.qweights();
+    auto scales = adaptor.scales();
+    auto zeros = adaptor.zeros();
+    auto input = adaptor.input();
+    auto output = adaptor.output();
+    auto rows = adaptor.rows();  // M
+    auto cols = adaptor.cols();  // K
+    auto group_size = adaptor.group_size();
+    auto offset = adaptor.offset();
+
+    auto f32Type = rewriter.getF32Type();
+    auto i32Type = rewriter.getIntegerType(32);
+
+    auto c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    auto c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    auto rowsIdx = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), rows);
+    auto colsIdx = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), cols);
+
+    // Constants for nibble extraction
+    Value c4i32 = rewriter.create<arith::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(4));
+    Value c15i32 = rewriter.create<arith::ConstantOp>(loc, i32Type, rewriter.getI32IntegerAttr(15));
+
+    // Tile size for dequantization (8 rows at a time)
+    constexpr int64_t TILE_SIZE = 8;
+    auto tileSize = rewriter.create<arith::ConstantIndexOp>(loc, TILE_SIZE);
+
+    // Try to extract constant dimensions for static tile shapes
+    std::optional<int64_t> colsConst;
+    if (auto constOp = cols.getDefiningOp<arith::ConstantIntOp>()) {
+      colsConst = constOp.value();
+    }
+
+    // TILE-BASED VECTORIZATION: Process 16 weights at a time
+    // Strategy: Dequantize 16 weights → temp buffer, then vectorized dot product
+
+    Value zeroF32 = rewriter.create<arith::ConstantOp>(loc, f32Type, rewriter.getF32FloatAttr(0.0f));
+    Value offsetIdx = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), offset);
+    Value groupSizeCast = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), group_size);
+    Value c16 = rewriter.create<arith::ConstantIndexOp>(loc, 16);
+    Value c8 = rewriter.create<arith::ConstantIndexOp>(loc, 8);
+
+    // Allocate tile buffer for 16 dequantized weights
+    auto tileType = MemRefType::get({16}, f32Type);
+    Value weightTile = rewriter.create<memref::AllocaOp>(loc, tileType);
+
+    // Row loop: for i in [0, rows)
+    auto rowLoop = rewriter.create<scf::ForOp>(loc, c0, rowsIdx, c1);
+    rewriter.setInsertionPointToStart(rowLoop.getBody());
+    auto i = rowLoop.getInductionVar();
+    auto rowOffset = rewriter.create<arith::MulIOp>(loc, i, colsIdx);
+
+    // Initialize output[i] = 0
+    rewriter.create<memref::StoreOp>(loc, zeroF32, output, ValueRange{i});
+
+    // Group loop: for each group of GS weights (128 weights per group)
+    auto numGroups = rewriter.create<arith::DivUIOp>(loc, colsIdx, groupSizeCast);
+    auto groupLoop = rewriter.create<scf::ForOp>(loc, c0, numGroups, c1);
+    rewriter.setInsertionPointToStart(groupLoop.getBody());
+    auto g = groupLoop.getInductionVar();
+    auto gStart = rewriter.create<arith::MulIOp>(loc, g, groupSizeCast);
+
+    // Load scale/zero once per group
+    auto rowGroupBase = rewriter.create<arith::DivUIOp>(loc, rowOffset, groupSizeCast);
+    auto groupIdx = rewriter.create<arith::AddIOp>(loc, rowGroupBase, g);
+    auto scale = rewriter.create<memref::LoadOp>(loc, scales, ValueRange{groupIdx});
+    auto zero = rewriter.create<memref::LoadOp>(loc, zeros, ValueRange{groupIdx});
+
+    // Tile loop: process 16 weights at a time within group (128/16 = 8 tiles)
+    auto numTiles = rewriter.create<arith::ConstantIndexOp>(loc, 8);  // 128/16 = 8
+    auto tileLoop = rewriter.create<scf::ForOp>(
+        loc, c0, numTiles, c1,
+        ValueRange{zeroF32},  // Accumulator
+        [&](OpBuilder &b, Location loc, Value t, ValueRange iterArgs) {
+          Value acc = iterArgs[0];
+          auto tileStart = b.create<arith::MulIOp>(loc, t, c16);
+          auto kStart = b.create<arith::AddIOp>(loc, gStart, tileStart);
+
+          // Dequantize 16 weights into tile buffer
+          // Load 8 bytes (16 nibbles) and unpack
+          for (int j = 0; j < 16; j++) {
+            auto jIdx = b.create<arith::ConstantIndexOp>(loc, j);
+            auto kGlobal = b.create<arith::AddIOp>(loc, kStart, jIdx);
+
+            // Weight index in qweights array
+            auto wIdx = b.create<arith::AddIOp>(loc, rowOffset, kGlobal);
+            wIdx = b.create<arith::AddIOp>(loc, offsetIdx, wIdx);
+
+            // Extract nibble
+            auto c1I64 = b.create<arith::ConstantOp>(loc, wIdx.getType(), b.getIntegerAttr(wIdx.getType(), 1));
+            auto qByteIdx = b.create<arith::ShRUIOp>(loc, wIdx, c1I64);
+            auto qByte_i8 = b.create<memref::LoadOp>(loc, qweights, ValueRange{qByteIdx});
+            auto qByte = b.create<arith::ExtUIOp>(loc, i32Type, qByte_i8);
+
+            auto idxAnd1 = b.create<arith::AndIOp>(loc, wIdx, c1I64);
+            auto c0Idx = b.create<arith::ConstantOp>(loc, wIdx.getType(), b.getIntegerAttr(wIdx.getType(), 0));
+            auto isEven = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, idxAnd1, c0Idx);
+
+            auto lowNibble = b.create<arith::AndIOp>(loc, qByte, c15i32);
+            auto qbyteShifted = b.create<arith::ShRUIOp>(loc, qByte, c4i32);
+            auto highNibble = b.create<arith::AndIOp>(loc, qbyteShifted, c15i32);
+            auto nibble = b.create<SelectOp>(loc, isEven, lowNibble, highNibble);
+
+            // Dequantize: weight = nibble * scale + zero
+            auto nibbleF = b.create<arith::UIToFPOp>(loc, f32Type, nibble);
+            auto scaled = b.create<arith::MulFOp>(loc, nibbleF, scale);
+            auto weightF = b.create<arith::AddFOp>(loc, scaled, zero);
+
+            // Store in tile buffer
+            b.create<memref::StoreOp>(loc, weightF, weightTile, ValueRange{jIdx});
+          }
+
+          // Simple loop for dot product
+          auto dotLoop = b.create<scf::ForOp>(
+              loc, c0, c16, c1,
+              ValueRange{acc},
+              [&](OpBuilder &b2, Location loc, Value j, ValueRange iterArgs2) {
+                Value dotAcc = iterArgs2[0];
+                auto kGlobal = b2.create<arith::AddIOp>(loc, kStart, j);
+
+                // Bounds check
+                auto kValid = b2.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, kGlobal, colsIdx);
+                auto ifOp = b2.create<scf::IfOp>(
+                    loc, TypeRange{f32Type}, kValid,
+                    [&](OpBuilder &b3, Location loc) {
+                      auto w = b3.create<memref::LoadOp>(loc, weightTile, ValueRange{j});
+                      auto x = b3.create<memref::LoadOp>(loc, input, ValueRange{kGlobal});
+                      auto prod = b3.create<arith::MulFOp>(loc, w, x);
+                      auto newAcc = b3.create<arith::AddFOp>(loc, dotAcc, prod);
+                      b3.create<scf::YieldOp>(loc, ValueRange{newAcc});
+                    },
+                    [&](OpBuilder &b3, Location loc) {
+                      b3.create<scf::YieldOp>(loc, ValueRange{dotAcc});
+                    });
+
+                b2.create<scf::YieldOp>(loc, ValueRange{ifOp.getResult(0)});
+              });
+
+          b.create<scf::YieldOp>(loc, ValueRange{dotLoop.getResult(0)});
+        });
+
+    // Add tile result to output[i]
+    auto currentOut = rewriter.create<memref::LoadOp>(loc, output, ValueRange{i});
+    auto tileResult = tileLoop.getResult(0);
+    auto newOut = rewriter.create<arith::AddFOp>(loc, currentOut, tileResult);
+    rewriter.create<memref::StoreOp>(loc, newOut, output, ValueRange{i});
+
+    rewriter.setInsertionPointAfter(groupLoop);
+    rewriter.setInsertionPointAfter(rowLoop);
+
+    rewriter.replaceOp(op, output);
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // Conversion Pass
 //===----------------------------------------------------------------------===//
 
@@ -876,6 +1224,11 @@ struct ConvertSimpToMemRefPass
       return typeConverter.isSignatureLegal(op.getType());
     });
 
+    // CallOp is legal only if its operands and results have legal types
+    target.addDynamicallyLegalOp<CallOp>([&](CallOp op) {
+      return typeConverter.isLegal(op);
+    });
+
     // Allow unrealized_conversion_cast (will be cleaned up by later passes)
     target.addLegalOp<UnrealizedConversionCastOp>();
 
@@ -902,11 +1255,14 @@ struct ConvertSimpToMemRefPass
         DivOpLowering,
         ModOpLowering,
         NegOpLowering,
+        CallOpLowering,
         MatMulOpLowering,
         Conv2DOpLowering,
         RMSNormOpLowering,
         SoftmaxOpLowering,
-        SiLUOpLowering
+        SiLUOpLowering,
+        DequantW4OpLowering,
+        MatMulQuantOpLowering
     >(typeConverter, &getContext());
 
     // Add SCF structural type conversions to handle scf.while, scf.if, etc. with type changes

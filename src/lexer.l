@@ -72,6 +72,8 @@ extern "C" int yywrap() { return 1; }
 "!="                  { return TCNE; }
 "<="                  { return TCLE; }
 ">="                  { return TCGE; }
+"<<"                  { return TOK_LSHIFT; }
+">>"                  { return TOK_RSHIFT; }
 "->"                  { return TARROW; }
 
 "("                   { return TLPAREN; }
@@ -91,6 +93,9 @@ extern "C" int yywrap() { return 1; }
 "*"                   { return '*'; }
 "/"                   { return '/'; }
 "%"                   { return TOK_MOD; }
+"&"                   { return TOK_AND; }
+"|"                   { return TOK_OR; }
+"^"                   { return TOK_XOR; }
 
 .                     { printf("Unknown token: %s\n", yytext); yyterminate(); }
 
