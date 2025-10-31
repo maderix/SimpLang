@@ -22,6 +22,7 @@
 #include "expr/array_expr.hpp"
 #include "expr/matmul_expr.hpp"
 #include "expr/vector_slice_expr.hpp"
+#include "expr/cast_expr.hpp"
 
 // Statement nodes
 #include "stmt/expression_stmt.hpp"

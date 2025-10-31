@@ -32,6 +32,7 @@ class VariableExprAST;
 class AssignmentExprAST;
 class BinaryExprAST;
 class UnaryExprAST;
+class CastExprAST;
 class ArrayCreateExprAST;
 class ArrayAccessExprAST;
 class ArrayStoreExprAST;
@@ -139,6 +140,9 @@ public:
 
   /// Lower a unary operation (neg)
   mlir::Value lowerUnaryOp(UnaryExprAST* unaryOp);
+
+  /// Lower a type cast expression (expr as type)
+  mlir::Value lowerCast(CastExprAST* castExpr);
 
   /// Lower an array creation expression
   mlir::Value lowerArrayCreate(ArrayCreateExprAST* arrayCreate);

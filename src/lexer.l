@@ -28,6 +28,7 @@ extern "C" int yywrap() { return 1; }
 "array"               { return TARRAY; }
 "include"             { return TINCLUDE; }
 "import"              { return TIMPORT; }
+"as"                  { return TAS; }
 
 "f16"                 { return TF16; }
 "bf16"                { return TBF16; }

@@ -393,9 +393,11 @@ int main(int argc, char** argv) {
     // Run module-level optimization passes including vectorization
     llvm::legacy::PassManager modulePM;
 
+#ifdef USE_MLIR
     // FIRST: Promote large stack allocations to heap
     // This must run BEFORE any optimization to fix MLIR's stack allocation bug
     modulePM.add(llvm::createPromoteLargeAllocaToHeapPass());
+#endif
 
     // Add target transform info for vectorizer
     modulePM.add(llvm::createTargetTransformInfoWrapperPass(context.getTargetMachine()->getTargetIRAnalysis()));

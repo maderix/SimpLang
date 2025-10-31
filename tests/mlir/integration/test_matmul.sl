@@ -13,15 +13,14 @@ fn main() -> f32 {
     // C = [[1*5 + 2*7, 1*6 + 2*8],  = [[19.0, 22.0],
     //      [3*5 + 4*7, 3*6 + 4*8]]     [43.0, 50.0]]
 
-    // Create matrix A (2x2, row-major)
-    var A = array<f32>([1.0, 2.0, 3.0, 4.0]);
+    // Create matrices with initializer lists
+    f32[4] A = {1.0, 2.0, 3.0, 4.0};
+    f32[4] B = {5.0, 6.0, 7.0, 8.0};
+    f32[4] C = {0.0, 0.0, 0.0, 0.0};
 
-    // Create matrix B (2x2, row-major)
-    var B = array<f32>([5.0, 6.0, 7.0, 8.0]);
-
-    // Perform matrix multiplication: C = matmul(A, B, m=2, k=2, n=2)
+    // Perform matrix multiplication: C = matmul(A, B, C, m=2, k=2, n=2, offsets)
     // A is 2x2, B is 2x2, so result C will be 2x2
-    var C = matmul(A, B, 2, 2, 2);
+    C = matmul(A, B, C, 2, 2, 2, 0, 0, 0);
 
     // Access result elements:
     // C[0,0] should be 19.0 (1*5 + 2*7)

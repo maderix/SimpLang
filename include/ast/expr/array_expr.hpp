@@ -6,15 +6,19 @@
 #include "../base/ast_base.hpp"
 #include "../type/type_info.hpp"
 
-// Array creation: array<f32>([10, 20, 30])
+// Array creation: array<f32>([10, 20, 30]) or array<f32>([1.0, 2.0, 3.0])
+// Supports both dimension specification (integers) and initializer lists (values)
 class ArrayCreateExprAST : public ExprAST {
     std::unique_ptr<TypeInfo> elementType;
-    std::vector<std::unique_ptr<ExprAST>> dimensionExprs; // Runtime dimensions
+    std::vector<std::unique_ptr<ExprAST>> dimensionExprs; // Runtime dimensions or initializer values
+    bool isInitializerList;  // true if this is an initializer list, false if dimensions
 
 public:
     ArrayCreateExprAST(std::unique_ptr<TypeInfo> elemType,
-                      std::vector<std::unique_ptr<ExprAST>> dimensions)
-        : elementType(std::move(elemType)), dimensionExprs(std::move(dimensions)) {}
+                      std::vector<std::unique_ptr<ExprAST>> dimensions,
+                      bool initList = false)
+        : elementType(std::move(elemType)), dimensionExprs(std::move(dimensions)),
+          isInitializerList(initList) {}
 
     virtual llvm::Value* codeGen(CodeGenContext& context) override;
     virtual ASTKind getKind() const override { return ASTKind::ArrayCreateExpr; }
@@ -22,6 +26,7 @@ public:
     TypeInfo* getElementType() const { return elementType.get(); }
     size_t getDimensionCount() const { return dimensionExprs.size(); }
     const std::vector<std::unique_ptr<ExprAST>>& getDimensions() const { return dimensionExprs; }
+    bool isInitializer() const { return isInitializerList; }
 };
 
 class SIMDArrayCreateExprAST : public ExprAST {

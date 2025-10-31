@@ -20,6 +20,7 @@ llvm::Type* TypeInfo::getLLVMType(llvm::LLVMContext& ctx) const {
         case TypeKind::Void:    return llvm::Type::getVoidTy(ctx);
         case TypeKind::Dynamic: return llvm::Type::getFloatTy(ctx); // Default to float for performance
         case TypeKind::Array:   return nullptr; // Handled by ArrayTypeInfo
+        case TypeKind::Tensor:  return nullptr; // Handled by TensorTypeInfo
         default:                return llvm::Type::getFloatTy(ctx);
     }
 }
@@ -42,6 +43,7 @@ std::string TypeInfo::toString() const {
         case TypeKind::Void:    return "void";
         case TypeKind::Dynamic: return "var";
         case TypeKind::Array:   return "array";
+        case TypeKind::Tensor:  return "tensor";
         default:                return "unknown";
     }
 }
@@ -52,4 +54,17 @@ std::string ArrayTypeInfo::toString() const {
         return "array<" + elementType->toString() + ">";
     }
     return "array";
+}
+
+// TensorTypeInfo override for proper MLIR type conversion
+std::string TensorTypeInfo::toString() const {
+    if (elementType && !shape.empty()) {
+        std::string shapeStr;
+        for (size_t i = 0; i < shape.size(); ++i) {
+            shapeStr += std::to_string(shape[i]);
+            if (i < shape.size() - 1) shapeStr += "x";
+        }
+        return "tensor<" + shapeStr + "x" + elementType->toString() + ">";
+    }
+    return "tensor";
 }

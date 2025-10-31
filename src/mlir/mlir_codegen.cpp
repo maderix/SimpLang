@@ -581,6 +581,9 @@ mlir::Value MLIRCodeGenContext::lowerExpression(ExprAST* expr) {
     case ASTKind::MatMulExpr:
       return lowerMatMul(static_cast<MatMulExprAST*>(expr));
 
+    case ASTKind::CastExpr:
+      return lowerCast(static_cast<CastExprAST*>(expr));
+
     default:
       llvm::errs() << "Error: Unsupported expression kind " << static_cast<int>(expr->getKind())
                    << " in MLIR lowering\n";
@@ -814,6 +817,67 @@ mlir::Value MLIRCodeGenContext::lowerUnaryOp(UnaryExprAST* unaryOp) {
       llvm::errs() << "Error: Unsupported unary operator: " << unaryOp->getOp() << "\n";
       return nullptr;
   }
+}
+
+mlir::Value MLIRCodeGenContext::lowerCast(CastExprAST* castExpr) {
+  auto loc = getUnknownLocation();
+
+  // Lower the expression being cast
+  mlir::Value value = lowerExpression(castExpr->getExpr());
+  if (!value) {
+    llvm::errs() << "Error: Failed to lower cast expression\n";
+    return nullptr;
+  }
+
+  // Get the target type
+  mlir::Type targetType = getMLIRType(castExpr->getTargetType());
+  mlir::Type sourceType = value.getType();
+
+  // If types are already the same, no cast needed
+  if (sourceType == targetType) {
+    return value;
+  }
+
+  // Handle conversions
+  bool sourceIsInt = sourceType.isInteger(64);
+  bool targetIsInt = targetType.isInteger(64);
+  bool sourceIsFloat = sourceType.isa<mlir::Float32Type>() || sourceType.isa<mlir::Float64Type>();
+  bool targetIsFloat = targetType.isa<mlir::Float32Type>() || targetType.isa<mlir::Float64Type>();
+
+  // int -> float
+  if (sourceIsInt && targetIsFloat) {
+    return builder.create<mlir::arith::SIToFPOp>(loc, targetType, value);
+  }
+
+  // float -> int
+  if (sourceIsFloat && targetIsInt) {
+    return builder.create<mlir::arith::FPToSIOp>(loc, targetType, value);
+  }
+
+  // float -> float (different precision)
+  if (sourceIsFloat && targetIsFloat) {
+    if (sourceType.getIntOrFloatBitWidth() < targetType.getIntOrFloatBitWidth()) {
+      // Extend
+      return builder.create<mlir::arith::ExtFOp>(loc, targetType, value);
+    } else {
+      // Truncate
+      return builder.create<mlir::arith::TruncFOp>(loc, targetType, value);
+    }
+  }
+
+  // int -> int (different width)
+  if (sourceIsInt && targetIsInt) {
+    if (sourceType.getIntOrFloatBitWidth() < targetType.getIntOrFloatBitWidth()) {
+      // Extend (signed)
+      return builder.create<mlir::arith::ExtSIOp>(loc, targetType, value);
+    } else {
+      // Truncate
+      return builder.create<mlir::arith::TruncIOp>(loc, targetType, value);
+    }
+  }
+
+  llvm::errs() << "Error: Unsupported cast from " << sourceType << " to " << targetType << "\n";
+  return nullptr;
 }
 
 mlir::Value MLIRCodeGenContext::lowerArrayCreate(ArrayCreateExprAST* arrayCreate) {
@@ -1655,6 +1719,160 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
     mlir::Value axisValue = (args.size() == 2) ? args[1] : nullptr;
     mlir::Type resultType = computeAxisReductionType(tensorType, axisValue, builder.getI64Type());
     return builder.create<mlir::simp::TensorArgmaxOp>(loc, resultType, tensor, axisValue);
+  }
+
+  // tensor_reshape: tensor_reshape(tensor, dim0, dim1, ...)
+  if (calleeName == "tensor_reshape") {
+    if (args.size() < 2) {
+      llvm::errs() << "Error: tensor_reshape requires at least 2 arguments (tensor, new_dims...), got " << args.size() << "\n";
+      return nullptr;
+    }
+
+    mlir::Value tensor = args[0];
+    auto tensorType = tensor.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    if (!tensorType) {
+      llvm::errs() << "Error: tensor_reshape requires a tensor argument\n";
+      return nullptr;
+    }
+
+    // Extract new shape from arguments
+    llvm::SmallVector<int64_t, 4> newShape;
+    for (size_t i = 1; i < args.size(); i++) {
+      if (auto constOp = args[i].getDefiningOp<mlir::simp::ConstantOp>()) {
+        if (auto intAttr = constOp.value().dyn_cast<mlir::IntegerAttr>()) {
+          newShape.push_back(intAttr.getInt());
+        }
+      } else if (auto arithConstOp = args[i].getDefiningOp<mlir::arith::ConstantOp>()) {
+        if (auto intAttr = arithConstOp.getValue().dyn_cast<mlir::IntegerAttr>()) {
+          newShape.push_back(intAttr.getInt());
+        }
+      }
+    }
+
+    if (newShape.empty()) {
+      llvm::errs() << "Error: tensor_reshape requires constant dimension arguments\n";
+      return nullptr;
+    }
+
+    mlir::Type resultType = mlir::simp::SimpTensorType::get(builder.getContext(), newShape, tensorType.getElementType());
+    llvm::SmallVector<mlir::Value, 4> shapeArgs(args.begin() + 1, args.end());
+    return builder.create<mlir::simp::TensorReshapeOp>(loc, resultType, tensor, shapeArgs);
+  }
+
+  // tensor_transpose: tensor_transpose(tensor) or tensor_transpose(tensor, perm0, perm1, ...)
+  if (calleeName == "tensor_transpose") {
+    if (args.size() < 1) {
+      llvm::errs() << "Error: tensor_transpose requires at least 1 argument (tensor, [perm...]), got " << args.size() << "\n";
+      return nullptr;
+    }
+
+    mlir::Value tensor = args[0];
+    auto tensorType = tensor.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    if (!tensorType) {
+      llvm::errs() << "Error: tensor_transpose requires a tensor argument\n";
+      return nullptr;
+    }
+
+    auto shape = tensorType.getShape();
+    int64_t rank = shape.size();
+
+    // Compute result shape
+    llvm::SmallVector<int64_t, 4> resultShape;
+    if (args.size() == 1 && rank == 2) {
+      // Default 2D transpose: swap dims
+      resultShape = {shape[1], shape[0]};
+    } else if (args.size() > 1) {
+      // Extract permutation from args
+      llvm::SmallVector<int64_t, 4> perm;
+      for (size_t i = 1; i < args.size(); i++) {
+        if (auto constOp = args[i].getDefiningOp<mlir::simp::ConstantOp>()) {
+          if (auto intAttr = constOp.value().dyn_cast<mlir::IntegerAttr>()) {
+            perm.push_back(intAttr.getInt());
+          }
+        } else if (auto arithConstOp = args[i].getDefiningOp<mlir::arith::ConstantOp>()) {
+          if (auto intAttr = arithConstOp.getValue().dyn_cast<mlir::IntegerAttr>()) {
+            perm.push_back(intAttr.getInt());
+          }
+        }
+      }
+
+      if (perm.size() != rank) {
+        llvm::errs() << "Error: transpose permutation size must match tensor rank\n";
+        return nullptr;
+      }
+
+      // Compute result shape from permutation
+      for (auto p : perm) {
+        resultShape.push_back(shape[p]);
+      }
+    } else {
+      llvm::errs() << "Error: tensor_transpose requires permutation for rank > 2\n";
+      return nullptr;
+    }
+
+    mlir::Type resultType = mlir::simp::SimpTensorType::get(builder.getContext(), resultShape, tensorType.getElementType());
+    llvm::SmallVector<mlir::Value, 4> permArgs(args.begin() + 1, args.end());
+    return builder.create<mlir::simp::TensorTransposeOp>(loc, resultType, tensor, permArgs);
+  }
+
+  // tensor_slice: tensor_slice(tensor, start0, end0, start1, end1, ...)
+  if (calleeName == "tensor_slice") {
+    if (args.size() < 1) {
+      llvm::errs() << "Error: tensor_slice requires arguments (tensor, indices...), got " << args.size() << "\n";
+      return nullptr;
+    }
+
+    mlir::Value tensor = args[0];
+    auto tensorType = tensor.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    if (!tensorType) {
+      llvm::errs() << "Error: tensor_slice requires a tensor argument\n";
+      return nullptr;
+    }
+
+    auto shape = tensorType.getShape();
+    int64_t rank = shape.size();
+
+    if (args.size() != 1 + 2 * rank) {
+      llvm::errs() << "Error: tensor_slice requires 2 indices per dimension (start, end), got " << (args.size() - 1) << " for rank " << rank << "\n";
+      return nullptr;
+    }
+
+    // Extract start/end pairs and compute result shape
+    llvm::SmallVector<int64_t, 4> resultShape;
+    for (int64_t i = 0; i < rank; i++) {
+      int64_t start = -1, end = -1;
+
+      if (auto constOp = args[1 + i * 2].getDefiningOp<mlir::simp::ConstantOp>()) {
+        if (auto intAttr = constOp.value().dyn_cast<mlir::IntegerAttr>()) {
+          start = intAttr.getInt();
+        }
+      } else if (auto arithConstOp = args[1 + i * 2].getDefiningOp<mlir::arith::ConstantOp>()) {
+        if (auto intAttr = arithConstOp.getValue().dyn_cast<mlir::IntegerAttr>()) {
+          start = intAttr.getInt();
+        }
+      }
+
+      if (auto constOp = args[1 + i * 2 + 1].getDefiningOp<mlir::simp::ConstantOp>()) {
+        if (auto intAttr = constOp.value().dyn_cast<mlir::IntegerAttr>()) {
+          end = intAttr.getInt();
+        }
+      } else if (auto arithConstOp = args[1 + i * 2 + 1].getDefiningOp<mlir::arith::ConstantOp>()) {
+        if (auto intAttr = arithConstOp.getValue().dyn_cast<mlir::IntegerAttr>()) {
+          end = intAttr.getInt();
+        }
+      }
+
+      if (start == -1 || end == -1) {
+        llvm::errs() << "Error: tensor_slice requires constant start/end indices\n";
+        return nullptr;
+      }
+
+      resultShape.push_back(end - start);
+    }
+
+    mlir::Type resultType = mlir::simp::SimpTensorType::get(builder.getContext(), resultShape, tensorType.getElementType());
+    llvm::SmallVector<mlir::Value, 4> indexArgs(args.begin() + 1, args.end());
+    return builder.create<mlir::simp::TensorSliceOp>(loc, resultType, tensor, indexArgs);
   }
 
   // Look up user-defined functions in the module

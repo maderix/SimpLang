@@ -2126,6 +2126,198 @@ struct DequantW4OpLowering : public OpConversionPattern<simp::DequantW4Op> {
   }
 };
 
+/// Reshape: Change tensor shape (optimized with linalg.generic for vectorization)
+struct TensorReshapeOpLowering : public OpConversionPattern<simp::TensorReshapeOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      simp::TensorReshapeOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+
+    auto loc = op.getLoc();
+    auto input = adaptor.input();
+    auto inputType = input.getType().cast<MemRefType>();
+    auto resultType = getTypeConverter()->convertType(op.getType()).cast<MemRefType>();
+
+    // Compute total number of elements
+    int64_t totalElements = 1;
+    for (auto dim : inputType.getShape()) {
+      totalElements *= dim;
+    }
+
+    // Allocate result tensor
+    Value result = rewriter.create<memref::AllocOp>(loc, resultType);
+
+    // Use linalg.generic with flat 1D iteration for vectorization
+    // Collapse both input and output to 1D views
+    SmallVector<int64_t, 1> flatShape = {totalElements};
+    auto flatType = MemRefType::get(flatShape, inputType.getElementType());
+
+    Value inputFlat = rewriter.create<memref::ReinterpretCastOp>(
+        loc, flatType, input, 0, flatShape, SmallVector<int64_t, 1>{1});
+    Value resultFlat = rewriter.create<memref::ReinterpretCastOp>(
+        loc, flatType, result, 0, flatShape, SmallVector<int64_t, 1>{1});
+
+    // Create linalg.generic that copies flatInput[i] -> flatResult[i]
+    // This will vectorize efficiently
+    SmallVector<mlir::AffineMap, 2> indexingMaps = {
+        mlir::AffineMap::getMultiDimIdentityMap(1, rewriter.getContext()),  // input
+        mlir::AffineMap::getMultiDimIdentityMap(1, rewriter.getContext())   // output
+    };
+    SmallVector<mlir::StringRef, 1> iteratorTypes = {mlir::getParallelIteratorTypeName()};
+
+    rewriter.create<mlir::linalg::GenericOp>(
+        loc,
+        TypeRange{},  // No results (writes to output arg)
+        ValueRange{inputFlat},  // inputs
+        ValueRange{resultFlat}, // outputs
+        indexingMaps,
+        iteratorTypes,
+        [&](OpBuilder &b, Location loc, ValueRange args) {
+          // Body: output[i] = input[i]
+          b.create<mlir::linalg::YieldOp>(loc, args[0]);
+        });
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+/// Transpose: Permute tensor dimensions (loop-based)
+struct TensorTransposeOpLowering : public OpConversionPattern<simp::TensorTransposeOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      simp::TensorTransposeOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+
+    auto loc = op.getLoc();
+    auto input = adaptor.input();
+    auto inputType = input.getType().cast<MemRefType>();
+    auto resultType = getTypeConverter()->convertType(op.getType()).cast<MemRefType>();
+
+    // Extract permutation from operands (first operand is tensor, rest are indices)
+    auto allOperands = adaptor.getOperands();
+    int64_t rank = allOperands.size() - 1;  // Subtract 1 for the tensor operand
+
+    // For 2D default transpose (no permutation args), use [1, 0]
+    SmallVector<int64_t, 4> permutation;
+    if (rank == 0 && inputType.getRank() == 2) {
+      permutation = {1, 0};
+      rank = 2;
+    } else {
+      // Extract constant permutation values (skip first operand which is the tensor)
+      for (size_t i = 1; i < allOperands.size(); i++) {
+        Value indexVal = allOperands[i];
+        if (auto constOp = indexVal.getDefiningOp<arith::ConstantOp>()) {
+          if (auto intAttr = constOp.getValue().dyn_cast<IntegerAttr>()) {
+            permutation.push_back(intAttr.getInt());
+          }
+        } else if (auto simpConstOp = indexVal.getDefiningOp<simp::ConstantOp>()) {
+          if (auto intAttr = simpConstOp.value().dyn_cast<IntegerAttr>()) {
+            permutation.push_back(intAttr.getInt());
+          }
+        }
+      }
+    }
+
+    auto inputShape = inputType.getShape();
+    auto resultShape = resultType.getShape();
+
+    // Allocate result tensor
+    Value result = rewriter.create<memref::AllocOp>(loc, resultType);
+
+    // Build nested loops for transpose
+    SmallVector<Value, 4> lbs, ubs, steps;
+    for (int64_t i = 0; i < rank; i++) {
+      lbs.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 0));
+      ubs.push_back(rewriter.create<arith::ConstantIndexOp>(loc, resultShape[i]));
+      steps.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 1));
+    }
+
+    scf::buildLoopNest(rewriter, loc, lbs, ubs, steps,
+        [&](OpBuilder &builder, Location loc, ValueRange ivs) {
+          // Compute input indices by permuting output indices
+          SmallVector<Value, 4> inputIndices(rank);
+          for (int64_t i = 0; i < rank; i++) {
+            inputIndices[permutation[i]] = ivs[i];
+          }
+
+          // Load from input, store to result
+          Value elem = builder.create<memref::LoadOp>(loc, input, inputIndices);
+          builder.create<memref::StoreOp>(loc, elem, result, ivs);
+        });
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+/// Slice: Extract sub-tensor (copy-based with SCF loops)
+struct TensorSliceOpLowering : public OpConversionPattern<simp::TensorSliceOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      simp::TensorSliceOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+
+    auto loc = op.getLoc();
+    auto input = adaptor.input();
+    auto inputType = input.getType().cast<MemRefType>();
+    auto resultType = getTypeConverter()->convertType(op.getType()).cast<MemRefType>();
+
+    auto inputShape = inputType.getShape();
+    auto resultShape = resultType.getShape();
+    int64_t rank = inputShape.size();
+
+    // Extract slice indices (start, end pairs)
+    // First operand is tensor, rest are indices (start0, end0, start1, end1, ...)
+    auto allOperands = adaptor.getOperands();
+    size_t numIndices = allOperands.size() - 1;  // Subtract 1 for the tensor operand
+    if (numIndices != static_cast<size_t>(rank * 2)) {
+      return op.emitError("Slice requires 2 indices per dimension (start, end)");
+    }
+
+    SmallVector<Value, 4> starts, ends;
+    for (int64_t i = 0; i < rank; i++) {
+      starts.push_back(allOperands[1 + i * 2]);  // Skip first operand (tensor)
+      ends.push_back(allOperands[1 + i * 2 + 1]);
+    }
+
+    // Allocate result tensor
+    Value result = rewriter.create<memref::AllocOp>(loc, resultType);
+
+    // Build nested loops to copy slice
+    SmallVector<Value, 4> lbs, ubs, steps;
+    for (int64_t i = 0; i < rank; i++) {
+      lbs.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 0));
+      ubs.push_back(rewriter.create<arith::ConstantIndexOp>(loc, resultShape[i]));
+      steps.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 1));
+    }
+
+    scf::buildLoopNest(rewriter, loc, lbs, ubs, steps,
+        [&](OpBuilder &builder, Location loc, ValueRange ivs) {
+          // Compute input indices: input[start + iv]
+          SmallVector<Value, 4> inputIndices;
+          for (int64_t i = 0; i < rank; i++) {
+            Value startIdx = starts[i];
+            if (!startIdx.getType().isIndex()) {
+              startIdx = builder.create<arith::IndexCastOp>(loc, builder.getIndexType(), startIdx);
+            }
+            Value inputIdx = builder.create<arith::AddIOp>(loc, startIdx, ivs[i]);
+            inputIndices.push_back(inputIdx);
+          }
+
+          // Load from input, store to result
+          Value elem = builder.create<memref::LoadOp>(loc, input, inputIndices);
+          builder.create<memref::StoreOp>(loc, elem, result, ivs);
+        });
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
 // MatMulQuant: Quantized matrix multiplication with tile-based dequantization
 // Strategy: Keep weights in W4 format, dequantize tiles on-the-fly for vectorization
 // For W[M×K] @ input[K] = output[M], process in tiles of size TILE×K
@@ -2376,7 +2568,10 @@ struct ConvertSimpToMemRefPass
         SoftmaxOpLowering,
         SiLUOpLowering,
         DequantW4OpLowering,
-        MatMulQuantOpLowering
+        MatMulQuantOpLowering,
+        TensorReshapeOpLowering,
+        TensorTransposeOpLowering,
+        TensorSliceOpLowering
     >(typeConverter, &getContext());
 
     // Add tensor unary operations with their specific kinds

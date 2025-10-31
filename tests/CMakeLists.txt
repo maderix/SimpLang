@@ -593,5 +593,7 @@ else()
     message(STATUS "SIMD test target not found - old SIMD tests are deprecated")
 endif()
 
-# Add MLIR tests
-add_subdirectory(mlir)
+# Add MLIR tests (only if MLIR is enabled)
+if(USE_MLIR)
+    add_subdirectory(mlir)
+endif()

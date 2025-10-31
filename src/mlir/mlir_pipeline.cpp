@@ -21,6 +21,7 @@
 #include "mlir/Dialect/Affine/Passes.h"
 #include "mlir/Dialect/Affine/LoopUtils.h"
 #include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
+#include "mlir/Dialect/Arithmetic/Transforms/Passes.h"
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -317,6 +318,18 @@ bool MLIRCompilationPipeline::runToLLVMDialectLowering() {
     }
   }
 
+  // 2.5. Expand Arithmetic ops (maxf, minf) to operations that can be lowered to LLVM
+  //      MaxFOp/MinFOp don't have direct LLVM lowering - they must be expanded to CmpF + Select
+  {
+    mlir::PassManager pm(module.getContext());
+    pm.addNestedPass<mlir::FuncOp>(mlir::arith::createArithmeticExpandOpsPass());
+    if (failed(pm.run(module))) {
+      llvm::errs() << "Error: Arithmetic expand ops pass failed\n";
+      module.dump();
+      return false;
+    }
+  }
+
   // 3. Lower MemRef, Arith, Vector, and Standard to LLVM dialect
   //    Using pattern-based conversion like Toy Ch6
 
@@ -325,15 +338,18 @@ bool MLIRCompilationPipeline::runToLLVMDialectLowering() {
     mlir::PassManager pm(module.getContext());
     mlir::RewritePatternSet patterns(module.getContext());
 
-    // Lower vector.contract to outer products
+    // Lower vector.contract to outer products and vector.transpose to shuffles
     mlir::vector::VectorTransformsOptions vectorOptions;
     vectorOptions.setVectorTransformsOptions(mlir::vector::VectorContractLowering::OuterProduct);
+    vectorOptions.setVectorTransposeLowering(mlir::vector::VectorTransposeLowering::Shuffle);
     mlir::vector::populateVectorContractLoweringPatterns(patterns, vectorOptions);
+    mlir::vector::populateVectorTransposeLoweringPatterns(patterns, vectorOptions);
 
-    // Lower vector.transpose, vector.broadcast, etc.
+    // Lower vector.transpose, vector.broadcast, vector.shape_cast, etc.
     mlir::vector::populateVectorToVectorCanonicalizationPatterns(patterns);
     mlir::vector::populateVectorBroadcastLoweringPatterns(patterns);
     mlir::vector::populateVectorMaskOpLoweringPatterns(patterns);
+    mlir::vector::populateVectorShapeCastLoweringPatterns(patterns);
 
     if (failed(mlir::applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
       llvm::errs() << "Warning: Vector lowering patterns failed\n";

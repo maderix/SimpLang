@@ -25,6 +25,7 @@ enum class ASTKind {
     SliceGetExpr,
     SliceSetExpr,
     VectorSliceExpr,
+    CastExpr,
 
     // Statement kinds
     VariableDecl,
