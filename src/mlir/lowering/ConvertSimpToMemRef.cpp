@@ -43,6 +43,11 @@ public:
       return MemRefType::get({-1}, type.getElementType());
     });
 
+    // Convert !simp.tensor<shape x T> to memref<shape x T>
+    addConversion([](simp::SimpTensorType type) -> llvm::Optional<Type> {
+      return MemRefType::get(type.getShape(), type.getElementType());
+    });
+
     // Add argument materialization: handles function arguments
     addArgumentMaterialization([](OpBuilder &builder, Type resultType,
                                    ValueRange inputs, Location loc) -> Value {
@@ -72,6 +77,51 @@ public:
     });
   }
 };
+
+//===----------------------------------------------------------------------===//
+// Type Promotion Helpers
+//===----------------------------------------------------------------------===//
+
+/// Helper function to promote value to target type using standard MLIR conversion ops
+static Value promoteType(Value val, Type targetType, OpBuilder& builder, Location loc) {
+  Type srcType = val.getType();
+  if (srcType == targetType) return val;
+
+  // Float to float (extend or truncate)
+  if (srcType.isa<FloatType>() && targetType.isa<FloatType>()) {
+    auto srcFloat = srcType.cast<FloatType>();
+    auto targetFloat = targetType.cast<FloatType>();
+    if (targetFloat.getWidth() > srcFloat.getWidth()) {
+      return builder.create<arith::ExtFOp>(loc, targetType, val);
+    } else if (targetFloat.getWidth() < srcFloat.getWidth()) {
+      return builder.create<arith::TruncFOp>(loc, targetType, val);
+    }
+  }
+
+  // Int to int (extend or truncate)
+  if (srcType.isa<IntegerType>() && targetType.isa<IntegerType>()) {
+    auto srcInt = srcType.cast<IntegerType>();
+    auto targetInt = targetType.cast<IntegerType>();
+    if (srcInt.getWidth() == 1) return val;  // Don't convert bool
+    if (targetInt.getWidth() > srcInt.getWidth()) {
+      return builder.create<arith::ExtSIOp>(loc, targetType, val);
+    } else if (targetInt.getWidth() < srcInt.getWidth()) {
+      return builder.create<arith::TruncIOp>(loc, targetType, val);
+    }
+  }
+
+  // Int to float (C++ style: always promote int to float in mixed arithmetic)
+  if (srcType.isa<IntegerType>() && targetType.isa<FloatType>()) {
+    return builder.create<arith::SIToFPOp>(loc, targetType, val);
+  }
+
+  // Float to int (rarely needed, but support it)
+  if (srcType.isa<FloatType>() && targetType.isa<IntegerType>()) {
+    return builder.create<arith::FPToSIOp>(loc, targetType, val);
+  }
+
+  return val;  // No conversion possible
+}
 
 //===----------------------------------------------------------------------===//
 // Operation Conversion Patterns
@@ -205,6 +255,13 @@ struct ArraySetOpLowering : public OpConversionPattern<simp::ArraySetOp> {
           op.getLoc(), rewriter.getIndexType(), index);
     }
 
+    // Ensure value type matches memref element type using type promotion
+    auto memrefType = memref.getType().cast<MemRefType>();
+    Type expectedType = memrefType.getElementType();
+    if (value.getType() != expectedType) {
+      value = promoteType(value, expectedType, rewriter, op.getLoc());
+    }
+
     // Create memref.store (mutates the memref)
     rewriter.create<memref::StoreOp>(op.getLoc(), value, memref, ValueRange{index});
 
@@ -212,6 +269,1051 @@ struct ArraySetOpLowering : public OpConversionPattern<simp::ArraySetOp> {
     // we just return the same memref (since it's mutated in-place)
     rewriter.replaceOp(op, memref);
 
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// Tensor Lowering Patterns
+//===----------------------------------------------------------------------===//
+
+/// Convert simp.tensor_create to memref.alloc
+struct TensorCreateOpLowering : public OpConversionPattern<simp::TensorCreateOp> {
+  using OpConversionPattern<simp::TensorCreateOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      simp::TensorCreateOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+
+    // Get the tensor type
+    auto tensorType = op.getType().cast<simp::SimpTensorType>();
+
+    // Convert to memref<shape x T> with static dimensions
+    auto memrefType = MemRefType::get(tensorType.getShape(), tensorType.getElementType());
+
+    // Create memref.alloc with static shape
+    rewriter.replaceOpWithNewOp<memref::AllocOp>(op, memrefType);
+
+    return success();
+  }
+};
+
+/// Convert simp.tensor_get to memref.load
+struct TensorGetOpLowering : public OpConversionPattern<simp::TensorGetOp> {
+  using OpConversionPattern<simp::TensorGetOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      simp::TensorGetOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+
+    // adaptor.getOperands() returns [tensor, index0, index1, ...]
+    auto operands = adaptor.getOperands();
+    Value memref = operands[0];  // tensor (now memref)
+
+    // Collect indices and convert to index type if needed
+    SmallVector<Value, 4> indices;
+    for (size_t i = 1; i < operands.size(); ++i) {
+      Value index = operands[i];
+      if (!index.getType().isIndex()) {
+        index = rewriter.create<arith::IndexCastOp>(
+            op.getLoc(), rewriter.getIndexType(), index);
+      }
+      indices.push_back(index);
+    }
+
+    // Replace with memref.load
+    rewriter.replaceOpWithNewOp<memref::LoadOp>(op, memref, indices);
+
+    return success();
+  }
+};
+
+/// Convert simp.tensor_set to memref.store
+/// Note: This changes semantics from SSA-pure to mutation
+struct TensorSetOpLowering : public OpConversionPattern<simp::TensorSetOp> {
+  using OpConversionPattern<simp::TensorSetOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      simp::TensorSetOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+
+    // adaptor.getOperands() returns [tensor, index0, index1, ..., value]
+    auto operands = adaptor.getOperands();
+    Value memref = operands[0];  // tensor (now memref)
+    Value value = operands[operands.size() - 1];  // last operand is value
+
+    // Collect indices (all operands except first and last)
+    SmallVector<Value, 4> indices;
+    for (size_t i = 1; i < operands.size() - 1; ++i) {
+      Value index = operands[i];
+      if (!index.getType().isIndex()) {
+        index = rewriter.create<arith::IndexCastOp>(
+            op.getLoc(), rewriter.getIndexType(), index);
+      }
+      indices.push_back(index);
+    }
+
+    // Ensure value type matches memref element type using type promotion
+    auto memrefType = memref.getType().cast<MemRefType>();
+    Type expectedType = memrefType.getElementType();
+    if (value.getType() != expectedType) {
+      value = promoteType(value, expectedType, rewriter, op.getLoc());
+    }
+
+    // Create memref.store (mutates the memref)
+    rewriter.create<memref::StoreOp>(op.getLoc(), value, memref, indices);
+
+    // Tensor set returns the "updated" tensor, but in memref semantics,
+    // we just return the same memref (since it's mutated in-place)
+    rewriter.replaceOp(op, memref);
+
+    return success();
+  }
+};
+
+/// Convert tensor element-wise binary ops (add, mul, sub, div) to loops
+template<typename SimpOp, typename ArithOp>
+struct TensorBinaryOpLowering : public OpConversionPattern<SimpOp> {
+  using OpConversionPattern<SimpOp>::OpConversionPattern;
+  using OpAdaptor = typename OpConversionPattern<SimpOp>::OpAdaptor;
+
+  LogicalResult matchAndRewrite(
+      SimpOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+
+    auto loc = op.getLoc();
+    auto operands = adaptor.getOperands();
+    Value lhs = operands[0];
+    Value rhs = operands[1];
+
+    // Get memref type
+    auto memrefType = lhs.getType().cast<MemRefType>();
+    auto shape = memrefType.getShape();
+
+    // Allocate result memref
+    Value result = rewriter.create<memref::AllocOp>(loc, memrefType);
+
+    // Build nested loops for each dimension
+    SmallVector<Value, 4> lowerBounds, upperBounds, steps;
+    for (int64_t dim : shape) {
+      lowerBounds.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 0));
+      upperBounds.push_back(rewriter.create<arith::ConstantIndexOp>(loc, dim));
+      steps.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 1));
+    }
+
+    // Create nested scf.for loops (using the void-returning buildLoopNest)
+    scf::buildLoopNest(
+        rewriter, loc, lowerBounds, upperBounds, steps,
+        [&](OpBuilder &builder, Location loc, ValueRange ivs) {
+          // Load from lhs and rhs
+          Value lhsVal = builder.create<memref::LoadOp>(loc, lhs, ivs);
+          Value rhsVal = builder.create<memref::LoadOp>(loc, rhs, ivs);
+
+          // Perform operation
+          Value resultVal = builder.create<ArithOp>(loc, lhsVal, rhsVal);
+
+          // Store to result
+          builder.create<memref::StoreOp>(loc, resultVal, result, ivs);
+        });
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+/// Convert tensor element-wise unary ops (relu, sigmoid, tanh) to loops
+template<typename SimpOp>
+struct TensorUnaryOpLowering : public OpConversionPattern<SimpOp> {
+  using OpConversionPattern<SimpOp>::OpConversionPattern;
+  using OpAdaptor = typename OpConversionPattern<SimpOp>::OpAdaptor;
+
+  enum class UnaryOpKind { ReLU, Sigmoid, Tanh };
+  UnaryOpKind kind;
+
+  TensorUnaryOpLowering(TypeConverter &converter, MLIRContext *context, UnaryOpKind k)
+      : OpConversionPattern<SimpOp>(converter, context), kind(k) {}
+
+  LogicalResult matchAndRewrite(
+      SimpOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+
+    auto loc = op.getLoc();
+    Value input = adaptor.getOperands()[0];
+
+    // Get memref type
+    auto memrefType = input.getType().cast<MemRefType>();
+    auto shape = memrefType.getShape();
+    auto elemType = memrefType.getElementType();
+
+    // Allocate result memref
+    Value result = rewriter.create<memref::AllocOp>(loc, memrefType);
+
+    // Build nested loops
+    SmallVector<Value, 4> lowerBounds, upperBounds, steps;
+    for (int64_t dim : shape) {
+      lowerBounds.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 0));
+      upperBounds.push_back(rewriter.create<arith::ConstantIndexOp>(loc, dim));
+      steps.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 1));
+    }
+
+    // Create nested scf.for loops (using the void-returning buildLoopNest)
+    scf::buildLoopNest(
+        rewriter, loc, lowerBounds, upperBounds, steps,
+        [&](OpBuilder &builder, Location loc, ValueRange ivs) {
+          Value inputVal = builder.create<memref::LoadOp>(loc, input, ivs);
+          Value resultVal;
+
+          switch (kind) {
+            case UnaryOpKind::ReLU: {
+              // ReLU: max(0, x)
+              Value zero = builder.create<arith::ConstantOp>(
+                  loc, elemType, builder.getZeroAttr(elemType));
+              Value cmp = builder.create<arith::CmpFOp>(
+                  loc, arith::CmpFPredicate::OGT, inputVal, zero);
+              resultVal = builder.create<SelectOp>(loc, cmp, inputVal, zero);
+              break;
+            }
+            case UnaryOpKind::Sigmoid: {
+              // sigmoid(x) = 1 / (1 + exp(-x))
+              Value negX = builder.create<arith::NegFOp>(loc, inputVal);
+              Value expNegX = builder.create<math::ExpOp>(loc, negX);
+              Value one = builder.create<arith::ConstantOp>(
+                  loc, elemType, builder.getFloatAttr(elemType, 1.0));
+              Value denom = builder.create<arith::AddFOp>(loc, one, expNegX);
+              resultVal = builder.create<arith::DivFOp>(loc, one, denom);
+              break;
+            }
+            case UnaryOpKind::Tanh: {
+              // Use math.tanh operation
+              resultVal = builder.create<math::TanhOp>(loc, inputVal);
+              break;
+            }
+          }
+
+          builder.create<memref::StoreOp>(loc, resultVal, result, ivs);
+        });
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+// Type aliases for specific operations
+using TensorAddOpLowering = TensorBinaryOpLowering<simp::TensorAddOp, arith::AddFOp>;
+using TensorMulOpLowering = TensorBinaryOpLowering<simp::TensorMulOp, arith::MulFOp>;
+using TensorSubOpLowering = TensorBinaryOpLowering<simp::TensorSubOp, arith::SubFOp>;
+using TensorDivOpLowering = TensorBinaryOpLowering<simp::TensorDivOp, arith::DivFOp>;
+
+//===----------------------------------------------------------------------===//
+// Tensor Reduction Operations Lowering
+//===----------------------------------------------------------------------===//
+
+/// Convert tensor.sum to loops with accumulator (supports full and axis reductions)
+struct TensorSumOpLowering : public OpConversionPattern<simp::TensorSumOp> {
+  using OpConversionPattern<simp::TensorSumOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      simp::TensorSumOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+
+    auto loc = op.getLoc();
+    Value input = adaptor.getOperands()[0];
+    auto memrefType = input.getType().cast<MemRefType>();
+    auto shape = memrefType.getShape();
+    Type elemType = memrefType.getElementType();
+    int64_t rank = shape.size();
+
+    // Initialize zero value
+    Value zero;
+    if (elemType.isa<FloatType>()) {
+      zero = rewriter.create<arith::ConstantOp>(loc, elemType,
+                 rewriter.getFloatAttr(elemType, 0.0));
+    } else if (elemType.isa<IntegerType>()) {
+      zero = rewriter.create<arith::ConstantOp>(loc, elemType,
+                 rewriter.getIntegerAttr(elemType, 0));
+    } else {
+      return op.emitError("Unsupported element type for tensor_sum");
+    }
+
+    // CASE 1: Full reduction (no axis specified)
+    if (!op.axis()) {
+      // Allocate scalar accumulator on stack
+      auto accumulatorType = MemRefType::get({}, elemType);
+      Value accumulator = rewriter.create<memref::AllocaOp>(loc, accumulatorType);
+      rewriter.create<memref::StoreOp>(loc, zero, accumulator, ValueRange{});
+
+      // Build nested loops over all dimensions
+      SmallVector<Value, 4> lowerBounds, upperBounds, steps;
+      for (int64_t dim : shape) {
+        lowerBounds.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 0));
+        upperBounds.push_back(rewriter.create<arith::ConstantIndexOp>(loc, dim));
+        steps.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 1));
+      }
+
+      scf::buildLoopNest(rewriter, loc, lowerBounds, upperBounds, steps,
+          [&](OpBuilder &builder, Location loc, ValueRange ivs) {
+            Value elem = builder.create<memref::LoadOp>(loc, input, ivs);
+            Value currentSum = builder.create<memref::LoadOp>(loc, accumulator, ValueRange{});
+            Value newSum;
+            if (elemType.isa<FloatType>()) {
+              newSum = builder.create<arith::AddFOp>(loc, currentSum, elem);
+            } else {
+              newSum = builder.create<arith::AddIOp>(loc, currentSum, elem);
+            }
+            builder.create<memref::StoreOp>(loc, newSum, accumulator, ValueRange{});
+          });
+
+      Value result = rewriter.create<memref::LoadOp>(loc, accumulator, ValueRange{});
+      rewriter.replaceOp(op, result);
+      return success();
+    }
+
+    // CASE 2: Axis reduction
+    // Extract axis value from operand (handle both arith.constant and simp.constant)
+    Value axisOperand = op.axis();
+    int64_t axis;
+
+    if (auto arithConstOp = axisOperand.getDefiningOp<arith::ConstantOp>()) {
+      auto axisIntAttr = arithConstOp.getValue().dyn_cast<IntegerAttr>();
+      if (!axisIntAttr) {
+        return op.emitError("Axis must be an integer");
+      }
+      axis = axisIntAttr.getInt();
+    } else if (auto simpConstOp = axisOperand.getDefiningOp<simp::ConstantOp>()) {
+      auto axisIntAttr = simpConstOp.value().dyn_cast<IntegerAttr>();
+      if (!axisIntAttr) {
+        return op.emitError("Axis must be an integer");
+      }
+      axis = axisIntAttr.getInt();
+    } else {
+      return op.emitError("Axis must be a constant integer");
+    }
+
+    // Handle negative axis
+    if (axis < 0) axis += rank;
+    if (axis < 0 || axis >= rank) {
+      return op.emitError("Axis out of bounds");
+    }
+
+    // Compute result shape (remove axis dimension)
+    SmallVector<int64_t, 4> resultShape;
+    for (int64_t i = 0; i < rank; i++) {
+      if (i != axis) {
+        resultShape.push_back(shape[i]);
+      }
+    }
+
+    // Allocate result tensor (use heap allocation for non-scalar results)
+    auto resultType = MemRefType::get(resultShape, elemType);
+    Value result = rewriter.create<memref::AllocOp>(loc, resultType);
+
+    // Initialize result tensor to zero
+    SmallVector<Value, 4> outerLBs, outerUBs, outerSteps;
+    for (int64_t dim : resultShape) {
+      outerLBs.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 0));
+      outerUBs.push_back(rewriter.create<arith::ConstantIndexOp>(loc, dim));
+      outerSteps.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 1));
+    }
+
+    scf::buildLoopNest(rewriter, loc, outerLBs, outerUBs, outerSteps,
+        [&](OpBuilder &builder, Location loc, ValueRange outerIvs) {
+          builder.create<memref::StoreOp>(loc, zero, result, outerIvs);
+        });
+
+    // Build reduction loops
+    scf::buildLoopNest(rewriter, loc, outerLBs, outerUBs, outerSteps,
+        [&](OpBuilder &builder, Location loc, ValueRange outerIvs) {
+          // Inner loop over reduction axis
+          Value lowerBound = builder.create<arith::ConstantIndexOp>(loc, 0);
+          Value upperBound = builder.create<arith::ConstantIndexOp>(loc, shape[axis]);
+          Value step = builder.create<arith::ConstantIndexOp>(loc, 1);
+
+          builder.create<scf::ForOp>(loc, lowerBound, upperBound, step, ValueRange{},
+              [&](OpBuilder &builder, Location loc, Value iv, ValueRange args) {
+                // Construct full input indices
+                SmallVector<Value, 4> inputIndices;
+                int64_t outerIdx = 0;
+                for (int64_t i = 0; i < rank; i++) {
+                  if (i == axis) {
+                    inputIndices.push_back(iv);
+                  } else {
+                    inputIndices.push_back(outerIvs[outerIdx++]);
+                  }
+                }
+
+                // Load input element and current sum
+                Value elem = builder.create<memref::LoadOp>(loc, input, inputIndices);
+                Value currentSum = builder.create<memref::LoadOp>(loc, result, outerIvs);
+
+                // Accumulate
+                Value newSum;
+                if (elemType.isa<FloatType>()) {
+                  newSum = builder.create<arith::AddFOp>(loc, currentSum, elem);
+                } else {
+                  newSum = builder.create<arith::AddIOp>(loc, currentSum, elem);
+                }
+
+                builder.create<memref::StoreOp>(loc, newSum, result, outerIvs);
+                builder.create<scf::YieldOp>(loc);
+              });
+        });
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+/// Convert tensor.mean to loops with accumulator + division (supports full and axis reductions)
+struct TensorMeanOpLowering : public OpConversionPattern<simp::TensorMeanOp> {
+  using OpConversionPattern<simp::TensorMeanOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      simp::TensorMeanOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+
+    auto loc = op.getLoc();
+    Value input = adaptor.getOperands()[0];
+    auto memrefType = input.getType().cast<MemRefType>();
+    auto shape = memrefType.getShape();
+    Type elemType = memrefType.getElementType();
+    int64_t rank = shape.size();
+
+    if (!elemType.isa<FloatType>()) {
+      return op.emitError("Mean only supported for float types");
+    }
+
+    Value zero = rewriter.create<arith::ConstantOp>(loc, elemType,
+                   rewriter.getFloatAttr(elemType, 0.0));
+
+    // CASE 1: Full reduction
+    if (!op.axis()) {
+      int64_t totalElements = 1;
+      for (int64_t dim : shape) {
+        totalElements *= dim;
+      }
+
+      auto accumulatorType = MemRefType::get({}, elemType);
+      Value accumulator = rewriter.create<memref::AllocaOp>(loc, accumulatorType);
+      rewriter.create<memref::StoreOp>(loc, zero, accumulator, ValueRange{});
+
+      SmallVector<Value, 4> lowerBounds, upperBounds, steps;
+      for (int64_t dim : shape) {
+        lowerBounds.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 0));
+        upperBounds.push_back(rewriter.create<arith::ConstantIndexOp>(loc, dim));
+        steps.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 1));
+      }
+
+      scf::buildLoopNest(rewriter, loc, lowerBounds, upperBounds, steps,
+          [&](OpBuilder &builder, Location loc, ValueRange ivs) {
+            Value elem = builder.create<memref::LoadOp>(loc, input, ivs);
+            Value currentSum = builder.create<memref::LoadOp>(loc, accumulator, ValueRange{});
+            Value newSum = builder.create<arith::AddFOp>(loc, currentSum, elem);
+            builder.create<memref::StoreOp>(loc, newSum, accumulator, ValueRange{});
+          });
+
+      Value sum = rewriter.create<memref::LoadOp>(loc, accumulator, ValueRange{});
+      Value count = rewriter.create<arith::ConstantOp>(loc, elemType,
+                       rewriter.getFloatAttr(elemType, (double)totalElements));
+      Value mean = rewriter.create<arith::DivFOp>(loc, sum, count);
+
+      rewriter.replaceOp(op, mean);
+      return success();
+    }
+
+    // CASE 2: Axis reduction
+    Value axisOperand = op.axis();
+    int64_t axis;
+    if (auto arithConstOp = axisOperand.getDefiningOp<arith::ConstantOp>()) {
+      auto axisIntAttr = arithConstOp.getValue().dyn_cast<IntegerAttr>();
+      if (!axisIntAttr) {
+        return op.emitError("Axis must be an integer");
+      }
+      axis = axisIntAttr.getInt();
+    } else if (auto simpConstOp = axisOperand.getDefiningOp<simp::ConstantOp>()) {
+      auto axisIntAttr = simpConstOp.value().dyn_cast<IntegerAttr>();
+      if (!axisIntAttr) {
+        return op.emitError("Axis must be an integer");
+      }
+      axis = axisIntAttr.getInt();
+    } else {
+      return op.emitError("Axis must be a constant integer");
+    }
+    if (axis < 0) axis += rank;
+    if (axis < 0 || axis >= rank) {
+      return op.emitError("Axis out of bounds");
+    }
+
+    // Compute result shape and reduction count
+    SmallVector<int64_t, 4> resultShape;
+    for (int64_t i = 0; i < rank; i++) {
+      if (i != axis) {
+        resultShape.push_back(shape[i]);
+      }
+    }
+    int64_t reductionCount = shape[axis];
+
+    // Allocate result tensor and initialize to zero (use heap allocation for non-scalar results)
+    auto resultType = MemRefType::get(resultShape, elemType);
+    Value result = rewriter.create<memref::AllocOp>(loc, resultType);
+
+    SmallVector<Value, 4> outerLBs, outerUBs, outerSteps;
+    for (int64_t dim : resultShape) {
+      outerLBs.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 0));
+      outerUBs.push_back(rewriter.create<arith::ConstantIndexOp>(loc, dim));
+      outerSteps.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 1));
+    }
+
+    scf::buildLoopNest(rewriter, loc, outerLBs, outerUBs, outerSteps,
+        [&](OpBuilder &builder, Location loc, ValueRange outerIvs) {
+          builder.create<memref::StoreOp>(loc, zero, result, outerIvs);
+        });
+
+    // Build reduction loops (sum first)
+    scf::buildLoopNest(rewriter, loc, outerLBs, outerUBs, outerSteps,
+        [&](OpBuilder &builder, Location loc, ValueRange outerIvs) {
+          Value lowerBound = builder.create<arith::ConstantIndexOp>(loc, 0);
+          Value upperBound = builder.create<arith::ConstantIndexOp>(loc, shape[axis]);
+          Value step = builder.create<arith::ConstantIndexOp>(loc, 1);
+
+          builder.create<scf::ForOp>(loc, lowerBound, upperBound, step, ValueRange{},
+              [&](OpBuilder &builder, Location loc, Value iv, ValueRange args) {
+                SmallVector<Value, 4> inputIndices;
+                int64_t outerIdx = 0;
+                for (int64_t i = 0; i < rank; i++) {
+                  if (i == axis) {
+                    inputIndices.push_back(iv);
+                  } else {
+                    inputIndices.push_back(outerIvs[outerIdx++]);
+                  }
+                }
+
+                Value elem = builder.create<memref::LoadOp>(loc, input, inputIndices);
+                Value currentSum = builder.create<memref::LoadOp>(loc, result, outerIvs);
+                Value newSum = builder.create<arith::AddFOp>(loc, currentSum, elem);
+                builder.create<memref::StoreOp>(loc, newSum, result, outerIvs);
+                builder.create<scf::YieldOp>(loc);
+              });
+        });
+
+    // Divide by count to get mean
+    Value count = rewriter.create<arith::ConstantOp>(loc, elemType,
+                     rewriter.getFloatAttr(elemType, (double)reductionCount));
+
+    scf::buildLoopNest(rewriter, loc, outerLBs, outerUBs, outerSteps,
+        [&](OpBuilder &builder, Location loc, ValueRange outerIvs) {
+          Value sum = builder.create<memref::LoadOp>(loc, result, outerIvs);
+          Value mean = builder.create<arith::DivFOp>(loc, sum, count);
+          builder.create<memref::StoreOp>(loc, mean, result, outerIvs);
+        });
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+/// Convert tensor.max to loops with max accumulator (supports full and axis reductions)
+struct TensorMaxOpLowering : public OpConversionPattern<simp::TensorMaxOp> {
+  using OpConversionPattern<simp::TensorMaxOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      simp::TensorMaxOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+
+    auto loc = op.getLoc();
+    Value input = adaptor.getOperands()[0];
+    auto memrefType = input.getType().cast<MemRefType>();
+    auto shape = memrefType.getShape();
+    Type elemType = memrefType.getElementType();
+    int64_t rank = shape.size();
+
+    // Initialize to negative infinity (for floats) or minimum value (for ints)
+    Value initialValue;
+    if (auto floatType = elemType.dyn_cast<FloatType>()) {
+      initialValue = rewriter.create<arith::ConstantOp>(loc, elemType,
+          rewriter.getFloatAttr(elemType,
+              -std::numeric_limits<double>::infinity()));
+    } else if (auto intType = elemType.dyn_cast<IntegerType>()) {
+      int64_t minVal = intType.isUnsigned() ? 0 :
+          -(1LL << (intType.getWidth() - 1));
+      initialValue = rewriter.create<arith::ConstantOp>(loc, elemType,
+          rewriter.getIntegerAttr(elemType, minVal));
+    } else {
+      return op.emitError("Unsupported element type for tensor_max");
+    }
+
+    // CASE 1: Full reduction
+    if (!op.axis()) {
+      auto accumulatorType = MemRefType::get({}, elemType);
+      Value accumulator = rewriter.create<memref::AllocaOp>(loc, accumulatorType);
+      rewriter.create<memref::StoreOp>(loc, initialValue, accumulator, ValueRange{});
+
+      SmallVector<Value, 4> lowerBounds, upperBounds, steps;
+      for (int64_t dim : shape) {
+        lowerBounds.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 0));
+        upperBounds.push_back(rewriter.create<arith::ConstantIndexOp>(loc, dim));
+        steps.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 1));
+      }
+
+      scf::buildLoopNest(rewriter, loc, lowerBounds, upperBounds, steps,
+          [&](OpBuilder &builder, Location loc, ValueRange ivs) {
+            Value elem = builder.create<memref::LoadOp>(loc, input, ivs);
+            Value currentMax = builder.create<memref::LoadOp>(loc, accumulator, ValueRange{});
+            Value newMax;
+            if (elemType.isa<FloatType>()) {
+              newMax = builder.create<arith::MaxFOp>(loc, currentMax, elem);
+            } else {
+              auto intType = elemType.cast<IntegerType>();
+              if (intType.isUnsigned()) {
+                newMax = builder.create<arith::MaxUIOp>(loc, currentMax, elem);
+              } else {
+                newMax = builder.create<arith::MaxSIOp>(loc, currentMax, elem);
+              }
+            }
+            builder.create<memref::StoreOp>(loc, newMax, accumulator, ValueRange{});
+          });
+
+      Value result = rewriter.create<memref::LoadOp>(loc, accumulator, ValueRange{});
+      rewriter.replaceOp(op, result);
+      return success();
+    }
+
+    // CASE 2: Axis reduction
+    Value axisOperand = op.axis();
+    int64_t axis;
+    if (auto arithConstOp = axisOperand.getDefiningOp<arith::ConstantOp>()) {
+      auto axisIntAttr = arithConstOp.getValue().dyn_cast<IntegerAttr>();
+      if (!axisIntAttr) {
+        return op.emitError("Axis must be an integer");
+      }
+      axis = axisIntAttr.getInt();
+    } else if (auto simpConstOp = axisOperand.getDefiningOp<simp::ConstantOp>()) {
+      auto axisIntAttr = simpConstOp.value().dyn_cast<IntegerAttr>();
+      if (!axisIntAttr) {
+        return op.emitError("Axis must be an integer");
+      }
+      axis = axisIntAttr.getInt();
+    } else {
+      return op.emitError("Axis must be a constant integer");
+    }
+    if (axis < 0) axis += rank;
+    if (axis < 0 || axis >= rank) {
+      return op.emitError("Axis out of bounds");
+    }
+
+    SmallVector<int64_t, 4> resultShape;
+    for (int64_t i = 0; i < rank; i++) {
+      if (i != axis) {
+        resultShape.push_back(shape[i]);
+      }
+    }
+
+    auto resultType = MemRefType::get(resultShape, elemType);
+    Value result = rewriter.create<memref::AllocOp>(loc, resultType);
+
+    SmallVector<Value, 4> outerLBs, outerUBs, outerSteps;
+    for (int64_t dim : resultShape) {
+      outerLBs.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 0));
+      outerUBs.push_back(rewriter.create<arith::ConstantIndexOp>(loc, dim));
+      outerSteps.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 1));
+    }
+
+    // Initialize result tensor to minimum value
+    scf::buildLoopNest(rewriter, loc, outerLBs, outerUBs, outerSteps,
+        [&](OpBuilder &builder, Location loc, ValueRange outerIvs) {
+          builder.create<memref::StoreOp>(loc, initialValue, result, outerIvs);
+        });
+
+    // Build reduction loops
+    scf::buildLoopNest(rewriter, loc, outerLBs, outerUBs, outerSteps,
+        [&](OpBuilder &builder, Location loc, ValueRange outerIvs) {
+          Value lowerBound = builder.create<arith::ConstantIndexOp>(loc, 0);
+          Value upperBound = builder.create<arith::ConstantIndexOp>(loc, shape[axis]);
+          Value step = builder.create<arith::ConstantIndexOp>(loc, 1);
+
+          builder.create<scf::ForOp>(loc, lowerBound, upperBound, step, ValueRange{},
+              [&](OpBuilder &builder, Location loc, Value iv, ValueRange args) {
+                SmallVector<Value, 4> inputIndices;
+                int64_t outerIdx = 0;
+                for (int64_t i = 0; i < rank; i++) {
+                  if (i == axis) {
+                    inputIndices.push_back(iv);
+                  } else {
+                    inputIndices.push_back(outerIvs[outerIdx++]);
+                  }
+                }
+
+                Value elem = builder.create<memref::LoadOp>(loc, input, inputIndices);
+                Value currentMax = builder.create<memref::LoadOp>(loc, result, outerIvs);
+
+                Value newMax;
+                if (elemType.isa<FloatType>()) {
+                  newMax = builder.create<arith::MaxFOp>(loc, currentMax, elem);
+                } else {
+                  auto intType = elemType.cast<IntegerType>();
+                  if (intType.isUnsigned()) {
+                    newMax = builder.create<arith::MaxUIOp>(loc, currentMax, elem);
+                  } else {
+                    newMax = builder.create<arith::MaxSIOp>(loc, currentMax, elem);
+                  }
+                }
+
+                builder.create<memref::StoreOp>(loc, newMax, result, outerIvs);
+                builder.create<scf::YieldOp>(loc);
+              });
+        });
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+/// Convert tensor.min to loops with min accumulator (supports full and axis reductions)
+struct TensorMinOpLowering : public OpConversionPattern<simp::TensorMinOp> {
+  using OpConversionPattern<simp::TensorMinOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      simp::TensorMinOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+
+    auto loc = op.getLoc();
+    Value input = adaptor.getOperands()[0];
+    auto memrefType = input.getType().cast<MemRefType>();
+    auto shape = memrefType.getShape();
+    Type elemType = memrefType.getElementType();
+    int64_t rank = shape.size();
+
+    // Initialize to positive infinity (for floats) or maximum value (for ints)
+    Value initialValue;
+    if (auto floatType = elemType.dyn_cast<FloatType>()) {
+      initialValue = rewriter.create<arith::ConstantOp>(loc, elemType,
+          rewriter.getFloatAttr(elemType,
+              std::numeric_limits<double>::infinity()));
+    } else if (auto intType = elemType.dyn_cast<IntegerType>()) {
+      int64_t maxVal = intType.isUnsigned() ?
+          ((1ULL << intType.getWidth()) - 1) :
+          ((1LL << (intType.getWidth() - 1)) - 1);
+      initialValue = rewriter.create<arith::ConstantOp>(loc, elemType,
+          rewriter.getIntegerAttr(elemType, maxVal));
+    } else {
+      return op.emitError("Unsupported element type for tensor_min");
+    }
+
+    // CASE 1: Full reduction
+    if (!op.axis()) {
+      auto accumulatorType = MemRefType::get({}, elemType);
+      Value accumulator = rewriter.create<memref::AllocaOp>(loc, accumulatorType);
+      rewriter.create<memref::StoreOp>(loc, initialValue, accumulator, ValueRange{});
+
+      SmallVector<Value, 4> lowerBounds, upperBounds, steps;
+      for (int64_t dim : shape) {
+        lowerBounds.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 0));
+        upperBounds.push_back(rewriter.create<arith::ConstantIndexOp>(loc, dim));
+        steps.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 1));
+      }
+
+      scf::buildLoopNest(rewriter, loc, lowerBounds, upperBounds, steps,
+          [&](OpBuilder &builder, Location loc, ValueRange ivs) {
+            Value elem = builder.create<memref::LoadOp>(loc, input, ivs);
+            Value currentMin = builder.create<memref::LoadOp>(loc, accumulator, ValueRange{});
+            Value newMin;
+            if (elemType.isa<FloatType>()) {
+              newMin = builder.create<arith::MinFOp>(loc, currentMin, elem);
+            } else {
+              auto intType = elemType.cast<IntegerType>();
+              if (intType.isUnsigned()) {
+                newMin = builder.create<arith::MinUIOp>(loc, currentMin, elem);
+              } else {
+                newMin = builder.create<arith::MinSIOp>(loc, currentMin, elem);
+              }
+            }
+            builder.create<memref::StoreOp>(loc, newMin, accumulator, ValueRange{});
+          });
+
+      Value result = rewriter.create<memref::LoadOp>(loc, accumulator, ValueRange{});
+      rewriter.replaceOp(op, result);
+      return success();
+    }
+
+    // CASE 2: Axis reduction
+    Value axisOperand = op.axis();
+    int64_t axis;
+    if (auto arithConstOp = axisOperand.getDefiningOp<arith::ConstantOp>()) {
+      auto axisIntAttr = arithConstOp.getValue().dyn_cast<IntegerAttr>();
+      if (!axisIntAttr) {
+        return op.emitError("Axis must be an integer");
+      }
+      axis = axisIntAttr.getInt();
+    } else if (auto simpConstOp = axisOperand.getDefiningOp<simp::ConstantOp>()) {
+      auto axisIntAttr = simpConstOp.value().dyn_cast<IntegerAttr>();
+      if (!axisIntAttr) {
+        return op.emitError("Axis must be an integer");
+      }
+      axis = axisIntAttr.getInt();
+    } else {
+      return op.emitError("Axis must be a constant integer");
+    }
+    if (axis < 0) axis += rank;
+    if (axis < 0 || axis >= rank) {
+      return op.emitError("Axis out of bounds");
+    }
+
+    SmallVector<int64_t, 4> resultShape;
+    for (int64_t i = 0; i < rank; i++) {
+      if (i != axis) {
+        resultShape.push_back(shape[i]);
+      }
+    }
+
+    auto resultType = MemRefType::get(resultShape, elemType);
+    Value result = rewriter.create<memref::AllocOp>(loc, resultType);
+
+    SmallVector<Value, 4> outerLBs, outerUBs, outerSteps;
+    for (int64_t dim : resultShape) {
+      outerLBs.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 0));
+      outerUBs.push_back(rewriter.create<arith::ConstantIndexOp>(loc, dim));
+      outerSteps.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 1));
+    }
+
+    // Initialize result tensor to maximum value
+    scf::buildLoopNest(rewriter, loc, outerLBs, outerUBs, outerSteps,
+        [&](OpBuilder &builder, Location loc, ValueRange outerIvs) {
+          builder.create<memref::StoreOp>(loc, initialValue, result, outerIvs);
+        });
+
+    // Build reduction loops
+    scf::buildLoopNest(rewriter, loc, outerLBs, outerUBs, outerSteps,
+        [&](OpBuilder &builder, Location loc, ValueRange outerIvs) {
+          Value lowerBound = builder.create<arith::ConstantIndexOp>(loc, 0);
+          Value upperBound = builder.create<arith::ConstantIndexOp>(loc, shape[axis]);
+          Value step = builder.create<arith::ConstantIndexOp>(loc, 1);
+
+          builder.create<scf::ForOp>(loc, lowerBound, upperBound, step, ValueRange{},
+              [&](OpBuilder &builder, Location loc, Value iv, ValueRange args) {
+                SmallVector<Value, 4> inputIndices;
+                int64_t outerIdx = 0;
+                for (int64_t i = 0; i < rank; i++) {
+                  if (i == axis) {
+                    inputIndices.push_back(iv);
+                  } else {
+                    inputIndices.push_back(outerIvs[outerIdx++]);
+                  }
+                }
+
+                Value elem = builder.create<memref::LoadOp>(loc, input, inputIndices);
+                Value currentMin = builder.create<memref::LoadOp>(loc, result, outerIvs);
+
+                Value newMin;
+                if (elemType.isa<FloatType>()) {
+                  newMin = builder.create<arith::MinFOp>(loc, currentMin, elem);
+                } else {
+                  auto intType = elemType.cast<IntegerType>();
+                  if (intType.isUnsigned()) {
+                    newMin = builder.create<arith::MinUIOp>(loc, currentMin, elem);
+                  } else {
+                    newMin = builder.create<arith::MinSIOp>(loc, currentMin, elem);
+                  }
+                }
+
+                builder.create<memref::StoreOp>(loc, newMin, result, outerIvs);
+                builder.create<scf::YieldOp>(loc);
+              });
+        });
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+/// Convert tensor.argmax to loops tracking both max value and index (supports full and axis reductions)
+struct TensorArgmaxOpLowering : public OpConversionPattern<simp::TensorArgmaxOp> {
+  using OpConversionPattern<simp::TensorArgmaxOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      simp::TensorArgmaxOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+
+    auto loc = op.getLoc();
+    Value input = adaptor.getOperands()[0];
+    auto memrefType = input.getType().cast<MemRefType>();
+    auto shape = memrefType.getShape();
+    Type elemType = memrefType.getElementType();
+    int64_t rank = shape.size();
+
+    // Initialize to negative infinity / min int
+    Value initialValue;
+    if (auto floatType = elemType.dyn_cast<FloatType>()) {
+      initialValue = rewriter.create<arith::ConstantOp>(loc, elemType,
+          rewriter.getFloatAttr(elemType,
+              -std::numeric_limits<double>::infinity()));
+    } else if (auto intType = elemType.dyn_cast<IntegerType>()) {
+      int64_t minVal = intType.isUnsigned() ? 0 :
+          -(1LL << (intType.getWidth() - 1));
+      initialValue = rewriter.create<arith::ConstantOp>(loc, elemType,
+          rewriter.getIntegerAttr(elemType, minVal));
+    } else {
+      return op.emitError("Unsupported element type for tensor_argmax");
+    }
+
+    Value zeroIndex = rewriter.create<arith::ConstantOp>(loc, rewriter.getI64Type(),
+        rewriter.getI64IntegerAttr(0));
+
+    // CASE 1: Full reduction (return linear index)
+    if (!op.axis()) {
+      auto maxValueType = MemRefType::get({}, elemType);
+      auto maxIndexType = MemRefType::get({}, rewriter.getI64Type());
+      Value maxValueAccum = rewriter.create<memref::AllocaOp>(loc, maxValueType);
+      Value maxIndexAccum = rewriter.create<memref::AllocaOp>(loc, maxIndexType);
+
+      rewriter.create<memref::StoreOp>(loc, initialValue, maxValueAccum, ValueRange{});
+      rewriter.create<memref::StoreOp>(loc, zeroIndex, maxIndexAccum, ValueRange{});
+
+      auto linearIndexType = MemRefType::get({}, rewriter.getI64Type());
+      Value linearIndexAccum = rewriter.create<memref::AllocaOp>(loc, linearIndexType);
+      rewriter.create<memref::StoreOp>(loc, zeroIndex, linearIndexAccum, ValueRange{});
+
+      SmallVector<Value, 4> lowerBounds, upperBounds, steps;
+      for (int64_t dim : shape) {
+        lowerBounds.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 0));
+        upperBounds.push_back(rewriter.create<arith::ConstantIndexOp>(loc, dim));
+        steps.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 1));
+      }
+
+      scf::buildLoopNest(rewriter, loc, lowerBounds, upperBounds, steps,
+          [&](OpBuilder &builder, Location loc, ValueRange ivs) {
+            Value elem = builder.create<memref::LoadOp>(loc, input, ivs);
+            Value currentMax = builder.create<memref::LoadOp>(loc, maxValueAccum, ValueRange{});
+            Value currentLinearIdx = builder.create<memref::LoadOp>(loc, linearIndexAccum, ValueRange{});
+
+            Value isGreater;
+            if (elemType.isa<FloatType>()) {
+              isGreater = builder.create<arith::CmpFOp>(loc, arith::CmpFPredicate::OGT, elem, currentMax);
+            } else {
+              auto intType = elemType.cast<IntegerType>();
+              if (intType.isUnsigned()) {
+                isGreater = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ugt, elem, currentMax);
+              } else {
+                isGreater = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, elem, currentMax);
+              }
+            }
+
+            Value newMaxValue = builder.create<SelectOp>(loc, isGreater, elem, currentMax);
+            Value newMaxIndex = builder.create<SelectOp>(loc, isGreater, currentLinearIdx,
+                builder.create<memref::LoadOp>(loc, maxIndexAccum, ValueRange{}));
+
+            builder.create<memref::StoreOp>(loc, newMaxValue, maxValueAccum, ValueRange{});
+            builder.create<memref::StoreOp>(loc, newMaxIndex, maxIndexAccum, ValueRange{});
+
+            Value one = builder.create<arith::ConstantOp>(loc, builder.getI64Type(),
+                builder.getI64IntegerAttr(1));
+            Value nextLinearIdx = builder.create<arith::AddIOp>(loc, currentLinearIdx, one);
+            builder.create<memref::StoreOp>(loc, nextLinearIdx, linearIndexAccum, ValueRange{});
+          });
+
+      Value resultIndex = rewriter.create<memref::LoadOp>(loc, maxIndexAccum, ValueRange{});
+      rewriter.replaceOp(op, resultIndex);
+      return success();
+    }
+
+    // CASE 2: Axis reduction (return tensor of indices along reduction axis)
+    Value axisOperand = op.axis();
+    int64_t axis;
+    if (auto arithConstOp = axisOperand.getDefiningOp<arith::ConstantOp>()) {
+      auto axisIntAttr = arithConstOp.getValue().dyn_cast<IntegerAttr>();
+      if (!axisIntAttr) {
+        return op.emitError("Axis must be an integer");
+      }
+      axis = axisIntAttr.getInt();
+    } else if (auto simpConstOp = axisOperand.getDefiningOp<simp::ConstantOp>()) {
+      auto axisIntAttr = simpConstOp.value().dyn_cast<IntegerAttr>();
+      if (!axisIntAttr) {
+        return op.emitError("Axis must be an integer");
+      }
+      axis = axisIntAttr.getInt();
+    } else {
+      return op.emitError("Axis must be a constant integer");
+    }
+    if (axis < 0) axis += rank;
+    if (axis < 0 || axis >= rank) {
+      return op.emitError("Axis out of bounds");
+    }
+
+    SmallVector<int64_t, 4> resultShape;
+    for (int64_t i = 0; i < rank; i++) {
+      if (i != axis) {
+        resultShape.push_back(shape[i]);
+      }
+    }
+
+    // Allocate result tensor (indices) and temp tensor (max values)
+    auto resultType = MemRefType::get(resultShape, rewriter.getI64Type());
+    auto maxValuesType = MemRefType::get(resultShape, elemType);
+    Value result = rewriter.create<memref::AllocOp>(loc, resultType);
+    Value maxValues = rewriter.create<memref::AllocOp>(loc, maxValuesType);
+
+    SmallVector<Value, 4> outerLBs, outerUBs, outerSteps;
+    for (int64_t dim : resultShape) {
+      outerLBs.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 0));
+      outerUBs.push_back(rewriter.create<arith::ConstantIndexOp>(loc, dim));
+      outerSteps.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 1));
+    }
+
+    // Initialize result indices to 0 and max values to -inf
+    scf::buildLoopNest(rewriter, loc, outerLBs, outerUBs, outerSteps,
+        [&](OpBuilder &builder, Location loc, ValueRange outerIvs) {
+          builder.create<memref::StoreOp>(loc, zeroIndex, result, outerIvs);
+          builder.create<memref::StoreOp>(loc, initialValue, maxValues, outerIvs);
+        });
+
+    // Build reduction loops
+    scf::buildLoopNest(rewriter, loc, outerLBs, outerUBs, outerSteps,
+        [&](OpBuilder &builder, Location loc, ValueRange outerIvs) {
+          Value lowerBound = builder.create<arith::ConstantIndexOp>(loc, 0);
+          Value upperBound = builder.create<arith::ConstantIndexOp>(loc, shape[axis]);
+          Value step = builder.create<arith::ConstantIndexOp>(loc, 1);
+
+          builder.create<scf::ForOp>(loc, lowerBound, upperBound, step, ValueRange{},
+              [&](OpBuilder &builder, Location loc, Value iv, ValueRange args) {
+                SmallVector<Value, 4> inputIndices;
+                int64_t outerIdx = 0;
+                for (int64_t i = 0; i < rank; i++) {
+                  if (i == axis) {
+                    inputIndices.push_back(iv);
+                  } else {
+                    inputIndices.push_back(outerIvs[outerIdx++]);
+                  }
+                }
+
+                Value elem = builder.create<memref::LoadOp>(loc, input, inputIndices);
+                Value currentMax = builder.create<memref::LoadOp>(loc, maxValues, outerIvs);
+
+                // Compare: is elem > currentMax?
+                Value isGreater;
+                if (elemType.isa<FloatType>()) {
+                  isGreater = builder.create<arith::CmpFOp>(loc, arith::CmpFPredicate::OGT, elem, currentMax);
+                } else {
+                  auto intType = elemType.cast<IntegerType>();
+                  if (intType.isUnsigned()) {
+                    isGreater = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ugt, elem, currentMax);
+                  } else {
+                    isGreater = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, elem, currentMax);
+                  }
+                }
+
+                // Update max value and index if greater
+                Value newMaxValue = builder.create<SelectOp>(loc, isGreater, elem, currentMax);
+                builder.create<memref::StoreOp>(loc, newMaxValue, maxValues, outerIvs);
+
+                // Convert reduction axis index from index to i64
+                Value ivI64 = builder.create<arith::IndexCastOp>(loc, builder.getI64Type(), iv);
+                Value currentIdx = builder.create<memref::LoadOp>(loc, result, outerIvs);
+                Value newIdx = builder.create<SelectOp>(loc, isGreater, ivI64, currentIdx);
+                builder.create<memref::StoreOp>(loc, newIdx, result, outerIvs);
+
+                builder.create<scf::YieldOp>(loc);
+              });
+        });
+
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
@@ -1249,6 +2351,18 @@ struct ConvertSimpToMemRefPass
         ArrayCreateOpLowering,
         ArrayGetOpLowering,
         ArraySetOpLowering,
+        TensorCreateOpLowering,
+        TensorGetOpLowering,
+        TensorSetOpLowering,
+        TensorAddOpLowering,
+        TensorMulOpLowering,
+        TensorSubOpLowering,
+        TensorDivOpLowering,
+        TensorSumOpLowering,
+        TensorMeanOpLowering,
+        TensorMaxOpLowering,
+        TensorMinOpLowering,
+        TensorArgmaxOpLowering,
         AddOpLowering,
         SubOpLowering,
         MulOpLowering,
@@ -1264,6 +2378,14 @@ struct ConvertSimpToMemRefPass
         DequantW4OpLowering,
         MatMulQuantOpLowering
     >(typeConverter, &getContext());
+
+    // Add tensor unary operations with their specific kinds
+    patterns.add<TensorUnaryOpLowering<simp::TensorReluOp>>(
+        typeConverter, &getContext(), TensorUnaryOpLowering<simp::TensorReluOp>::UnaryOpKind::ReLU);
+    patterns.add<TensorUnaryOpLowering<simp::TensorSigmoidOp>>(
+        typeConverter, &getContext(), TensorUnaryOpLowering<simp::TensorSigmoidOp>::UnaryOpKind::Sigmoid);
+    patterns.add<TensorUnaryOpLowering<simp::TensorTanhOp>>(
+        typeConverter, &getContext(), TensorUnaryOpLowering<simp::TensorTanhOp>::UnaryOpKind::Tanh);
 
     // Add SCF structural type conversions to handle scf.while, scf.if, etc. with type changes
     mlir::scf::populateSCFStructuralTypeConversionsAndLegality(typeConverter, patterns, target);

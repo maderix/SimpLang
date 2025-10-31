@@ -319,6 +319,317 @@ def Simp_ArraySetOp : Simp_Op<"array_set", [NoSideEffect]> {
 }
 
 //===----------------------------------------------------------------------===//
+// Tensor Operations
+//===----------------------------------------------------------------------===//
+
+//===----------------------------------------------------------------------===//
+// Simp_TensorCreateOp
+//===----------------------------------------------------------------------===//
+
+def Simp_TensorCreateOp : Simp_Op<"tensor_create", [NoSideEffect]> {
+  let summary = "Create tensor with given shape";
+
+  let description = [{
+    The `simp.tensor_create` operation allocates a new tensor with the
+    specified shape. The tensor is uninitialized.
+
+    Examples:
+    ```mlir
+    %tensor = simp.tensor_create : !simp.tensor<2x3x4xf32>
+    ```
+
+    SSA-Pure Semantics:
+    - Returns a new SSA value (the tensor)
+    - No global state mutation
+    - Shape is compile-time constant
+
+    Lowering:
+    - Phase 1: Lower to memref.alloc
+      simp.tensor_create : !simp.tensor<2x3x4xf32>
+      → memref.alloc() : memref<2x3x4xf32>
+  }];
+
+  let results = (outs Simp_SimpTensorType:$result);
+
+  // Custom assembly format: simp.tensor_create : <tensor-type>
+  let assemblyFormat = "attr-dict `:` type($result)";
+}
+
+//===----------------------------------------------------------------------===//
+// Simp_TensorGetOp
+//===----------------------------------------------------------------------===//
+
+def Simp_TensorGetOp : Simp_Op<"tensor_get", [NoSideEffect]> {
+  let summary = "Get element from tensor (load)";
+
+  let description = [{
+    The `simp.tensor_get` operation loads an element from a tensor at the
+    specified multi-dimensional index.
+
+    Examples:
+    ```mlir
+    %elem = simp.tensor_get %tensor[%i, %j, %k] : !simp.tensor<2x3x4xf32> -> f32
+    ```
+
+    SSA-Pure Semantics:
+    - Reads value without modifying the tensor
+    - Returns element value as SSA result
+    - Tensor indexing is 0-based
+    - Multi-dimensional indexing supported
+
+    Lowering:
+    - Phase 1: Lower to memref.load
+      simp.tensor_get %tensor[%i, %j, %k] : !simp.tensor<2x3x4xf32>
+      → memref.load %memref[%i, %j, %k] : memref<2x3x4xf32>
+  }];
+
+  let arguments = (ins Simp_SimpTensorType:$tensor, Variadic<I64>:$indices);
+  let results = (outs AnyType:$result);
+
+  // Custom assembly format: simp.tensor_get <tensor>[<indices>] : <types>
+  let assemblyFormat = "$tensor `[` $indices `]` attr-dict `:` functional-type(operands, results)";
+}
+
+//===----------------------------------------------------------------------===//
+// Simp_TensorSetOp
+//===----------------------------------------------------------------------===//
+
+def Simp_TensorSetOp : Simp_Op<"tensor_set", [NoSideEffect]> {
+  let summary = "Set element in tensor (functional)";
+
+  let description = [{
+    The `simp.tensor_set` operation returns a new tensor with the specified
+    element updated. This is a functional (SSA-pure) operation.
+
+    Examples:
+    ```mlir
+    %tensor2 = simp.tensor_set %tensor1[%i, %j, %k], %val : !simp.tensor<2x3x4xf32>
+    ```
+
+    SSA-Pure Semantics:
+    - Returns a NEW tensor with updated element
+    - Does not modify the input tensor
+    - Multi-dimensional indexing supported
+
+    Lowering:
+    - Phase 1: Lower to memref.store on the memref representation
+      Note: After lowering to memref, the SSA-pure semantics are relaxed.
+  }];
+
+  let arguments = (ins Simp_SimpTensorType:$tensor, Variadic<I64>:$indices, AnyType:$value);
+  let results = (outs Simp_SimpTensorType:$result);
+
+  // Custom assembly format: simp.tensor_set <tensor>[<indices>], <value> : <types>
+  let assemblyFormat = "$tensor `[` $indices `]` `,` $value attr-dict `:` functional-type(operands, results)";
+}
+
+//===----------------------------------------------------------------------===//
+// Tensor Element-wise Operations
+//===----------------------------------------------------------------------===//
+
+def Simp_TensorAddOp : Simp_Op<"tensor_add", [NoSideEffect, Commutative]> {
+  let summary = "Element-wise tensor addition";
+  let description = [{
+    Performs element-wise addition of two tensors with the same shape.
+    Returns a new tensor with the result.
+  }];
+  let arguments = (ins Simp_SimpTensorType:$lhs, Simp_SimpTensorType:$rhs);
+  let results = (outs Simp_SimpTensorType:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` `(` type($lhs) `,` type($rhs) `)` `->` type($result)";
+}
+
+def Simp_TensorMulOp : Simp_Op<"tensor_mul", [NoSideEffect, Commutative]> {
+  let summary = "Element-wise tensor multiplication";
+  let description = [{
+    Performs element-wise multiplication of two tensors with the same shape.
+    Returns a new tensor with the result.
+  }];
+  let arguments = (ins Simp_SimpTensorType:$lhs, Simp_SimpTensorType:$rhs);
+  let results = (outs Simp_SimpTensorType:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` `(` type($lhs) `,` type($rhs) `)` `->` type($result)";
+}
+
+def Simp_TensorSubOp : Simp_Op<"tensor_sub", [NoSideEffect]> {
+  let summary = "Element-wise tensor subtraction";
+  let description = [{
+    Performs element-wise subtraction of two tensors with the same shape.
+    Returns a new tensor with the result.
+  }];
+  let arguments = (ins Simp_SimpTensorType:$lhs, Simp_SimpTensorType:$rhs);
+  let results = (outs Simp_SimpTensorType:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` `(` type($lhs) `,` type($rhs) `)` `->` type($result)";
+}
+
+def Simp_TensorDivOp : Simp_Op<"tensor_div", [NoSideEffect]> {
+  let summary = "Element-wise tensor division";
+  let description = [{
+    Performs element-wise division of two tensors with the same shape.
+    Returns a new tensor with the result.
+  }];
+  let arguments = (ins Simp_SimpTensorType:$lhs, Simp_SimpTensorType:$rhs);
+  let results = (outs Simp_SimpTensorType:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` `(` type($lhs) `,` type($rhs) `)` `->` type($result)";
+}
+
+def Simp_TensorReluOp : Simp_Op<"tensor_relu", [NoSideEffect]> {
+  let summary = "Element-wise ReLU activation";
+  let description = [{
+    Performs element-wise ReLU (Rectified Linear Unit) activation.
+    ReLU(x) = max(0, x). Returns a new tensor with the result.
+  }];
+  let arguments = (ins Simp_SimpTensorType:$input);
+  let results = (outs Simp_SimpTensorType:$result);
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
+}
+
+def Simp_TensorSigmoidOp : Simp_Op<"tensor_sigmoid", [NoSideEffect]> {
+  let summary = "Element-wise sigmoid activation";
+  let description = [{
+    Performs element-wise sigmoid activation.
+    sigmoid(x) = 1 / (1 + e^(-x)). Returns a new tensor with the result.
+  }];
+  let arguments = (ins Simp_SimpTensorType:$input);
+  let results = (outs Simp_SimpTensorType:$result);
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
+}
+
+def Simp_TensorTanhOp : Simp_Op<"tensor_tanh", [NoSideEffect]> {
+  let summary = "Element-wise tanh activation";
+  let description = [{
+    Performs element-wise hyperbolic tangent activation.
+    tanh(x) = (e^x - e^(-x)) / (e^x + e^(-x)). Returns a new tensor with the result.
+  }];
+  let arguments = (ins Simp_SimpTensorType:$input);
+  let results = (outs Simp_SimpTensorType:$result);
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
+}
+
+//===----------------------------------------------------------------------===//
+// Tensor Reduction Operations
+//===----------------------------------------------------------------------===//
+
+def Simp_TensorSumOp : Simp_Op<"tensor_sum", [NoSideEffect]> {
+  let summary = "Tensor sum reduction";
+  let description = [{
+    Reduces a tensor by summing all elements (full reduction) or along a specific axis.
+
+    Full reduction (returns scalar):
+      %sum = simp.tensor_sum %tensor : !simp.tensor<2x3xf32> -> f32
+
+    Axis reduction (returns tensor with reduced dimension):
+      %sum = simp.tensor_sum %tensor, %axis : (!simp.tensor<2x3xf32>, i64) -> !simp.tensor<2xf32>
+  }];
+  let arguments = (ins Simp_SimpTensorType:$input, Optional<I64>:$axis);
+  let results = (outs AnyType:$result);
+  let assemblyFormat = "$input (`,` $axis^)? attr-dict `:` type($input) `->` type($result)";
+}
+
+def Simp_TensorMeanOp : Simp_Op<"tensor_mean", [NoSideEffect]> {
+  let summary = "Tensor mean reduction";
+  let description = [{
+    Reduces a tensor by computing the mean of all elements (full reduction) or along a specific axis.
+
+    Full reduction (returns scalar):
+      %mean = simp.tensor_mean %tensor : !simp.tensor<2x3xf32> -> f32
+  }];
+  let arguments = (ins Simp_SimpTensorType:$input, Optional<I64>:$axis);
+  let results = (outs AnyType:$result);
+  let assemblyFormat = "$input (`,` $axis^)? attr-dict `:` type($input) `->` type($result)";
+}
+
+def Simp_TensorMaxOp : Simp_Op<"tensor_max", [NoSideEffect]> {
+  let summary = "Tensor max reduction";
+  let description = [{
+    Reduces a tensor by finding the maximum element (full reduction) or along a specific axis.
+
+    Full reduction (returns scalar):
+      %max = simp.tensor_max %tensor : !simp.tensor<2x3xf32> -> f32
+  }];
+  let arguments = (ins Simp_SimpTensorType:$input, Optional<I64>:$axis);
+  let results = (outs AnyType:$result);
+  let assemblyFormat = "$input (`,` $axis^)? attr-dict `:` type($input) `->` type($result)";
+}
+
+def Simp_TensorMinOp : Simp_Op<"tensor_min", [NoSideEffect]> {
+  let summary = "Tensor min reduction";
+  let description = [{
+    Reduces a tensor by finding the minimum element (full reduction) or along a specific axis.
+
+    Full reduction (returns scalar):
+      %min = simp.tensor_min %tensor : !simp.tensor<2x3xf32> -> f32
+  }];
+  let arguments = (ins Simp_SimpTensorType:$input, Optional<I64>:$axis);
+  let results = (outs AnyType:$result);
+  let assemblyFormat = "$input (`,` $axis^)? attr-dict `:` type($input) `->` type($result)";
+}
+
+def Simp_TensorArgmaxOp : Simp_Op<"tensor_argmax", [NoSideEffect]> {
+  let summary = "Tensor argmax reduction";
+  let description = [{
+    Reduces a tensor by finding the index of the maximum element (full reduction) or along a specific axis.
+
+    Full reduction (returns scalar index):
+      %argmax = simp.tensor_argmax %tensor : !simp.tensor<2x3xf32> -> i64
+  }];
+  let arguments = (ins Simp_SimpTensorType:$input, Optional<I64>:$axis);
+  let results = (outs AnyType:$result);
+  let assemblyFormat = "$input (`,` $axis^)? attr-dict `:` type($input) `->` type($result)";
+}
+
+//===----------------------------------------------------------------------===//
+// Tensor Memory Operations
+//===----------------------------------------------------------------------===//
+
+def Simp_TensorReshapeOp : Simp_Op<"tensor_reshape", [NoSideEffect]> {
+  let summary = "Reshape tensor without copying data";
+  let description = [{
+    Changes the shape of a tensor without reordering elements. Total number of elements must remain the same.
+
+    Example:
+      %reshaped = simp.tensor_reshape %input, %dim0, %dim1 : (!simp.tensor<6xf32>, i64, i64) -> !simp.tensor<2x3xf32>
+
+    The data layout (row-major) is preserved, only the interpretation changes.
+  }];
+  let arguments = (ins Simp_SimpTensorType:$input, Variadic<I64>:$new_shape);
+  let results = (outs Simp_SimpTensorType:$result);
+  let assemblyFormat = "$input `,` $new_shape attr-dict `:` `(` type($input) `,` type($new_shape) `)` `->` type($result)";
+}
+
+def Simp_TensorTransposeOp : Simp_Op<"tensor_transpose", [NoSideEffect]> {
+  let summary = "Transpose tensor dimensions";
+  let description = [{
+    Swaps tensor dimensions according to a permutation.
+
+    For 2D tensors (no permutation specified):
+      %transposed = simp.tensor_transpose %input : !simp.tensor<2x3xf32> -> !simp.tensor<3x2xf32>
+
+    For N-D tensors with explicit permutation:
+      %transposed = simp.tensor_transpose %input, %perm0, %perm1, %perm2 : (!simp.tensor<2x3x4xf32>, i64, i64, i64) -> !simp.tensor<4x2x3xf32>
+
+    Requires data reordering (creates a copy).
+  }];
+  let arguments = (ins Simp_SimpTensorType:$input, Variadic<I64>:$permutation);
+  let results = (outs Simp_SimpTensorType:$result);
+  let assemblyFormat = "$input (`,` $permutation^)? attr-dict `:` `(` type($input) (`,` type($permutation)^)? `)` `->` type($result)";
+}
+
+def Simp_TensorSliceOp : Simp_Op<"tensor_slice", [NoSideEffect]> {
+  let summary = "Extract sub-tensor slice";
+  let description = [{
+    Extracts a contiguous sub-tensor using start and end indices for each dimension.
+
+    Example:
+      %slice = simp.tensor_slice %input, %start0, %end0, %start1, %end1 : (!simp.tensor<4x5xf32>, i64, i64, i64, i64) -> !simp.tensor<2x2xf32>
+
+    For each dimension i, extracts elements [start_i, end_i) (end is exclusive).
+    Creates a copy of the extracted region.
+  }];
+  let arguments = (ins Simp_SimpTensorType:$input, Variadic<I64>:$indices);
+  let results = (outs Simp_SimpTensorType:$result);
+  let assemblyFormat = "$input `,` $indices attr-dict `:` `(` type($input) `,` type($indices) `)` `->` type($result)";
+}
+
+//===----------------------------------------------------------------------===//
 // Simp_MatMulOp
 //===----------------------------------------------------------------------===//
 
