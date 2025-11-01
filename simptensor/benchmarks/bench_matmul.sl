@@ -227,6 +227,198 @@ fn benchmark_matmul_256_i16() -> i32 {
     return checksum;
 }
 
+fn benchmark_matmul_64_i8() -> i32 {
+    i8<64, 64> A;
+    i8<64, 64> B;
+
+    var i = 0;
+    while (i < 64) {
+        var j = 0;
+        while (j < 64) {
+            var val = (i * 64 + j) / 64;
+            A[i as i64, j as i64] = val;
+            B[j as i64, i as i64] = val;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    var C = tensor_matmul(A, B);
+
+    var checksum = 0;
+    i = 0;
+    while (i < 64) {
+        var j = 0;
+        while (j < 64) {
+            checksum = checksum + C[i as i64, j as i64];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    return checksum;
+}
+
+fn benchmark_matmul_128_i8() -> i32 {
+    i8<128, 128> A;
+    i8<128, 128> B;
+
+    var i = 0;
+    while (i < 128) {
+        var j = 0;
+        while (j < 128) {
+            var val = (i * 128 + j) / 128;
+            A[i as i64, j as i64] = val;
+            B[j as i64, i as i64] = val;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    var C = tensor_matmul(A, B);
+
+    var checksum = 0;
+    i = 0;
+    while (i < 128) {
+        var j = 0;
+        while (j < 128) {
+            checksum = checksum + C[i as i64, j as i64];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    return checksum;
+}
+
+fn benchmark_matmul_512_i8() -> i32 {
+    i8<512, 512> A;
+    i8<512, 512> B;
+
+    var i = 0;
+    while (i < 512) {
+        var j = 0;
+        while (j < 512) {
+            var val = (i * 512 + j) / 512;
+            A[i as i64, j as i64] = val;
+            B[j as i64, i as i64] = val;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    var C = tensor_matmul(A, B);
+
+    var checksum = 0;
+    i = 0;
+    while (i < 512) {
+        var j = 0;
+        while (j < 512) {
+            checksum = checksum + C[i as i64, j as i64];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    return checksum;
+}
+
+fn benchmark_matmul_64_i16() -> i32 {
+    i16<64, 64> A;
+    i16<64, 64> B;
+
+    var i = 0;
+    while (i < 64) {
+        var j = 0;
+        while (j < 64) {
+            var val = (i * 64 + j) / 64;
+            A[i as i64, j as i64] = val;
+            B[j as i64, i as i64] = val;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    var C = tensor_matmul(A, B);
+
+    var checksum = 0;
+    i = 0;
+    while (i < 64) {
+        var j = 0;
+        while (j < 64) {
+            checksum = checksum + C[i as i64, j as i64];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    return checksum;
+}
+
+fn benchmark_matmul_128_i16() -> i32 {
+    i16<128, 128> A;
+    i16<128, 128> B;
+
+    var i = 0;
+    while (i < 128) {
+        var j = 0;
+        while (j < 128) {
+            var val = (i * 128 + j) / 128;
+            A[i as i64, j as i64] = val;
+            B[j as i64, i as i64] = val;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    var C = tensor_matmul(A, B);
+
+    var checksum = 0;
+    i = 0;
+    while (i < 128) {
+        var j = 0;
+        while (j < 128) {
+            checksum = checksum + C[i as i64, j as i64];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    return checksum;
+}
+
+fn benchmark_matmul_512_i16() -> i32 {
+    i16<512, 512> A;
+    i16<512, 512> B;
+
+    var i = 0;
+    while (i < 512) {
+        var j = 0;
+        while (j < 512) {
+            var val = (i * 512 + j) / 512;
+            A[i as i64, j as i64] = val;
+            B[j as i64, i as i64] = val;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    var C = tensor_matmul(A, B);
+
+    var checksum = 0;
+    i = 0;
+    while (i < 512) {
+        var j = 0;
+        while (j < 512) {
+            checksum = checksum + C[i as i64, j as i64];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    return checksum;
+}
+
 fn benchmark_matmul_256_i32() -> i32 {
     i32<256, 256> A;
     i32<256, 256> B;
@@ -405,6 +597,167 @@ fn benchmark_matmul_256_i64() -> i64 {
         var j = 0;
         while (j < 256) {
             checksum = checksum + C[i, j];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    return checksum;
+}
+
+// f64 (double precision) benchmarks
+fn benchmark_matmul_64_f64() -> f64 {
+    f64<64, 64> A;
+    f64<64, 64> B;
+
+    var i = 0;
+    while (i < 64) {
+        var j = 0;
+        while (j < 64) {
+            var val = ((i * 64 + j) / 64) as f64;
+            A[i as i64, j as i64] = val;
+            B[j as i64, i as i64] = val;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    var C = tensor_matmul(A, B);
+
+    var checksum = 0.0;
+    i = 0;
+    while (i < 64) {
+        var j = 0;
+        while (j < 64) {
+            checksum = checksum + C[i as i64, j as i64];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    return checksum;
+}
+
+fn benchmark_matmul_128_f64() -> f64 {
+    f64<128, 128> A;
+    f64<128, 128> B;
+
+    var i = 0;
+    while (i < 128) {
+        var j = 0;
+        while (j < 128) {
+            var val = ((i * 128 + j) / 128) as f64;
+            A[i as i64, j as i64] = val;
+            B[j as i64, i as i64] = val;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    var C = tensor_matmul(A, B);
+
+    var checksum = 0.0;
+    i = 0;
+    while (i < 128) {
+        var j = 0;
+        while (j < 128) {
+            checksum = checksum + C[i as i64, j as i64];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    return checksum;
+}
+
+fn benchmark_matmul_256_f64() -> f64 {
+    f64<256, 256> A;
+    f64<256, 256> B;
+
+    var i = 0;
+    while (i < 256) {
+        var j = 0;
+        while (j < 256) {
+            var val = ((i * 256 + j) / 256) as f64;
+            A[i as i64, j as i64] = val;
+            B[j as i64, i as i64] = val;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    var C = tensor_matmul(A, B);
+
+    var checksum = 0.0;
+    i = 0;
+    while (i < 256) {
+        var j = 0;
+        while (j < 256) {
+            checksum = checksum + C[i as i64, j as i64];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    return checksum;
+}
+
+fn benchmark_matmul_512_f64() -> f64 {
+    f64<512, 512> A;
+    f64<512, 512> B;
+
+    var i = 0;
+    while (i < 512) {
+        var j = 0;
+        while (j < 512) {
+            var val = ((i * 512 + j) / 512) as f64;
+            A[i as i64, j as i64] = val;
+            B[j as i64, i as i64] = val;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    var C = tensor_matmul(A, B);
+
+    var checksum = 0.0;
+    i = 0;
+    while (i < 512) {
+        var j = 0;
+        while (j < 512) {
+            checksum = checksum + C[i as i64, j as i64];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    return checksum;
+}
+
+fn benchmark_matmul_1024_f64() -> f64 {
+    f64<1024, 1024> A;
+    f64<1024, 1024> B;
+
+    var i = 0;
+    while (i < 1024) {
+        var j = 0;
+        while (j < 1024) {
+            var val = ((i * 1024 + j) / 1024) as f64;
+            A[i as i64, j as i64] = val;
+            B[j as i64, i as i64] = val;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    var C = tensor_matmul(A, B);
+
+    var checksum = 0.0;
+    i = 0;
+    while (i < 1024) {
+        var j = 0;
+        while (j < 1024) {
+            checksum = checksum + C[i as i64, j as i64];
             j = j + 1;
         }
         i = i + 1;

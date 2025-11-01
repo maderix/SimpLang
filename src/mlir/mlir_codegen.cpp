@@ -2042,6 +2042,143 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
     }
   }
 
+  // tensor_matmul: tensor_matmul(lhs, rhs)
+  if (calleeName == "tensor_matmul") {
+    if (args.size() != 2) {
+      llvm::errs() << "Error: tensor_matmul requires 2 arguments (lhs, rhs), got " << args.size() << "\n";
+      return nullptr;
+    }
+
+    mlir::Value lhs = args[0];
+    mlir::Value rhs = args[1];
+    auto lhsType = lhs.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    auto rhsType = rhs.getType().dyn_cast<mlir::simp::SimpTensorType>();
+
+    if (!lhsType) {
+      llvm::errs() << "Error: tensor_matmul requires tensor lhs argument\n";
+      return nullptr;
+    }
+    if (!rhsType) {
+      llvm::errs() << "Error: tensor_matmul requires tensor rhs argument\n";
+      return nullptr;
+    }
+
+    auto lhsShape = lhsType.getShape();
+    auto rhsShape = rhsType.getShape();
+    int64_t lhsRank = lhsShape.size();
+    int64_t rhsRank = rhsShape.size();
+
+    // Compute result shape based on input dimensions
+    llvm::SmallVector<int64_t, 4> resultShape;
+
+    if (lhsRank == 2 && rhsRank == 2) {
+      // 2D matmul: (M, K) × (K, N) → (M, N)
+      int64_t M = lhsShape[0];
+      int64_t K_lhs = lhsShape[1];
+      int64_t K_rhs = rhsShape[0];
+      int64_t N = rhsShape[1];
+
+      if (K_lhs != K_rhs) {
+        llvm::errs() << "Error: tensor_matmul dimension mismatch: lhs K=" << K_lhs << ", rhs K=" << K_rhs << "\n";
+        return nullptr;
+      }
+
+      resultShape = {M, N};
+
+    } else if (lhsRank == 3 && rhsRank == 3) {
+      // Batched 3D matmul: (B, M, K) × (B, K, N) → (B, M, N)
+      int64_t B_lhs = lhsShape[0];
+      int64_t B_rhs = rhsShape[0];
+      int64_t M = lhsShape[1];
+      int64_t K_lhs = lhsShape[2];
+      int64_t K_rhs = rhsShape[1];
+      int64_t N = rhsShape[2];
+
+      if (B_lhs != B_rhs) {
+        llvm::errs() << "Error: tensor_matmul batch size mismatch\n";
+        return nullptr;
+      }
+      if (K_lhs != K_rhs) {
+        llvm::errs() << "Error: tensor_matmul dimension mismatch\n";
+        return nullptr;
+      }
+
+      resultShape = {B_lhs, M, N};
+
+    } else if (lhsRank == 4 && rhsRank == 2) {
+      // 4D NHWC matmul: (N, H, W, C_in) × (C_out, C_in) → (N, H, W, C_out)
+      int64_t N = lhsShape[0];
+      int64_t H = lhsShape[1];
+      int64_t W = lhsShape[2];
+      int64_t C_in_lhs = lhsShape[3];
+      int64_t C_out = rhsShape[0];
+      int64_t C_in_rhs = rhsShape[1];
+
+      if (C_in_lhs != C_in_rhs) {
+        llvm::errs() << "Error: tensor_matmul channel mismatch\n";
+        return nullptr;
+      }
+
+      resultShape = {N, H, W, C_out};
+
+    } else {
+      llvm::errs() << "Error: tensor_matmul unsupported dimensions: lhs rank=" << lhsRank
+                   << ", rhs rank=" << rhsRank << "\n";
+      return nullptr;
+    }
+
+    // For i8/i16 inputs, promote result type to i32 to prevent overflow
+    mlir::Type elemType = lhsType.getElementType();
+    if (elemType.isInteger(8) || elemType.isInteger(16)) {
+      elemType = builder.getI32Type();
+    }
+
+    mlir::Type resultType = mlir::simp::SimpTensorType::get(
+        builder.getContext(), resultShape, elemType);
+
+    return builder.create<mlir::simp::TensorMatMulOp>(loc, resultType, lhs, rhs, /*layout=*/nullptr);
+  }
+
+  // tensor_dot: tensor_dot(lhs, rhs)
+  if (calleeName == "tensor_dot") {
+    if (args.size() != 2) {
+      llvm::errs() << "Error: tensor_dot requires 2 arguments (lhs, rhs), got " << args.size() << "\n";
+      return nullptr;
+    }
+
+    mlir::Value lhs = args[0];
+    mlir::Value rhs = args[1];
+    auto lhsType = lhs.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    auto rhsType = rhs.getType().dyn_cast<mlir::simp::SimpTensorType>();
+
+    if (!lhsType) {
+      llvm::errs() << "Error: tensor_dot requires tensor lhs argument\n";
+      return nullptr;
+    }
+    if (!rhsType) {
+      llvm::errs() << "Error: tensor_dot requires tensor rhs argument\n";
+      return nullptr;
+    }
+
+    auto lhsShape = lhsType.getShape();
+    auto rhsShape = rhsType.getShape();
+
+    if (lhsShape.size() != 1 || rhsShape.size() != 1) {
+      llvm::errs() << "Error: tensor_dot requires 1D tensors\n";
+      return nullptr;
+    }
+
+    if (lhsShape[0] != rhsShape[0]) {
+      llvm::errs() << "Error: tensor_dot dimension mismatch: " << lhsShape[0] << " vs " << rhsShape[0] << "\n";
+      return nullptr;
+    }
+
+    // Result is a scalar of the same element type
+    mlir::Type resultType = lhsType.getElementType();
+
+    return builder.create<mlir::simp::TensorDotOp>(loc, resultType, lhs, rhs);
+  }
+
   // Look up user-defined functions in the module
   mlir::FuncOp callee = module.lookupSymbol<mlir::FuncOp>(calleeName);
   if (!callee) {

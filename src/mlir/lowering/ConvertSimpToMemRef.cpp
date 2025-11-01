@@ -2625,8 +2625,9 @@ struct TensorMatMulOpLowering : public OpConversionPattern<simp::TensorMatMulOp>
         Value product = rewriter.create<arith::MulFOp>(loc, lhsVal, rhsVal);
         rewriter.create<memref::StoreOp>(loc, product, result, ValueRange{c0, c0});
       } else if (elemType.isInteger(8) || elemType.isInteger(16)) {
-        // Special case: i8/i16 matmul needs wider accumulator to prevent overflow
-        // Quantized ML workloads: i8×i8 or i16×i16 accumulates into i32
+        // Special case: i8/i16 matmul returns i32 result to prevent overflow
+        // i8×i8 or i16×i16 matmul produces results that typically exceed narrow type range
+        // Result type is promoted to i32 - do NOT truncate back
         auto wideType = rewriter.getIntegerType(32);
         auto wideMemRefType = MemRefType::get(lhsShape, wideType);
         auto wideResultMemRefType = MemRefType::get(resultType.getShape(), wideType);
@@ -2670,28 +2671,18 @@ struct TensorMatMulOpLowering : public OpConversionPattern<simp::TensorMatMulOp>
               b.create<linalg::YieldOp>(loc, extended);
             });
 
-        // Perform matmul with i32 accumulator
+        // Perform matmul with i32 accumulator - result stays as i32
         rewriter.create<linalg::MatmulOp>(
             loc, ValueRange{lhsWide, rhsWide}, ValueRange{resultWide});
 
-        // Truncate result back to original type using linalg.generic
-        SmallVector<AffineMap, 2> truncMaps = {
-            AffineMap::getMultiDimIdentityMap(2, rewriter.getContext()),
-            AffineMap::getMultiDimIdentityMap(2, rewriter.getContext())};
-        SmallVector<StringRef, 2> truncIters = {
-            getParallelIteratorTypeName(), getParallelIteratorTypeName()};
-        rewriter.create<linalg::GenericOp>(
-            loc, TypeRange{}, ValueRange{resultWide}, ValueRange{result},
-            truncMaps, truncIters,
-            [&](OpBuilder &b, Location loc, ValueRange args) {
-              Value truncated = b.create<arith::TruncIOp>(loc, elemType, args[0]);
-              b.create<linalg::YieldOp>(loc, truncated);
-            });
+        // Return i32 result directly - NO truncation
+        // User gets i32 tensor instead of i8/i16 to avoid overflow
+        rewriter.replaceOp(op, resultWide);
 
-        // Clean up temporary wide buffers
+        // Clean up temporary input buffers (result is returned, don't dealloc)
         rewriter.create<memref::DeallocOp>(loc, lhsWide);
         rewriter.create<memref::DeallocOp>(loc, rhsWide);
-        rewriter.create<memref::DeallocOp>(loc, resultWide);
+        return success();
       } else {
         // General 2D matmul: Use linalg.matmul for optimal performance
         rewriter.create<linalg::MatmulOp>(
