@@ -2577,6 +2577,266 @@ struct TensorScatterOpLowering : public OpConversionPattern<simp::TensorScatterO
   }
 };
 
+/// TensorMatMul: Matrix multiplication for tensor types
+/// Supports 2D, 3D (batched), and 4D (NHWC-aware) operations
+struct TensorMatMulOpLowering : public OpConversionPattern<simp::TensorMatMulOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      simp::TensorMatMulOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+
+    auto loc = op.getLoc();
+    auto lhs = adaptor.lhs();
+    auto rhs = adaptor.rhs();
+    auto lhsType = lhs.getType().cast<MemRefType>();
+    auto rhsType = rhs.getType().cast<MemRefType>();
+    auto resultType = getTypeConverter()->convertType(op.getType()).cast<MemRefType>();
+
+    auto lhsShape = lhsType.getShape();
+    auto rhsShape = rhsType.getShape();
+    int64_t lhsRank = lhsShape.size();
+    int64_t rhsRank = rhsShape.size();
+
+    // Allocate result tensor
+    Value result = rewriter.create<memref::AllocOp>(loc, resultType);
+
+    // Initialize result to zero (linalg.matmul accumulates into the output)
+    auto elemType = resultType.getElementType();
+    Value zero = rewriter.create<arith::ConstantOp>(
+        loc, elemType, rewriter.getZeroAttr(elemType));
+    rewriter.create<linalg::FillOp>(loc, zero, result);
+
+    if (lhsRank == 2 && rhsRank == 2) {
+      // Case 1: Standard 2D matrix multiplication (GEMM)
+      // A: MxK, B: KxN → C: MxN
+
+      int64_t M = lhsShape[0];
+      int64_t K_lhs = lhsShape[1];
+      int64_t K_rhs = rhsShape[0];
+      int64_t N = rhsShape[1];
+
+      // Special case: 1x1 matmul = scalar multiplication
+      // Avoid vectorization to prevent vector.broadcast lowering issues
+      if (M == 1 && K_lhs == 1 && K_rhs == 1 && N == 1) {
+        Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+        Value lhsVal = rewriter.create<memref::LoadOp>(loc, lhs, ValueRange{c0, c0});
+        Value rhsVal = rewriter.create<memref::LoadOp>(loc, rhs, ValueRange{c0, c0});
+        Value product = rewriter.create<arith::MulFOp>(loc, lhsVal, rhsVal);
+        rewriter.create<memref::StoreOp>(loc, product, result, ValueRange{c0, c0});
+      } else if (elemType.isInteger(8) || elemType.isInteger(16)) {
+        // Special case: i8/i16 matmul needs wider accumulator to prevent overflow
+        // Quantized ML workloads: i8×i8 or i16×i16 accumulates into i32
+        auto wideType = rewriter.getIntegerType(32);
+        auto wideMemRefType = MemRefType::get(lhsShape, wideType);
+        auto wideResultMemRefType = MemRefType::get(resultType.getShape(), wideType);
+
+        // Allocate wide buffers
+        Value lhsWide = rewriter.create<memref::AllocOp>(loc, wideMemRefType);
+        Value rhsWide = rewriter.create<memref::AllocOp>(loc,
+            MemRefType::get(rhsShape, wideType));
+        Value resultWide = rewriter.create<memref::AllocOp>(loc, wideResultMemRefType);
+
+        // Initialize wide result to zero
+        Value wideZero = rewriter.create<arith::ConstantOp>(
+            loc, wideType, rewriter.getZeroAttr(wideType));
+        rewriter.create<linalg::FillOp>(loc, wideZero, resultWide);
+
+        // Cast lhs to i32 using linalg.generic
+        SmallVector<AffineMap, 2> lhsCastMaps = {
+            AffineMap::getMultiDimIdentityMap(2, rewriter.getContext()),
+            AffineMap::getMultiDimIdentityMap(2, rewriter.getContext())};
+        SmallVector<StringRef, 2> lhsCastIters = {
+            getParallelIteratorTypeName(), getParallelIteratorTypeName()};
+        rewriter.create<linalg::GenericOp>(
+            loc, TypeRange{}, ValueRange{lhs}, ValueRange{lhsWide},
+            lhsCastMaps, lhsCastIters,
+            [&](OpBuilder &b, Location loc, ValueRange args) {
+              Value extended = b.create<arith::ExtSIOp>(loc, wideType, args[0]);
+              b.create<linalg::YieldOp>(loc, extended);
+            });
+
+        // Cast rhs to i32 using linalg.generic
+        SmallVector<AffineMap, 2> rhsCastMaps = {
+            AffineMap::getMultiDimIdentityMap(2, rewriter.getContext()),
+            AffineMap::getMultiDimIdentityMap(2, rewriter.getContext())};
+        SmallVector<StringRef, 2> rhsCastIters = {
+            getParallelIteratorTypeName(), getParallelIteratorTypeName()};
+        rewriter.create<linalg::GenericOp>(
+            loc, TypeRange{}, ValueRange{rhs}, ValueRange{rhsWide},
+            rhsCastMaps, rhsCastIters,
+            [&](OpBuilder &b, Location loc, ValueRange args) {
+              Value extended = b.create<arith::ExtSIOp>(loc, wideType, args[0]);
+              b.create<linalg::YieldOp>(loc, extended);
+            });
+
+        // Perform matmul with i32 accumulator
+        rewriter.create<linalg::MatmulOp>(
+            loc, ValueRange{lhsWide, rhsWide}, ValueRange{resultWide});
+
+        // Truncate result back to original type using linalg.generic
+        SmallVector<AffineMap, 2> truncMaps = {
+            AffineMap::getMultiDimIdentityMap(2, rewriter.getContext()),
+            AffineMap::getMultiDimIdentityMap(2, rewriter.getContext())};
+        SmallVector<StringRef, 2> truncIters = {
+            getParallelIteratorTypeName(), getParallelIteratorTypeName()};
+        rewriter.create<linalg::GenericOp>(
+            loc, TypeRange{}, ValueRange{resultWide}, ValueRange{result},
+            truncMaps, truncIters,
+            [&](OpBuilder &b, Location loc, ValueRange args) {
+              Value truncated = b.create<arith::TruncIOp>(loc, elemType, args[0]);
+              b.create<linalg::YieldOp>(loc, truncated);
+            });
+
+        // Clean up temporary wide buffers
+        rewriter.create<memref::DeallocOp>(loc, lhsWide);
+        rewriter.create<memref::DeallocOp>(loc, rhsWide);
+        rewriter.create<memref::DeallocOp>(loc, resultWide);
+      } else {
+        // General 2D matmul: Use linalg.matmul for optimal performance
+        rewriter.create<linalg::MatmulOp>(
+            loc, ValueRange{lhs, rhs}, ValueRange{result});
+      }
+
+    } else if (lhsRank == 3 && rhsRank == 3) {
+      // Case 2: Batched 3D matrix multiplication
+      // A: BxMxK, B: BxKxN → C: BxMxN
+      // Use linalg.batch_matmul
+      rewriter.create<linalg::BatchMatmulOp>(
+          loc, ValueRange{lhs, rhs}, ValueRange{result});
+
+    } else if (lhsRank == 4 && rhsRank == 2) {
+      // Case 3: 4D NHWC input with 2D weight matrix (fully connected layer)
+      // Input: NxHxWxC_in, Weights: C_outxC_in → Output: NxHxWxC_out
+      //
+      // Strategy:
+      // 1. Reshape input from (N, H, W, C_in) to (N*H*W, C_in)
+      // 2. Matmul: (N*H*W, C_in) × (C_in, C_out) → (N*H*W, C_out)
+      // 3. Reshape output to (N, H, W, C_out)
+      //
+      // NHWC layout optimization: Channels are innermost (contiguous)
+      // This enables vectorization on the C dimension
+
+      int64_t N = lhsShape[0];
+      int64_t H = lhsShape[1];
+      int64_t W = lhsShape[2];
+      int64_t C_in = lhsShape[3];
+      int64_t C_out = rhsShape[0];
+      int64_t spatial = N * H * W;
+
+      auto elemType = lhsType.getElementType();
+
+      // Create 2D views using memref.collapse_shape
+      SmallVector<ReassociationIndices, 2> lhsReassoc = {{0, 1, 2}, {3}};
+      auto lhsCollapsed = rewriter.create<memref::CollapseShapeOp>(
+          loc, MemRefType::get({spatial, C_in}, elemType), lhs, lhsReassoc);
+
+      // Transpose weights from (C_out, C_in) to (C_in, C_out) for matmul
+      auto rhsTransposed = rewriter.create<memref::AllocOp>(
+          loc, MemRefType::get({C_in, C_out}, elemType));
+
+      Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+      Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+      Value c_in_val = rewriter.create<arith::ConstantIndexOp>(loc, C_in);
+      Value c_out_val = rewriter.create<arith::ConstantIndexOp>(loc, C_out);
+
+      // Transpose loop: rhsTransposed[i,j] = rhs[j,i]
+      rewriter.create<scf::ForOp>(
+          loc, c0, c_in_val, c1, ValueRange{},
+          [&](OpBuilder &b1, Location loc, Value i, ValueRange) {
+            b1.create<scf::ForOp>(
+                loc, c0, c_out_val, c1, ValueRange{},
+                [&](OpBuilder &b2, Location loc, Value j, ValueRange) {
+                  Value elem = b2.create<memref::LoadOp>(loc, rhs, ValueRange{j, i});
+                  b2.create<memref::StoreOp>(loc, elem, rhsTransposed, ValueRange{i, j});
+                  b2.create<scf::YieldOp>(loc);
+                });
+            b1.create<scf::YieldOp>(loc);
+          });
+
+      // Matmul on reshaped tensors
+      auto tempResult = rewriter.create<memref::AllocOp>(
+          loc, MemRefType::get({spatial, C_out}, elemType));
+
+      // Initialize tempResult to zero
+      rewriter.create<linalg::FillOp>(loc, zero, tempResult);
+
+      rewriter.create<linalg::MatmulOp>(
+          loc, ValueRange{lhsCollapsed, rhsTransposed}, ValueRange{tempResult});
+
+      // Reshape result back to (N, H, W, C_out)
+      SmallVector<ReassociationIndices, 2> resultReassoc = {{0, 1, 2}, {3}};
+      auto resultExpanded = rewriter.create<memref::ExpandShapeOp>(
+          loc, resultType, tempResult, resultReassoc);
+
+      // Copy expanded result to final output
+      rewriter.create<memref::CopyOp>(loc, resultExpanded, result);
+
+    } else {
+      return rewriter.notifyMatchFailure(op, "Unsupported tensor dimensions for matmul");
+    }
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+/// TensorDot: Dot product for 1D tensors
+/// Computes: result = sum(a[i] * b[i])
+struct TensorDotOpLowering : public OpConversionPattern<simp::TensorDotOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      simp::TensorDotOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+
+    auto loc = op.getLoc();
+    auto lhs = adaptor.lhs();
+    auto rhs = adaptor.rhs();
+    auto lhsType = lhs.getType().cast<MemRefType>();
+
+    auto shape = lhsType.getShape();
+    if (shape.size() != 1) {
+      return rewriter.notifyMatchFailure(op, "Dot product requires 1D tensors");
+    }
+
+    int64_t N = shape[0];
+    auto elemType = lhsType.getElementType();
+
+    // Initialize accumulator to zero
+    Value zero = rewriter.create<arith::ConstantOp>(
+        loc, elemType, rewriter.getZeroAttr(elemType));
+
+    Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    Value N_val = rewriter.create<arith::ConstantIndexOp>(loc, N);
+
+    // Tight reduction loop: sum = sum + lhs[i] * rhs[i]
+    // This is auto-vectorizable by LLVM
+    auto loopResult = rewriter.create<scf::ForOp>(
+        loc, c0, N_val, c1, ValueRange{zero},
+        [&](OpBuilder &builder, Location loc, Value i, ValueRange iterArgs) {
+          Value currentSum = iterArgs[0];
+
+          // Load elements
+          Value lhsElem = builder.create<memref::LoadOp>(loc, lhs, ValueRange{i});
+          Value rhsElem = builder.create<memref::LoadOp>(loc, rhs, ValueRange{i});
+
+          // Multiply
+          Value product = builder.create<arith::MulFOp>(loc, lhsElem, rhsElem);
+
+          // Accumulate
+          Value newSum = builder.create<arith::AddFOp>(loc, currentSum, product);
+
+          builder.create<scf::YieldOp>(loc, ValueRange{newSum});
+        });
+
+    // Replace with the final sum
+    rewriter.replaceOp(op, loopResult.getResult(0));
+    return success();
+  }
+};
+
 // MatMulQuant: Quantized matrix multiplication with tile-based dequantization
 // Strategy: Keep weights in W4 format, dequantize tiles on-the-fly for vectorization
 // For W[M×K] @ input[K] = output[M], process in tiles of size TILE×K
@@ -2832,7 +3092,9 @@ struct ConvertSimpToMemRefPass
         TensorTransposeOpLowering,
         TensorSliceOpLowering,
         TensorGatherOpLowering,
-        TensorScatterOpLowering
+        TensorScatterOpLowering,
+        TensorMatMulOpLowering,
+        TensorDotOpLowering
     >(typeConverter, &getContext());
 
     // Add tensor unary operations with their specific kinds
