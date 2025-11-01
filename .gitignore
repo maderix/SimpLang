@@ -49,3 +49,4 @@ tests/obj/
 tests/*.ll
 tests/*.o
 tests/*.so
+simptensor/TENSOR_CHECKPOINT.md

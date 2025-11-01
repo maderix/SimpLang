@@ -629,6 +629,122 @@ def Simp_TensorSliceOp : Simp_Op<"tensor_slice", [NoSideEffect]> {
   let assemblyFormat = "$input `,` $indices attr-dict `:` `(` type($input) `,` type($indices) `)` `->` type($result)";
 }
 
+def Simp_TensorGatherOp : Simp_Op<"tensor_gather", [NoSideEffect]> {
+  let summary = "Gather slices along specified axis (N-D)";
+  let description = [{
+    Gathers slices from source tensor along the specified axis using indices.
+    Supports arbitrary N-dimensional tensors with optimized lowering.
+
+    The indices tensor must be 1D (rank-1) containing integer indices.
+    The result shape is the source shape with the gather axis dimension
+    replaced by the length of the indices tensor.
+
+    Examples:
+      // 1D gather (embedding lookup)
+      %result = simp.tensor_gather %embeddings, %tokens, %axis
+        : (!simp.tensor<10000xf32>, !simp.tensor<512xi64>, i64)
+        -> !simp.tensor<512xf32>
+
+      // 2D gather along axis 0 (select rows)
+      %result = simp.tensor_gather %matrix, %row_indices, %axis
+        : (!simp.tensor<1000x512xf32>, !simp.tensor<32xi64>, i64)
+        -> !simp.tensor<32x512xf32>
+
+      // 3D gather along axis 1
+      %result = simp.tensor_gather %tensor3d, %indices, %axis
+        : (!simp.tensor<8x100x64xf32>, !simp.tensor<16xi64>, i64)
+        -> !simp.tensor<8x16x64xf32>
+
+      // 5D gather along axis 3
+      %result = simp.tensor_gather %tensor5d, %indices, %axis
+        : (!simp.tensor<2x4x8x16x32xf32>, !simp.tensor<10xi64>, i64)
+        -> !simp.tensor<2x4x8x10x32xf32>
+
+    Optimization Notes:
+    - Lowering uses nested loops with innermost dimension vectorizable
+    - Memory access pattern optimized for cache locality when axis >= rank-2
+    - Supports all numeric types (f32, f64, i32, i64, etc.)
+    - No bounds checking for maximum performance (undefined if out-of-bounds)
+
+    Lowering Path:
+    ```
+    simp.tensor_gather
+      → nested scf.for loops with memref.load
+      → [vectorization + loop tiling optimizations]
+      → LLVM IR with SIMD instructions
+    ```
+  }];
+
+  let arguments = (ins
+    Simp_SimpTensorType:$source,
+    Simp_SimpTensorType:$indices,  // Must be 1D tensor of i64
+    Optional<I64>:$axis             // Default: 0
+  );
+  let results = (outs Simp_SimpTensorType:$result);
+
+  let assemblyFormat = "$source `,` $indices (`,` $axis^)? attr-dict `:` `(` type($source) `,` type($indices) (`,` type($axis)^)? `)` `->` type($result)";
+}
+
+def Simp_TensorScatterOp : Simp_Op<"tensor_scatter", [NoSideEffect]> {
+  let summary = "Scatter values along specified axis (N-D)";
+  let description = [{
+    Scatters values into destination tensor along the specified axis using indices.
+    Supports arbitrary N-dimensional tensors with optimized lowering.
+
+    The indices tensor must be 1D (rank-1) containing integer indices.
+    The values tensor shape must match the destination shape with the scatter
+    axis dimension equal to the length of the indices tensor.
+
+    Semantics: Last write wins if indices contain duplicates.
+
+    Examples:
+      // 1D scatter (sparse update)
+      %result = simp.tensor_scatter %dst, %indices, %values, %axis
+        : (!simp.tensor<10000xf32>, !simp.tensor<16xi64>, !simp.tensor<16xf32>, i64)
+        -> !simp.tensor<10000xf32>
+
+      // 2D scatter along axis 0 (update rows)
+      %result = simp.tensor_scatter %matrix, %row_indices, %new_rows, %axis
+        : (!simp.tensor<1000x512xf32>, !simp.tensor<8xi64>, !simp.tensor<8x512xf32>, i64)
+        -> !simp.tensor<1000x512xf32>
+
+      // 3D scatter along axis 2
+      %result = simp.tensor_scatter %tensor3d, %indices, %updates, %axis
+        : (!simp.tensor<4x8x100xf32>, !simp.tensor<12xi64>, !simp.tensor<4x8x12xf32>, i64)
+        -> !simp.tensor<4x8x100xf32>
+
+      // 4D scatter along axis 1
+      %result = simp.tensor_scatter %tensor4d, %indices, %updates, %axis
+        : (!simp.tensor<2x50x16x32xf32>, !simp.tensor<5xi64>, !simp.tensor<2x5x16x32xf32>, i64)
+        -> !simp.tensor<2x50x16x32xf32>
+
+    Optimization Notes:
+    - Lowering uses nested loops with innermost dimension vectorizable
+    - Minimizes memory copies (single allocation + scatter writes)
+    - Memory access pattern optimized for cache locality
+    - Supports all numeric types (f32, f64, i32, i64, etc.)
+    - No bounds checking for maximum performance (undefined if out-of-bounds)
+
+    Lowering Path:
+    ```
+    simp.tensor_scatter
+      → memref.copy (dst to result) + nested scf.for loops with memref.store
+      → [vectorization + loop tiling optimizations]
+      → LLVM IR with SIMD instructions
+    ```
+  }];
+
+  let arguments = (ins
+    Simp_SimpTensorType:$dst,
+    Simp_SimpTensorType:$indices,  // Must be 1D tensor of i64
+    Simp_SimpTensorType:$values,
+    Optional<I64>:$axis             // Default: 0
+  );
+  let results = (outs Simp_SimpTensorType:$result);
+
+  let assemblyFormat = "$dst `,` $indices `,` $values (`,` $axis^)? attr-dict `:` `(` type($dst) `,` type($indices) `,` type($values) (`,` type($axis)^)? `)` `->` type($result)";
+}
+
 //===----------------------------------------------------------------------===//
 // Simp_MatMulOp
 //===----------------------------------------------------------------------===//

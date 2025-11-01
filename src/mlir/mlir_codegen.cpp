@@ -1875,6 +1875,173 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
     return builder.create<mlir::simp::TensorSliceOp>(loc, resultType, tensor, indexArgs);
   }
 
+  // tensor_gather: tensor_gather(source, indices, [axis])
+  if (calleeName == "tensor_gather") {
+    if (args.size() < 2 || args.size() > 3) {
+      llvm::errs() << "Error: tensor_gather requires 2-3 arguments (source, indices, [axis]), got " << args.size() << "\n";
+      return nullptr;
+    }
+
+    mlir::Value source = args[0];
+    mlir::Value indices = args[1];
+    auto sourceType = source.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    auto indicesType = indices.getType().dyn_cast<mlir::simp::SimpTensorType>();
+
+    if (!sourceType) {
+      llvm::errs() << "Error: tensor_gather requires tensor source argument\n";
+      return nullptr;
+    }
+    if (!indicesType) {
+      llvm::errs() << "Error: tensor_gather requires tensor indices argument\n";
+      return nullptr;
+    }
+
+    // Validate indices tensor is 1D and i64
+    if (indicesType.getShape().size() != 1) {
+      llvm::errs() << "Error: tensor_gather indices must be 1D tensor, got rank " << indicesType.getShape().size() << "\n";
+      return nullptr;
+    }
+
+    // Get axis (default 0)
+    int64_t axis = 0;
+    mlir::Value axisVal = nullptr;
+    if (args.size() == 3) {
+      if (auto constOp = args[2].getDefiningOp<mlir::simp::ConstantOp>()) {
+        if (auto intAttr = constOp.value().dyn_cast<mlir::IntegerAttr>()) {
+          axis = intAttr.getInt();
+        }
+      } else if (auto arithConstOp = args[2].getDefiningOp<mlir::arith::ConstantOp>()) {
+        if (auto intAttr = arithConstOp.getValue().dyn_cast<mlir::IntegerAttr>()) {
+          axis = intAttr.getInt();
+        }
+      }
+      axisVal = args[2];
+    }
+
+    auto sourceShape = sourceType.getShape();
+    int64_t rank = sourceShape.size();
+    int64_t numIndices = indicesType.getShape()[0];
+
+    // Handle negative axis
+    if (axis < 0) {
+      axis += rank;
+    }
+    if (axis < 0 || axis >= rank) {
+      llvm::errs() << "Error: tensor_gather axis " << axis << " out of bounds for rank " << rank << "\n";
+      return nullptr;
+    }
+
+    // Compute result shape: replace axis dimension with numIndices
+    llvm::SmallVector<int64_t, 4> resultShape;
+    for (int64_t i = 0; i < rank; i++) {
+      if (i == axis) {
+        resultShape.push_back(numIndices);
+      } else {
+        resultShape.push_back(sourceShape[i]);
+      }
+    }
+
+    mlir::Type resultType = mlir::simp::SimpTensorType::get(builder.getContext(), resultShape, sourceType.getElementType());
+
+    if (axisVal) {
+      return builder.create<mlir::simp::TensorGatherOp>(loc, resultType, source, indices, axisVal);
+    } else {
+      return builder.create<mlir::simp::TensorGatherOp>(loc, resultType, source, indices, nullptr);
+    }
+  }
+
+  // tensor_scatter: tensor_scatter(dst, indices, values, [axis])
+  if (calleeName == "tensor_scatter") {
+    if (args.size() < 3 || args.size() > 4) {
+      llvm::errs() << "Error: tensor_scatter requires 3-4 arguments (dst, indices, values, [axis]), got " << args.size() << "\n";
+      return nullptr;
+    }
+
+    mlir::Value dst = args[0];
+    mlir::Value indices = args[1];
+    mlir::Value values = args[2];
+    auto dstType = dst.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    auto indicesType = indices.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    auto valuesType = values.getType().dyn_cast<mlir::simp::SimpTensorType>();
+
+    if (!dstType) {
+      llvm::errs() << "Error: tensor_scatter requires tensor dst argument\n";
+      return nullptr;
+    }
+    if (!indicesType) {
+      llvm::errs() << "Error: tensor_scatter requires tensor indices argument\n";
+      return nullptr;
+    }
+    if (!valuesType) {
+      llvm::errs() << "Error: tensor_scatter requires tensor values argument\n";
+      return nullptr;
+    }
+
+    // Validate indices tensor is 1D
+    if (indicesType.getShape().size() != 1) {
+      llvm::errs() << "Error: tensor_scatter indices must be 1D tensor, got rank " << indicesType.getShape().size() << "\n";
+      return nullptr;
+    }
+
+    // Get axis (default 0)
+    int64_t axis = 0;
+    mlir::Value axisVal = nullptr;
+    if (args.size() == 4) {
+      if (auto constOp = args[3].getDefiningOp<mlir::simp::ConstantOp>()) {
+        if (auto intAttr = constOp.value().dyn_cast<mlir::IntegerAttr>()) {
+          axis = intAttr.getInt();
+        }
+      } else if (auto arithConstOp = args[3].getDefiningOp<mlir::arith::ConstantOp>()) {
+        if (auto intAttr = arithConstOp.getValue().dyn_cast<mlir::IntegerAttr>()) {
+          axis = intAttr.getInt();
+        }
+      }
+      axisVal = args[3];
+    }
+
+    auto dstShape = dstType.getShape();
+    int64_t rank = dstShape.size();
+    int64_t numIndices = indicesType.getShape()[0];
+
+    // Handle negative axis
+    if (axis < 0) {
+      axis += rank;
+    }
+    if (axis < 0 || axis >= rank) {
+      llvm::errs() << "Error: tensor_scatter axis " << axis << " out of bounds for rank " << rank << "\n";
+      return nullptr;
+    }
+
+    // Validate values shape matches dst shape with axis replaced by numIndices
+    auto valuesShape = valuesType.getShape();
+    if (valuesShape.size() != rank) {
+      llvm::errs() << "Error: tensor_scatter values rank must match dst rank\n";
+      return nullptr;
+    }
+    for (int64_t i = 0; i < rank; i++) {
+      if (i == axis) {
+        if (valuesShape[i] != numIndices) {
+          llvm::errs() << "Error: tensor_scatter values axis dimension must match indices length\n";
+          return nullptr;
+        }
+      } else {
+        if (valuesShape[i] != dstShape[i]) {
+          llvm::errs() << "Error: tensor_scatter values shape must match dst shape (except axis)\n";
+          return nullptr;
+        }
+      }
+    }
+
+    // Result type is same as dst
+    mlir::Type resultType = dstType;
+
+    if (axisVal) {
+      return builder.create<mlir::simp::TensorScatterOp>(loc, resultType, dst, indices, values, axisVal);
+    } else {
+      return builder.create<mlir::simp::TensorScatterOp>(loc, resultType, dst, indices, values, nullptr);
+    }
+  }
+
   // Look up user-defined functions in the module
   mlir::FuncOp callee = module.lookupSymbol<mlir::FuncOp>(calleeName);
   if (!callee) {
