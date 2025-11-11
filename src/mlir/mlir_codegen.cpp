@@ -23,6 +23,7 @@
 #include "mlir/tensor_layout.hpp"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/raw_ostream.h"
+#include "logger.hpp"
 #include <cmath>
 
 // Include full AST definitions here in the .cpp file
@@ -545,9 +546,20 @@ mlir::ModuleOp MLIRCodeGenContext::lowerAST(BlockAST* programBlock) {
 
 mlir::Value MLIRCodeGenContext::lowerExpression(ExprAST* expr) {
   if (!expr) {
-    llvm::errs() << "Error: Null expression\n";
+    LOG_ERROR("Null expression encountered in lowerExpression");
     return nullptr;
   }
+
+  // Log expression type for debugging
+  static const char* kindNames[] = {
+    "NumberExpr", "VariableExpr", "AssignmentExpr", "BinaryExpr", "UnaryExpr",
+    "CallExpr", "ArrayCreateExpr", "ArrayAccessExpr", "ArrayStoreExpr",
+    "MatMulExpr", "CastExpr", "TensorGetExpr", "TensorSetExpr"
+  };
+  int kindIndex = static_cast<int>(expr->getKind());
+  LOG_DEBUG("Lowering expression: ",
+            (kindIndex >= 0 && kindIndex < 13 ? kindNames[kindIndex] : "Unknown"),
+            " (kind=", kindIndex, ")");
 
   // Use getKind() for type identification without RTTI
   switch (expr->getKind()) {
@@ -2042,6 +2054,14 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
     }
   }
 
+  // tensor_from_array is handled specially in variable declarations
+  // See lowerVariableDeclaration for the implementation
+  if (calleeName == "tensor_from_array") {
+    llvm::errs() << "Error: tensor_from_array must be used in a tensor variable declaration\n";
+    llvm::errs() << "  Example: f32<32000, 768> embedding = tensor_from_array(array);\n";
+    return nullptr;
+  }
+
   // tensor_matmul: tensor_matmul(lhs, rhs)
   if (calleeName == "tensor_matmul") {
     if (args.size() != 2) {
@@ -2247,6 +2267,10 @@ mlir::LogicalResult MLIRCodeGenContext::lowerStatement(StmtAST* stmt) {
 }
 
 mlir::LogicalResult MLIRCodeGenContext::lowerDeclaration(VariableDeclarationAST* decl) {
+  LOG_DEBUG("Lowering variable declaration: ", decl->getName(),
+            ", staticType=", (decl->isStaticallyTyped() ? "yes" : "no"),
+            ", isTensor=", (decl->isStaticallyTyped() && decl->getStaticType()->isTensor() ? "yes" : "no"));
+
   // Check if this is an array creation - we need to track dimensions
   ExprAST* initExpr = decl->getAssignmentExpr();
   ArrayCreateExprAST* arrayCreate = nullptr;
@@ -2328,12 +2352,87 @@ mlir::LogicalResult MLIRCodeGenContext::lowerDeclaration(VariableDeclarationAST*
       initValue = builder.create<mlir::simp::TensorSetOp>(loc, tensorType, initValue, indices, valueToStore);
     }
   }
+  // Handle tensor_from_array conversion
+  else if (initExpr && initExpr->getKind() == ASTKind::CallExpr &&
+           decl->isStaticallyTyped() && decl->getStaticType()->isTensor()) {
+    auto* funcCall = static_cast<CallExprAST*>(initExpr);
+    if (funcCall->getCallee() == "tensor_from_array") {
+      LOG_DEBUG("Processing tensor_from_array for variable: ", decl->getName());
+
+      auto loc = getUnknownLocation();
+      auto tensorType = getMLIRType(const_cast<TypeInfo*>(decl->getStaticType()));
+
+      // Get arguments: tensor_from_array(array) or tensor_from_array(array, offset)
+      size_t numArgs = funcCall->getArguments().size();
+      LOG_DEBUG("tensor_from_array has ", numArgs, " arguments");
+      if (numArgs != 1 && numArgs != 2) {
+        llvm::errs() << "Error: tensor_from_array requires 1 or 2 arguments (array, [offset])\n";
+        return mlir::failure();
+      }
+
+      mlir::Value arrayArg = lowerExpression(funcCall->getArguments()[0]);
+      if (!arrayArg) {
+        llvm::errs() << "Error: Failed to lower tensor_from_array array argument\n";
+        return mlir::failure();
+      }
+
+      // Get offset (default to 0 if not provided)
+      mlir::Value offsetArg;
+      if (numArgs == 2) {
+        offsetArg = lowerExpression(funcCall->getArguments()[1]);
+        if (!offsetArg) {
+          llvm::errs() << "Error: Failed to lower tensor_from_array offset argument\n";
+          return mlir::failure();
+        }
+      } else {
+        // Default offset = 0
+        offsetArg = builder.create<mlir::arith::ConstantIntOp>(loc, 0, builder.getI64Type());
+      }
+
+      // Create tensor_from_array operation with explicit result type
+      initValue = builder.create<mlir::simp::TensorFromArrayOp>(loc, tensorType, arrayArg, offsetArg);
+    } else {
+      // Regular function call
+      initValue = lowerExpression(decl->getAssignmentExpr());
+      if (!initValue) {
+        return mlir::failure();
+      }
+    }
+  }
   // Lower the initialization expression if provided
-  else {
-    initValue = lowerExpression(decl->getAssignmentExpr());
+  else if (initExpr) {
+    LOG_DEBUG("Lowering init expression for: ", decl->getName());
+    initValue = lowerExpression(initExpr);
     if (!initValue) {
+      LOG_ERROR("Failed to lower init expression for: ", decl->getName());
       return mlir::failure();
     }
+  }
+  // Handle uninitialized arrays (allocate memory)
+  else if (decl->isStaticallyTyped() && decl->getStaticType()->isArray()) {
+    LOG_DEBUG("Creating uninitialized array for: ", decl->getName());
+    auto loc = getUnknownLocation();
+    auto arrayType = getMLIRType(const_cast<TypeInfo*>(decl->getStaticType()));
+
+    // Cast to ArrayTypeInfo to get size
+    auto* arrayTypeInfo = static_cast<const ArrayTypeInfo*>(decl->getStaticType());
+    int arraySize = arrayTypeInfo->size;
+
+    if (arraySize <= 0) {
+      LOG_ERROR("Array ", decl->getName(), " has invalid size: ", arraySize);
+      return mlir::failure();
+    }
+
+    // Create size constant
+    mlir::Value sizeValue = builder.create<mlir::simp::ConstantOp>(
+        loc, builder.getI64Type(), builder.getI64IntegerAttr(arraySize));
+
+    // For arrays, create an ArrayCreateOp with the declared size
+    initValue = builder.create<mlir::simp::ArrayCreateOp>(loc, arrayType, sizeValue);
+  }
+  else {
+    LOG_ERROR("No initialization for variable: ", decl->getName());
+    return mlir::failure();
   }
 
   // Declare the variable in the symbol table

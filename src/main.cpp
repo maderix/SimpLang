@@ -35,25 +35,76 @@ int main(int argc, char** argv) {
     bool printIR = false;
     bool emitMLIR = false;
     bool enableTiling = true;  // MLIR tiling optimization (enabled by default)
-    int tileSize = 8;  // Default optimal tile size
+    int tileSize = 16;  // Optimal tile size: 39% of NumPy @512x512, 20% @1024x1024
+    bool enableHierarchicalTiling = false;  // Multi-level cache-aware tiling (experimental)
+    bool enableOpenMP = false;  // OpenMP parallelization (disabled by default)
+    bool enableO3 = true;  // LLVM O3 optimization (enabled by default)
     bool dumpMLIRPasses = false;  // Dump MLIR at each pipeline stage
     std::string outputPath;
     std::string logLevel = "INFO";  // Default log level
 
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " source.sl [-o output] [-d] [--log-level LEVEL] [--print-ir] [--emit-mlir] [--enable-tiling] [--dump-mlir-passes]" << std::endl;
-        std::cerr << "  --log-level LEVEL: Set logging level (ERROR, WARNING, INFO, DEBUG, TRACE)" << std::endl;
-        std::cerr << "  -q, --quiet:       Equivalent to --log-level ERROR" << std::endl;
-        std::cerr << "  -v, --verbose:     Equivalent to --log-level DEBUG" << std::endl;
-        std::cerr << "  --print-ir:        Print LLVM IR to console" << std::endl;
+    // Helper function to print help
+    auto printHelp = [&]() {
+        std::cout << "SimpLang Compiler - DSL for SIMD Hardware Optimization\n" << std::endl;
+        std::cout << "Usage: " << argv[0] << " <source.sl> [OPTIONS]\n" << std::endl;
+
+        std::cout << "Basic Options:" << std::endl;
+        std::cout << "  -h, --help         Show this help message" << std::endl;
+        std::cout << "  -o <file>          Output file path (default: <input>.o)" << std::endl;
+        std::cout << "  -d, --debug        Enable parser debug mode" << std::endl;
+        std::cout << "  --print-ir         Print LLVM IR to console" << std::endl;
+        std::cout << std::endl;
+
+        std::cout << "Logging Options:" << std::endl;
+        std::cout << "  --log-level LEVEL  Set logging level (ERROR, WARNING, INFO, DEBUG, TRACE)" << std::endl;
+        std::cout << "  -q, --quiet        Quiet mode (--log-level ERROR)" << std::endl;
+        std::cout << "  -v, --verbose      Verbose mode (--log-level DEBUG)" << std::endl;
+        std::cout << "  --no-color         Disable colored output" << std::endl;
+        std::cout << std::endl;
+
 #ifdef USE_MLIR
-        std::cerr << "  --emit-mlir:       Emit MLIR instead of LLVM IR" << std::endl;
-        std::cerr << "  --enable-tiling:   Enable loop tiling optimization for matmul (default: on)" << std::endl;
-        std::cerr << "  --no-tiling:       Disable loop tiling optimization" << std::endl;
-        std::cerr << "  --tile-size N:     Set tile size for matmul (default: 8)" << std::endl;
-        std::cerr << "  --dump-mlir-passes: Dump MLIR IR at each pipeline stage" << std::endl;
+        std::cout << "MLIR Backend Options:" << std::endl;
+        std::cout << "  --emit-mlir        Use MLIR backend (required for tensor ops, transformers)" << std::endl;
+        std::cout << "  --dump-mlir-passes Dump MLIR IR at each pipeline stage" << std::endl;
+        std::cout << std::endl;
+
+        std::cout << "Optimization Options (MLIR):" << std::endl;
+        std::cout << "  --enable-tiling    Enable loop tiling for matmul (default: ON)" << std::endl;
+        std::cout << "  --no-tiling        Disable loop tiling optimization" << std::endl;
+        std::cout << "  --tile-size N      Set tile size for matmul (default: 16)" << std::endl;
+        std::cout << "  --hierarchical-tiling  Multi-level cache-aware tiling (L1/L2/L3)" << std::endl;
+        std::cout << "  --enable-openmp    Enable OpenMP parallelization (multi-threading)" << std::endl;
+        std::cout << "  --no-opt           Disable LLVM O3 optimization (faster compilation)" << std::endl;
+        std::cout << std::endl;
 #endif
+
+        std::cout << "Examples:" << std::endl;
+        std::cout << "  # Basic compilation" << std::endl;
+        std::cout << "  " << argv[0] << " kernel.sl -o kernel.o" << std::endl;
+        std::cout << std::endl;
+        std::cout << "  # Compile with MLIR backend (for tensor operations)" << std::endl;
+        std::cout << "  " << argv[0] << " transformer.sl --emit-mlir -o model.o" << std::endl;
+        std::cout << std::endl;
+        std::cout << "  # Optimize for specific tile size" << std::endl;
+        std::cout << "  " << argv[0] << " matmul.sl --emit-mlir --tile-size 64 -o matmul.o" << std::endl;
+        std::cout << std::endl;
+        std::cout << "  # Enable parallelization with OpenMP" << std::endl;
+        std::cout << "  " << argv[0] << " compute.sl --emit-mlir --enable-openmp -o compute.o" << std::endl;
+        std::cout << "  # Link: gcc -shared -o compute.so compute.o -lm -fopenmp" << std::endl;
+        std::cout << std::endl;
+    };
+
+    if (argc < 2) {
+        printHelp();
         return 1;
+    }
+
+    // Check for help flag first (can be anywhere in args)
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            printHelp();
+            return 0;
+        }
     }
 
     // Parse command line arguments
@@ -96,6 +147,15 @@ int main(int argc, char** argv) {
                 std::cerr << "Error: Invalid tile size " << tileSize << std::endl;
                 return 1;
             }
+        }
+        else if (strcmp(argv[i], "--hierarchical-tiling") == 0) {
+            enableHierarchicalTiling = true;
+        }
+        else if (strcmp(argv[i], "--enable-openmp") == 0) {
+            enableOpenMP = true;
+        }
+        else if (strcmp(argv[i], "--no-opt") == 0) {
+            enableO3 = false;
         }
         else if (strcmp(argv[i], "--dump-mlir-passes") == 0) {
             dumpMLIRPasses = true;
@@ -198,8 +258,17 @@ int main(int argc, char** argv) {
         // Configure pipeline options
         pipeline.setEnableTiling(enableTiling);
         pipeline.setTileSize(tileSize);
+        pipeline.setEnableHierarchicalTiling(enableHierarchicalTiling);
+        pipeline.setEnableOpenMP(enableOpenMP);
         if (enableTiling) {
-            LOG_INFO("Loop tiling optimization enabled (" + std::to_string(tileSize) + "x" + std::to_string(tileSize) + "x" + std::to_string(tileSize) + ")");
+            if (enableHierarchicalTiling) {
+                LOG_INFO("Hierarchical tiling enabled (L3: 128x128x128, L2: 32x32x32, L1: 8x8x8)");
+            } else {
+                LOG_INFO("Loop tiling optimization enabled (" + std::to_string(tileSize) + "x" + std::to_string(tileSize) + "x" + std::to_string(tileSize) + ")");
+            }
+        }
+        if (enableOpenMP) {
+            LOG_INFO("OpenMP parallelization enabled (multi-threading)");
         }
 
         pipeline.setDumpIntermediateIR(dumpMLIRPasses);
@@ -218,6 +287,17 @@ int main(int argc, char** argv) {
             std::cout << "\n=== Lowered MLIR (LLVM Dialect) ===" << std::endl;
             pipeline.getModule().print(llvm::outs());
             std::cout << "====================================\n" << std::endl;
+        }
+
+        // DEBUG: Dump MLIR before LLVM translation to see what vector ops remain
+        {
+            std::string preTranslationPath = std::string(outputPath) + "_pre_llvm.mlir";
+            std::error_code EC;
+            llvm::raw_fd_ostream preTranslationOut(preTranslationPath, EC);
+            if (!EC) {
+                pipeline.getModule().print(preTranslationOut);
+                std::cout << "Pre-translation MLIR written to: " << preTranslationPath << std::endl;
+            }
         }
 
         // Translate MLIR LLVM dialect to LLVM IR
@@ -275,22 +355,26 @@ int main(int argc, char** argv) {
         std::string features = subtargetFeatures.getString();
 
         llvm::TargetOptions opt;
-        auto rm = llvm::Optional<llvm::Reloc::Model>();
+        auto rm = llvm::Optional<llvm::Reloc::Model>(llvm::Reloc::PIC_);
         auto targetMachine = target->createTargetMachine(targetTriple, cpu, features, opt, rm);
 
         llvmModule->setDataLayout(targetMachine->createDataLayout());
 
         // RUN LLVM OPTIMIZATION PASSES (Critical for performance!)
         // Use MLIR's optimization transformer (same as Toy tutorial Ch6)
-        LOG_INFO("Running LLVM optimization passes (O3)...");
-        auto optPipeline = mlir::makeOptimizingTransformer(
-            /*optLevel=*/3,        // O3 optimization (enables loop vectorization!)
-            /*sizeLevel=*/0,       // Optimize for speed, not size
-            /*targetMachine=*/targetMachine);
+        if (enableO3) {
+            LOG_INFO("Running LLVM optimization passes (O3)...");
+            auto optPipeline = mlir::makeOptimizingTransformer(
+                /*optLevel=*/3,        // O3 optimization (enables loop vectorization!)
+                /*sizeLevel=*/0,       // Optimize for speed, not size
+                /*targetMachine=*/targetMachine);
 
-        if (auto err = optPipeline(llvmModule.get())) {
-            llvm::errs() << "Failed to optimize LLVM IR: " << err << "\n";
-            return 1;
+            if (auto err = optPipeline(llvmModule.get())) {
+                llvm::errs() << "Failed to optimize LLVM IR: " << err << "\n";
+                return 1;
+            }
+        } else {
+            LOG_INFO("Skipping LLVM O3 optimization (--no-opt)");
         }
 
         // AFTER O3: Promote large stack allocations to heap

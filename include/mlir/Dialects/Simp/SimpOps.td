@@ -424,6 +424,51 @@ def Simp_TensorSetOp : Simp_Op<"tensor_set", [NoSideEffect]> {
 }
 
 //===----------------------------------------------------------------------===//
+// Simp_TensorFromArrayOp
+//===----------------------------------------------------------------------===//
+
+def Simp_TensorFromArrayOp : Simp_Op<"tensor_from_array", [NoSideEffect]> {
+  let summary = "Create tensor from array (bulk conversion with optional offset)";
+
+  let description = [{
+    The `simp.tensor_from_array` operation creates a tensor from an existing
+    array by reinterpreting its memory layout. This is a zero-copy operation
+    that wraps the array data in a tensor view.
+
+    Examples:
+    ```mlir
+    // Without offset (start from beginning)
+    %tensor = simp.tensor_from_array %array, %c0 : !simp.array<f32>, i64 -> !simp.tensor<768x1024xf32>
+
+    // With offset (for multi-layer weights)
+    %offset = simp.constant(589824 : i64) : i64  // layer 1 offset
+    %tensor = simp.tensor_from_array %array, %offset : !simp.array<f32>, i64 -> !simp.tensor<768x768xf32>
+    ```
+
+    Use Cases:
+    - Loading large weight matrices (e.g., 32000×768 embeddings)
+    - Slicing multi-layer weights (e.g., wq[layer, :, :] from flat array)
+    - Zero-copy reshaping for ML operations
+
+    SSA-Pure Semantics:
+    - Returns a tensor view of the array data starting at offset
+    - No data copying (reinterpret cast with offset)
+    - offset + tensor_size must not exceed array size
+
+    Lowering:
+    - Phase 1: Lower to memref.reinterpret_cast with offset
+      simp.tensor_from_array %array, %offset : !simp.array<f32>, i64 -> !simp.tensor<MxNxf32>
+      → memref.reinterpret_cast %memref : memref<?xf32> to memref<MxNxf32> (offset = %offset)
+  }];
+
+  let arguments = (ins Simp_ArrayType:$array, I64:$offset);
+  let results = (outs Simp_SimpTensorType:$result);
+
+  // Custom assembly format: simp.tensor_from_array <array>, <offset> : <types> -> <tensor-type>
+  let assemblyFormat = "$array `,` $offset attr-dict `:` type($array) `,` type($offset) `->` type($result)";
+}
+
+//===----------------------------------------------------------------------===//
 // Tensor Element-wise Operations
 //===----------------------------------------------------------------------===//
 
@@ -1056,6 +1101,112 @@ def Simp_MatMulQuantOp : Simp_Op<"matmul_quant", [NoSideEffect]> {
     `(` type($qweights) `,` type($scales) `,` type($zeros) `,` type($input) `,` type($output) `,`
         type($rows) `,` type($cols) `,` type($group_size) `,` type($offset) `)`
     `->` type($result)
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// TensorMatMulOp - Matrix multiplication for tensor types (2D/3D/4D)
+//===----------------------------------------------------------------------===//
+
+def Simp_TensorMatMulOp : Simp_Op<"tensor_matmul", [NoSideEffect]> {
+  let summary = "Matrix multiplication for tensors (GEMM, batched GEMM)";
+
+  let description = [{
+    Matrix multiplication for SimpTensorType with support for:
+    - 2D matmul: Standard GEMM
+    - 3D matmul: Batched GEMM (broadcast semantics)
+    - 4D matmul: NHWC-aware batched operations for CNNs
+
+    Supported cases:
+
+    1. Standard 2D GEMM:
+       A: tensor<M, K>, B: tensor<K, N> → C: tensor<M, N>
+       ```simplang
+       f32<128, 256> A;
+       f32<256, 512> B;
+       f32<128, 512> C = tensor_matmul(A, B);
+       ```
+
+    2. Batched 3D GEMM:
+       A: tensor<B, M, K>, B: tensor<B, K, N> → C: tensor<B, M, N>
+       ```simplang
+       f32<32, 128, 256> A;  // 32 batches
+       f32<32, 256, 512> B;
+       f32<32, 128, 512> C = tensor_matmul(A, B);
+       ```
+
+    3. 4D NHWC-aware operations (for CNNs):
+       Input: tensor<N, H, W, C_in>
+       Weights: tensor<C_out, C_in>  (fully connected layer)
+       Output: tensor<N, H, W, C_out>
+
+       The operation reshapes to (N*H*W, C_in) × (C_in, C_out) → (N*H*W, C_out)
+       and reshapes back, optimizing for NHWC layout (channels innermost).
+
+    Layout attribute:
+    - "NCHW": Channels first (PyTorch style)
+    - "NHWC": Channels last (TensorFlow style, better cache/vectorization)
+
+    Lowering strategy:
+    - 2D: Use linalg.matmul with cache-aware tiling
+    - 3D: Use linalg.batch_matmul with loop fusion
+    - 4D NHWC: Reshape + matmul + reshape with layout-aware optimization
+    - Enable vectorization on innermost (contiguous) dimension
+    - Competitive with Intel MKL for small-medium sizes
+  }];
+
+  let arguments = (ins
+    Simp_SimpTensorType:$lhs,           // A: input tensor (2D/3D/4D)
+    Simp_SimpTensorType:$rhs,           // B: weight tensor (2D/3D/4D)
+    OptionalAttr<StrAttr>:$layout   // "NCHW" or "NHWC" (default: infer from shapes)
+  );
+
+  let results = (outs Simp_SimpTensorType:$result);  // C: output tensor
+
+  let assemblyFormat = [{
+    $lhs `,` $rhs attr-dict `:` `(` type($lhs) `,` type($rhs) `)` `->` type($result)
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// TensorDotOp - Dot product for 1D tensors
+//===----------------------------------------------------------------------===//
+
+def Simp_TensorDotOp : Simp_Op<"tensor_dot", [NoSideEffect]> {
+  let summary = "Dot product for 1D tensors";
+
+  let description = [{
+    Computes dot product of two 1D tensors.
+
+    Computes: result = sum(a[i] * b[i])
+
+    Where:
+      a: tensor<N>  (1D tensor, N elements)
+      b: tensor<N>  (1D tensor, N elements)
+      result: scalar
+
+    Example:
+    ```simplang
+    f32<1024> a;
+    f32<1024> b;
+    f32 result = tensor_dot(a, b);
+    ```
+
+    Lowering strategy:
+    - Tight vectorized loop with reduction
+    - Auto-vectorization friendly
+    - Minimal overhead vs hand-written SIMD
+  }];
+
+  let arguments = (ins
+    Simp_SimpTensorType:$lhs,  // Vector a
+    Simp_SimpTensorType:$rhs   // Vector b
+  );
+
+  let results = (outs AnyType:$result);  // Scalar result (type matches tensor element type)
+
+  let assemblyFormat = [{
+    $lhs `,` $rhs attr-dict `:` `(` type($lhs) `,` type($rhs) `)` `->` type($result)
   }];
 }
 

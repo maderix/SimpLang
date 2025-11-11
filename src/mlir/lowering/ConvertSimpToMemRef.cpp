@@ -298,7 +298,66 @@ struct TensorCreateOpLowering : public OpConversionPattern<simp::TensorCreateOp>
   }
 };
 
+/// Convert simp.tensor_from_array to memref.reinterpret_cast
+/// Zero-copy conversion from flat array to multi-dimensional tensor
+struct TensorFromArrayOpLowering : public OpConversionPattern<simp::TensorFromArrayOp> {
+  using OpConversionPattern<simp::TensorFromArrayOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      simp::TensorFromArrayOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+
+    auto loc = op.getLoc();
+
+    // Get operands: array and offset
+    auto operands = adaptor.getOperands();
+    Value arrayMemref = operands[0];  // memref<?xT>
+    Value offsetI64 = operands[1];    // i64 offset
+    auto arrayType = arrayMemref.getType().cast<MemRefType>();
+
+    // Get the target tensor type
+    auto tensorType = op.getType().cast<simp::SimpTensorType>();
+    auto targetShape = tensorType.getShape();
+    auto elemType = tensorType.getElementType();
+
+    // Verify array has enough elements
+    // Total elements = product of all dimensions
+    int64_t totalElements = 1;
+    for (int64_t dim : targetShape) {
+      totalElements *= dim;
+    }
+
+    // Create the target memref type with static shape
+    auto targetMemRefType = MemRefType::get(targetShape, elemType);
+
+    // Convert offset from i64 to index type
+    Value offset = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), offsetI64);
+
+    // Build sizes for the target shape
+    SmallVector<Value, 4> sizes;
+    for (int64_t dim : targetShape) {
+      sizes.push_back(rewriter.create<arith::ConstantIndexOp>(loc, dim));
+    }
+
+    // Build strides for row-major layout
+    SmallVector<Value, 4> strides;
+    int64_t stride = 1;
+    for (int i = targetShape.size() - 1; i >= 0; --i) {
+      strides.insert(strides.begin(), rewriter.create<arith::ConstantIndexOp>(loc, stride));
+      stride *= targetShape[i];
+    }
+
+    // Create reinterpret_cast with offset - this stores offset in descriptor field [2]
+    // The memref.load lowering should extract and use this offset
+    rewriter.replaceOpWithNewOp<memref::ReinterpretCastOp>(
+        op, targetMemRefType, arrayMemref, offset, sizes, strides);
+
+    return success();
+  }
+};
+
 /// Convert simp.tensor_get to memref.load
+/// For tensors created from tensor_from_array with offset, we need to handle offset manually
 struct TensorGetOpLowering : public OpConversionPattern<simp::TensorGetOp> {
   using OpConversionPattern<simp::TensorGetOp>::OpConversionPattern;
 
@@ -306,6 +365,7 @@ struct TensorGetOpLowering : public OpConversionPattern<simp::TensorGetOp> {
       simp::TensorGetOp op, OpAdaptor adaptor,
       ConversionPatternRewriter &rewriter) const override {
 
+    auto loc = op.getLoc();
     // adaptor.getOperands() returns [tensor, index0, index1, ...]
     auto operands = adaptor.getOperands();
     Value memref = operands[0];  // tensor (now memref)
@@ -315,14 +375,53 @@ struct TensorGetOpLowering : public OpConversionPattern<simp::TensorGetOp> {
     for (size_t i = 1; i < operands.size(); ++i) {
       Value index = operands[i];
       if (!index.getType().isIndex()) {
-        index = rewriter.create<arith::IndexCastOp>(
-            op.getLoc(), rewriter.getIndexType(), index);
+        index = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), index);
       }
       indices.push_back(index);
     }
 
-    // Replace with memref.load
-    rewriter.replaceOpWithNewOp<memref::LoadOp>(op, memref, indices);
+    // Check if memref came from reinterpret_cast (which may have non-zero offset)
+    // If so, we need to convert to linearized index and add base offset
+    if (auto reinterpretOp = memref.getDefiningOp<memref::ReinterpretCastOp>()) {
+      // Get operands: source, offset, sizes..., strides...
+      auto reinterpretOperands = reinterpretOp->getOperands();
+      Value sourceMemref = reinterpretOperands[0];  // source memref
+      Value baseOffset = reinterpretOperands[1];    // offset
+
+      // Get the static strides from the operation
+      auto staticStrides = reinterpretOp.static_strides();
+      int64_t rank = staticStrides.size();
+
+      // Calculate linearized index from multi-dimensional indices
+      Value linearIndex = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+
+      for (int64_t i = 0; i < rank; ++i) {
+        // Get stride value (either from operand or constant)
+        Value stride;
+        auto strideAttr = staticStrides[i].cast<IntegerAttr>();
+        int64_t strideVal = strideAttr.getInt();
+
+        if (strideVal == ShapedType::kDynamicStrideOrOffset) {
+          // Dynamic stride - get from operand
+          stride = reinterpretOperands[2 + rank + i];
+        } else {
+          // Static stride - create constant
+          stride = rewriter.create<arith::ConstantIndexOp>(loc, strideVal);
+        }
+
+        Value product = rewriter.create<arith::MulIOp>(loc, indices[i], stride);
+        linearIndex = rewriter.create<arith::AddIOp>(loc, linearIndex, product);
+      }
+
+      // Add base offset to linearized index
+      linearIndex = rewriter.create<arith::AddIOp>(loc, linearIndex, baseOffset);
+
+      // Load from source memref using linearized index
+      rewriter.replaceOpWithNewOp<memref::LoadOp>(op, sourceMemref, ValueRange{linearIndex});
+    } else {
+      // Normal case: just use memref.load with multi-dimensional indices
+      rewriter.replaceOpWithNewOp<memref::LoadOp>(op, memref, indices);
+    }
 
     return success();
   }
@@ -337,6 +436,7 @@ struct TensorSetOpLowering : public OpConversionPattern<simp::TensorSetOp> {
       simp::TensorSetOp op, OpAdaptor adaptor,
       ConversionPatternRewriter &rewriter) const override {
 
+    auto loc = op.getLoc();
     // adaptor.getOperands() returns [tensor, index0, index1, ..., value]
     auto operands = adaptor.getOperands();
     Value memref = operands[0];  // tensor (now memref)
@@ -347,8 +447,7 @@ struct TensorSetOpLowering : public OpConversionPattern<simp::TensorSetOp> {
     for (size_t i = 1; i < operands.size() - 1; ++i) {
       Value index = operands[i];
       if (!index.getType().isIndex()) {
-        index = rewriter.create<arith::IndexCastOp>(
-            op.getLoc(), rewriter.getIndexType(), index);
+        index = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), index);
       }
       indices.push_back(index);
     }
@@ -357,11 +456,47 @@ struct TensorSetOpLowering : public OpConversionPattern<simp::TensorSetOp> {
     auto memrefType = memref.getType().cast<MemRefType>();
     Type expectedType = memrefType.getElementType();
     if (value.getType() != expectedType) {
-      value = promoteType(value, expectedType, rewriter, op.getLoc());
+      value = promoteType(value, expectedType, rewriter, loc);
     }
 
-    // Create memref.store (mutates the memref)
-    rewriter.create<memref::StoreOp>(op.getLoc(), value, memref, indices);
+    // Check if memref came from reinterpret_cast (same offset handling as tensor_get)
+    if (auto reinterpretOp = memref.getDefiningOp<memref::ReinterpretCastOp>()) {
+      // Get operands: source, offset, sizes..., strides...
+      auto reinterpretOperands = reinterpretOp->getOperands();
+      Value sourceMemref = reinterpretOperands[0];  // source memref
+      Value baseOffset = reinterpretOperands[1];    // offset
+
+      // Get the static strides from the operation
+      auto staticStrides = reinterpretOp.static_strides();
+      int64_t rank = staticStrides.size();
+
+      // Calculate linearized index from multi-dimensional indices
+      Value linearIndex = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+
+      for (int64_t i = 0; i < rank; ++i) {
+        Value stride;
+        auto strideAttr = staticStrides[i].cast<IntegerAttr>();
+        int64_t strideVal = strideAttr.getInt();
+
+        if (strideVal == ShapedType::kDynamicStrideOrOffset) {
+          stride = reinterpretOperands[2 + rank + i];
+        } else {
+          stride = rewriter.create<arith::ConstantIndexOp>(loc, strideVal);
+        }
+
+        Value product = rewriter.create<arith::MulIOp>(loc, indices[i], stride);
+        linearIndex = rewriter.create<arith::AddIOp>(loc, linearIndex, product);
+      }
+
+      // Add base offset to linearized index
+      linearIndex = rewriter.create<arith::AddIOp>(loc, linearIndex, baseOffset);
+
+      // Store to source memref using linearized index
+      rewriter.create<memref::StoreOp>(loc, value, sourceMemref, ValueRange{linearIndex});
+    } else {
+      // Normal case: use memref.store with multi-dimensional indices
+      rewriter.create<memref::StoreOp>(loc, value, memref, indices);
+    }
 
     // Tensor set returns the "updated" tensor, but in memref semantics,
     // we just return the same memref (since it's mutated in-place)
@@ -3054,6 +3189,7 @@ struct ConvertSimpToMemRefPass
         ArrayGetOpLowering,
         ArraySetOpLowering,
         TensorCreateOpLowering,
+        TensorFromArrayOpLowering,
         TensorGetOpLowering,
         TensorSetOpLowering,
         TensorAddOpLowering,

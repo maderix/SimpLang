@@ -41,6 +41,7 @@ add_mlir_dialect_library(simp_dialect
   simp_ops.cpp
   mlir_codegen.cpp
   mlir_pipeline.cpp
+  cache_info.cpp
   lowering/ConvertSimpToMemRef.cpp
   lowering/ConvertSimpToLinalg.cpp
   lowering/SpecializeShapes.cpp
@@ -76,6 +77,11 @@ add_mlir_dialect_library(simp_dialect
   MLIRMemRefToLLVM
   MLIRSCFToStandard
   MLIRStandardToLLVM
+  MLIROpenMP                      # OpenMP dialect
+  MLIRSCFToOpenMP                 # SCF to OpenMP conversion
+  MLIROpenMPToLLVM                # OpenMP to LLVM conversion
+  MLIROpenMPToLLVMIRTranslation   # OpenMP LLVM IR translation
+  MLIRReconcileUnrealizedCasts
   MLIRTargetLLVMIRExport
   MLIRLLVMToLLVMIRTranslation
   mlir_c_runner_utils
