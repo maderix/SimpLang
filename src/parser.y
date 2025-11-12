@@ -3,6 +3,7 @@
     #include <string>
     #include <vector>
     #include <iostream>
+    #include <cmath>
     #include "ast/ast.hpp"
     #include "simd_backend.hpp"
 
@@ -28,6 +29,29 @@
         }
         return result;
     }
+
+    // Helper to detect if expression list is an initializer list
+    // Heuristic: >4 elements OR any non-literal = initializer list
+    // Otherwise assume dimensions (for multi-dimensional arrays like [2,3,4])
+    bool isInitializerList(const std::vector<ExprAST*>& exprs) {
+        if (exprs.empty()) return false;
+
+        // More than 4 elements = definitely initializer (arrays >4D are rare)
+        if (exprs.size() > 4) return true;
+
+        // Check if any expression is not a simple number literal
+        for (const auto* expr : exprs) {
+            if (expr->getKind() != ASTKind::NumberExpr) {
+                // Non-literal expressions = initializer list
+                return true;
+            }
+        }
+
+        // All are number literals with <= 4 elements
+        // Assume dimensions unless proven otherwise (would need type context)
+        // Default to dimensions for backward compatibility
+        return false;
+    }
 %}
 
 %define parse.trace
@@ -44,6 +68,7 @@
     VariableDeclarationAST *var_decl;
     std::vector<ExprAST*> *exprvec;
     std::vector<VariableDeclarationAST*> *varvec;
+    std::vector<int> *intvec;
     std::string *string;
     SliceTypeAST *slice_type;
     TypeInfo *type_info;
@@ -52,7 +77,7 @@
 
 %token <string> TIDENTIFIER TINTEGER TFLOAT TINTLIT TSTRING
 %token TCEQ TCNE TCLE TCGE TARROW
-%token TVAR TFUNC TIF TELSE TWHILE TRETURN TINCLUDE TIMPORT
+%token TVAR TFUNC TIF TELSE TWHILE TRETURN TINCLUDE TIMPORT TAS
 %token TF16 TBF16 TF32 TF64 TI8 TI16 TI32 TI64 TU8 TU16 TU32 TU64 TBOOL TVOID
 %token TSSE TAVX    /* Vector creation tokens */
 %token TSIMD TAUTO TAVX512 TNEON TSVE
@@ -75,6 +100,7 @@
 %left '+' '-'
 %left '*' '/' TOK_MOD
 %left UNARY_MINUS  /* Add precedence for unary minus */
+%left TAS  /* Type cast operator */
 
 %type <block> program stmts block
 %type <stmt> stmt func_decl if_stmt while_stmt return_stmt include_stmt
@@ -82,9 +108,10 @@
 %type <var_expr> ident
 %type <exprvec> call_args expr_list multi_index
 %type <varvec> func_decl_args
+%type <intvec> dimension_list
 %type <var_decl> var_decl param_decl
 %type <slice_type> slice_type
-%type <type_info> type_spec array_type
+%type <type_info> type_spec array_type tensor_type
 %type <expr> array_expr array_access
 %type <token> simd_option
 
@@ -117,6 +144,7 @@ expr : expr '+' expr   { $$ = new BinaryExprAST(static_cast<BinaryOp>('+'), make
      | expr TOK_LSHIFT expr { $$ = new BinaryExprAST(BinaryOp::OpLShift, makeUnique($1), makeUnique($3)); }
      | expr TOK_RSHIFT expr { $$ = new BinaryExprAST(BinaryOp::OpRShift, makeUnique($1), makeUnique($3)); }
      | '-' expr %prec UNARY_MINUS { $$ = new UnaryExprAST(OpNeg, makeUnique($2)); }
+     | expr TAS type_spec { $$ = new CastExprAST(makeUnique($1), std::unique_ptr<TypeInfo>($3)); }
      | expr TCEQ expr  { $$ = new BinaryExprAST(BinaryOp::OpEQ, makeUnique($1), makeUnique($3)); }
      | expr TCNE expr  { $$ = new BinaryExprAST(BinaryOp::OpNE, makeUnique($1), makeUnique($3)); }
      | expr '<' expr   { $$ = new BinaryExprAST(BinaryOp::OpLT, makeUnique($1), makeUnique($3)); }
@@ -178,19 +206,45 @@ block : TLBRACE stmts TRBRACE { $$ = $2; }
 var_decl : TVAR TIDENTIFIER { $$ = new VariableDeclarationAST(*$2, nullptr); }
          | TVAR TIDENTIFIER '=' expr { $$ = new VariableDeclarationAST(*$2, $4); }
          | TVAR TIDENTIFIER slice_type { $$ = new VariableDeclarationAST(*$2, nullptr, nullptr, $3); }
-         | TVAR TIDENTIFIER slice_type '=' slice_expr 
+         | TVAR TIDENTIFIER slice_type '=' slice_expr
            { $$ = new VariableDeclarationAST(*$2, $5, nullptr, $3); }
-         | type_spec TIDENTIFIER { 
-             $$ = new VariableDeclarationAST(*$2, nullptr, std::unique_ptr<TypeInfo>($1)); 
+         | type_spec TIDENTIFIER {
+             $$ = new VariableDeclarationAST(*$2, nullptr, std::unique_ptr<TypeInfo>($1));
            }
-         | type_spec TIDENTIFIER '=' expr { 
-             $$ = new VariableDeclarationAST(*$2, $4, std::unique_ptr<TypeInfo>($1)); 
+         | type_spec TIDENTIFIER '=' expr {
+             $$ = new VariableDeclarationAST(*$2, $4, std::unique_ptr<TypeInfo>($1));
            }
-         | array_type TIDENTIFIER { 
-             $$ = new VariableDeclarationAST(*$2, nullptr, std::unique_ptr<TypeInfo>($1)); 
+         | array_type TIDENTIFIER {
+             $$ = new VariableDeclarationAST(*$2, nullptr, std::unique_ptr<TypeInfo>($1));
            }
-         | array_type TIDENTIFIER '=' expr { 
-             $$ = new VariableDeclarationAST(*$2, $4, std::unique_ptr<TypeInfo>($1)); 
+         | array_type TIDENTIFIER '=' expr {
+             $$ = new VariableDeclarationAST(*$2, $4, std::unique_ptr<TypeInfo>($1));
+           }
+         | array_type TIDENTIFIER '=' TLBRACE expr_list TRBRACE {
+             ArrayTypeInfo* arrType = static_cast<ArrayTypeInfo*>($1);
+             auto initExpr = new ArrayCreateExprAST(
+                 std::unique_ptr<TypeInfo>(arrType->elementType->clone()),
+                 makeUniqueVector(*$5),
+                 true  // isInitializerList = true
+             );
+             $$ = new VariableDeclarationAST(*$2, initExpr, std::unique_ptr<TypeInfo>($1));
+             delete $5;
+           }
+         | tensor_type TIDENTIFIER {
+             $$ = new VariableDeclarationAST(*$2, nullptr, std::unique_ptr<TypeInfo>($1));
+           }
+         | tensor_type TIDENTIFIER '=' expr {
+             $$ = new VariableDeclarationAST(*$2, $4, std::unique_ptr<TypeInfo>($1));
+           }
+         | tensor_type TIDENTIFIER '=' TLBRACE expr_list TRBRACE {
+             TensorTypeInfo* tensorType = static_cast<TensorTypeInfo*>($1);
+             auto initExpr = new ArrayCreateExprAST(
+                 std::unique_ptr<TypeInfo>(tensorType->elementType->clone()),
+                 makeUniqueVector(*$5),
+                 true  // isInitializerList = true
+             );
+             $$ = new VariableDeclarationAST(*$2, initExpr, std::unique_ptr<TypeInfo>($1));
+             delete $5;
            }
          ;
 
@@ -215,13 +269,31 @@ type_spec : TF16 { $$ = new TypeInfo(TypeKind::F16); }
          | TVAR { $$ = new TypeInfo(TypeKind::Dynamic); }
          ;
 
-array_type : type_spec TLBRACKET TINTEGER TRBRACKET { 
-             $$ = new ArrayTypeInfo(std::unique_ptr<TypeInfo>($1), atoi($3->c_str())); 
+array_type : type_spec TLBRACKET TINTEGER TRBRACKET {
+             $$ = new ArrayTypeInfo(std::unique_ptr<TypeInfo>($1), atoi($3->c_str()));
            }
-           | type_spec TLBRACKET TRBRACKET { 
+           | type_spec TLBRACKET TRBRACKET {
              $$ = new ArrayTypeInfo(std::unique_ptr<TypeInfo>($1), -1); /* Dynamic size */
            }
            ;
+
+tensor_type : type_spec '<' dimension_list '>' {
+             $$ = new TensorTypeInfo(std::unique_ptr<TypeInfo>($1), *$3);
+             delete $3;
+            }
+            ;
+
+dimension_list : TINTEGER {
+                $$ = new std::vector<int>();
+                $$->push_back(atoi($1->c_str()));
+                delete $1;
+               }
+               | dimension_list TCOMMA TINTEGER {
+                $1->push_back(atoi($3->c_str()));
+                $$ = $1;
+                delete $3;
+               }
+               ;
 
 expr_list 
     : expr { 
@@ -245,7 +317,8 @@ slice_expr : TMAKE TLPAREN slice_type TCOMMA expr TRPAREN
 //           ;
 
 array_expr : TARRAY '<' type_spec '>' TLPAREN TLBRACKET expr_list TRBRACKET TRPAREN {
-             $$ = new ArrayCreateExprAST(std::unique_ptr<TypeInfo>($3), makeUniqueVector(*$7));
+             bool isInit = isInitializerList(*$7);
+             $$ = new ArrayCreateExprAST(std::unique_ptr<TypeInfo>($3), makeUniqueVector(*$7), isInit);
            }
            | TARRAY '<' type_spec TCOMMA TSIMD '=' simd_option '>' TLPAREN TLBRACKET expr_list TRBRACKET TRPAREN {
              $$ = new SIMDArrayCreateExprAST(std::unique_ptr<TypeInfo>($3), (SIMDType)$7, makeUniqueVector(*$11));
@@ -312,11 +385,14 @@ matmul_expr : TMATMUL TLPAREN expr TCOMMA expr TCOMMA expr TCOMMA expr TCOMMA ex
 
 param_decl : TVAR TIDENTIFIER { $$ = new VariableDeclarationAST(*$2, nullptr); }
            | TVAR TIDENTIFIER slice_type { $$ = new VariableDeclarationAST(*$2, nullptr, nullptr, $3); }
-           | type_spec TIDENTIFIER { 
-               $$ = new VariableDeclarationAST(*$2, nullptr, std::unique_ptr<TypeInfo>($1)); 
+           | type_spec TIDENTIFIER {
+               $$ = new VariableDeclarationAST(*$2, nullptr, std::unique_ptr<TypeInfo>($1));
              }
-           | array_type TIDENTIFIER { 
-               $$ = new VariableDeclarationAST(*$2, nullptr, std::unique_ptr<TypeInfo>($1)); 
+           | array_type TIDENTIFIER {
+               $$ = new VariableDeclarationAST(*$2, nullptr, std::unique_ptr<TypeInfo>($1));
+             }
+           | tensor_type TIDENTIFIER {
+               $$ = new VariableDeclarationAST(*$2, nullptr, std::unique_ptr<TypeInfo>($1));
              }
            ;
 

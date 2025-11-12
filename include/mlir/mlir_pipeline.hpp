@@ -82,6 +82,12 @@ public:
   /// Set tile size for matmul optimization (default: 8)
   void setTileSize(int size) { tileSize = size; }
 
+  /// Enable hierarchical (multi-level) tiling for cache optimization
+  void setEnableHierarchicalTiling(bool enable) { enableHierarchicalTiling = enable; }
+
+  /// Enable/disable OpenMP parallelization (multi-threading)
+  void setEnableOpenMP(bool enable) { enableOpenMP = enable; }
+
   /// Enable/disable IR dumping at each pipeline stage
   void setDumpIntermediateIR(bool enable) { dumpIntermediateIR = enable; }
 
@@ -98,6 +104,12 @@ private:
 
   /// Tile size for matmul optimization (default: 8)
   int tileSize = 8;
+
+  /// Enable hierarchical tiling (default: false for compatibility)
+  bool enableHierarchicalTiling = false;
+
+  /// Enable OpenMP parallelization (default: false)
+  bool enableOpenMP = false;
 
   /// Enable IR dumping at each pipeline stage (default: false)
   bool dumpIntermediateIR = false;

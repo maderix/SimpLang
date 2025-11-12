@@ -23,6 +23,7 @@
 #include "mlir/tensor_layout.hpp"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/raw_ostream.h"
+#include "logger.hpp"
 #include <cmath>
 
 // Include full AST definitions here in the .cpp file
@@ -413,9 +414,40 @@ mlir::Type MLIRCodeGenContext::convertType(const std::string& simpType) {
 
   // Handle tensor types: "tensor<10x20xf64>" or "tensor<?x?xf32>"
   if (simpType.find("tensor<") == 0) {
-    // Parse shape and element type
-    // For now, return a placeholder - full parsing in future
-    return mlir::simp::SimpTensorType::get(&mlirContext, {-1}, builder.getF32Type());
+    // Parse shape and element type from "tensor<2x3x4xf32>"
+    size_t start = simpType.find('<') + 1;
+    size_t end = simpType.find('>');
+    std::string shapeAndType = simpType.substr(start, end - start);
+
+    // Split by 'x' to get dimensions and element type
+    std::vector<int64_t> shape;
+    std::string elemTypeStr;
+    size_t pos = 0;
+    size_t lastX = 0;
+
+    while ((pos = shapeAndType.find('x', lastX)) != std::string::npos) {
+      std::string token = shapeAndType.substr(lastX, pos - lastX);
+      // Try to parse as integer (dimension)
+      char* endptr;
+      long dim = std::strtol(token.c_str(), &endptr, 10);
+      if (*endptr == '\0') {
+        // Successfully parsed as integer
+        shape.push_back(dim);
+      } else {
+        // Not a number, must be the element type
+        elemTypeStr = shapeAndType.substr(lastX);
+        break;
+      }
+      lastX = pos + 1;
+    }
+
+    // If we didn't find element type yet, the remainder is the element type
+    if (elemTypeStr.empty()) {
+      elemTypeStr = shapeAndType.substr(lastX);
+    }
+
+    mlir::Type elemType = convertType(elemTypeStr);
+    return mlir::simp::SimpTensorType::get(&mlirContext, shape, elemType);
   }
 
   // Default to f32 (matches existing SimpLang compiler)
@@ -428,12 +460,12 @@ mlir::Type MLIRCodeGenContext::getMLIRType(TypeInfo* typeInfo) {
     return builder.getF32Type(); // Default (matches existing compiler)
   }
 
-  // For non-array types, use TypeConverter directly for better performance
-  if (!typeInfo->isArray()) {
+  // For non-array/tensor types, use TypeConverter directly for better performance
+  if (!typeInfo->isArray() && !typeInfo->isTensor()) {
     return TypeConverter::toMLIRType(typeInfo->kind, builder);
   }
 
-  // Use the toString() method from TypeInfo for arrays
+  // Use the toString() method from TypeInfo for arrays and tensors
   return convertType(typeInfo->toString());
 }
 
@@ -514,9 +546,20 @@ mlir::ModuleOp MLIRCodeGenContext::lowerAST(BlockAST* programBlock) {
 
 mlir::Value MLIRCodeGenContext::lowerExpression(ExprAST* expr) {
   if (!expr) {
-    llvm::errs() << "Error: Null expression\n";
+    LOG_ERROR("Null expression encountered in lowerExpression");
     return nullptr;
   }
+
+  // Log expression type for debugging
+  static const char* kindNames[] = {
+    "NumberExpr", "VariableExpr", "AssignmentExpr", "BinaryExpr", "UnaryExpr",
+    "CallExpr", "ArrayCreateExpr", "ArrayAccessExpr", "ArrayStoreExpr",
+    "MatMulExpr", "CastExpr", "TensorGetExpr", "TensorSetExpr"
+  };
+  int kindIndex = static_cast<int>(expr->getKind());
+  LOG_DEBUG("Lowering expression: ",
+            (kindIndex >= 0 && kindIndex < 13 ? kindNames[kindIndex] : "Unknown"),
+            " (kind=", kindIndex, ")");
 
   // Use getKind() for type identification without RTTI
   switch (expr->getKind()) {
@@ -549,6 +592,9 @@ mlir::Value MLIRCodeGenContext::lowerExpression(ExprAST* expr) {
 
     case ASTKind::MatMulExpr:
       return lowerMatMul(static_cast<MatMulExprAST*>(expr));
+
+    case ASTKind::CastExpr:
+      return lowerCast(static_cast<CastExprAST*>(expr));
 
     default:
       llvm::errs() << "Error: Unsupported expression kind " << static_cast<int>(expr->getKind())
@@ -618,7 +664,28 @@ mlir::Value MLIRCodeGenContext::lowerBinaryOp(BinaryExprAST* binOp) {
     return nullptr;
   }
 
-  // Apply C++ style type promotion for arithmetic operations
+  // Check if operands are tensors - use tensor-specific operations
+  auto lhsTensorType = lhs.getType().dyn_cast<mlir::simp::SimpTensorType>();
+  auto rhsTensorType = rhs.getType().dyn_cast<mlir::simp::SimpTensorType>();
+
+  if (lhsTensorType && rhsTensorType) {
+    // Both operands are tensors - use tensor element-wise operations
+    switch (binOp->getOp()) {
+      case OpAdd:
+        return builder.create<mlir::simp::TensorAddOp>(loc, lhsTensorType, lhs, rhs);
+      case OpSub:
+        return builder.create<mlir::simp::TensorSubOp>(loc, lhsTensorType, lhs, rhs);
+      case OpMul:
+        return builder.create<mlir::simp::TensorMulOp>(loc, lhsTensorType, lhs, rhs);
+      case OpDiv:
+        return builder.create<mlir::simp::TensorDivOp>(loc, lhsTensorType, lhs, rhs);
+      default:
+        llvm::errs() << "Error: Unsupported binary operation on tensors\n";
+        return nullptr;
+    }
+  }
+
+  // Apply C++ style type promotion for arithmetic operations on scalars
   auto promoted = applyUsualArithmeticConversions(lhs, rhs, builder, loc);
   lhs = promoted.first;
   rhs = promoted.second;
@@ -764,44 +831,124 @@ mlir::Value MLIRCodeGenContext::lowerUnaryOp(UnaryExprAST* unaryOp) {
   }
 }
 
-mlir::Value MLIRCodeGenContext::lowerArrayCreate(ArrayCreateExprAST* arrayCreate) {
+mlir::Value MLIRCodeGenContext::lowerCast(CastExprAST* castExpr) {
   auto loc = getUnknownLocation();
 
-  // Get dimensions
-  const auto& dimensions = arrayCreate->getDimensions();
-  if (dimensions.empty()) {
-    llvm::errs() << "Error: Array must have at least one dimension\n";
+  // Lower the expression being cast
+  mlir::Value value = lowerExpression(castExpr->getExpr());
+  if (!value) {
+    llvm::errs() << "Error: Failed to lower cast expression\n";
     return nullptr;
   }
 
-  // Lower all dimensions
-  mlir::SmallVector<mlir::Value> dimValues;
-  for (const auto& dim : dimensions) {
-    mlir::Value dimValue = lowerExpression(dim.get());
-    if (!dimValue) {
-      llvm::errs() << "Error: Failed to lower array dimension\n";
-      return nullptr;
+  // Get the target type
+  mlir::Type targetType = getMLIRType(castExpr->getTargetType());
+  mlir::Type sourceType = value.getType();
+
+  // If types are already the same, no cast needed
+  if (sourceType == targetType) {
+    return value;
+  }
+
+  // Handle conversions
+  bool sourceIsInt = sourceType.isInteger(64);
+  bool targetIsInt = targetType.isInteger(64);
+  bool sourceIsFloat = sourceType.isa<mlir::Float32Type>() || sourceType.isa<mlir::Float64Type>();
+  bool targetIsFloat = targetType.isa<mlir::Float32Type>() || targetType.isa<mlir::Float64Type>();
+
+  // int -> float
+  if (sourceIsInt && targetIsFloat) {
+    return builder.create<mlir::arith::SIToFPOp>(loc, targetType, value);
+  }
+
+  // float -> int
+  if (sourceIsFloat && targetIsInt) {
+    return builder.create<mlir::arith::FPToSIOp>(loc, targetType, value);
+  }
+
+  // float -> float (different precision)
+  if (sourceIsFloat && targetIsFloat) {
+    if (sourceType.getIntOrFloatBitWidth() < targetType.getIntOrFloatBitWidth()) {
+      // Extend
+      return builder.create<mlir::arith::ExtFOp>(loc, targetType, value);
+    } else {
+      // Truncate
+      return builder.create<mlir::arith::TruncFOp>(loc, targetType, value);
     }
-    dimValues.push_back(dimValue);
   }
 
-  // Calculate total size as product of all dimensions
-  // size = d0 * d1 * d2 * ... * dn
-  mlir::Value totalSize = dimValues[0];
-  for (size_t i = 1; i < dimValues.size(); ++i) {
-    totalSize = builder.create<mlir::arith::MulIOp>(loc, totalSize, dimValues[i]);
+  // int -> int (different width)
+  if (sourceIsInt && targetIsInt) {
+    if (sourceType.getIntOrFloatBitWidth() < targetType.getIntOrFloatBitWidth()) {
+      // Extend (signed)
+      return builder.create<mlir::arith::ExtSIOp>(loc, targetType, value);
+    } else {
+      // Truncate
+      return builder.create<mlir::arith::TruncIOp>(loc, targetType, value);
+    }
   }
 
-  // Get element type
+  llvm::errs() << "Error: Unsupported cast from " << sourceType << " to " << targetType << "\n";
+  return nullptr;
+}
+
+mlir::Value MLIRCodeGenContext::lowerArrayCreate(ArrayCreateExprAST* arrayCreate) {
+  auto loc = getUnknownLocation();
+
+  const auto& expressions = arrayCreate->getDimensions();
+  if (expressions.empty()) {
+    llvm::errs() << "Error: Array must have at least one dimension or initializer\n";
+    return nullptr;
+  }
+
   mlir::Type elemType = getMLIRType(arrayCreate->getElementType());
-
-  // Create the array type (still 1D, but stores total size)
   mlir::Type arrayType = mlir::simp::ArrayType::get(&mlirContext, elemType);
 
-  // Create simp.array_create operation with total flattened size
-  // Note: Dimensions are tracked by variable name in lowerDeclaration,
-  // not by SSA value here, since the value changes when assigned to variables
-  return builder.create<mlir::simp::ArrayCreateOp>(loc, arrayType, totalSize);
+  // Check if this is an initializer list
+  if (arrayCreate->isInitializer()) {
+    // Create array with size = number of initializer values
+    mlir::Value size = builder.create<mlir::simp::ConstantOp>(
+        loc, builder.getI64Type(),
+        builder.getI64IntegerAttr(expressions.size()));
+
+    mlir::Value array = builder.create<mlir::simp::ArrayCreateOp>(loc, arrayType, size);
+
+    // Initialize each element
+    for (size_t i = 0; i < expressions.size(); ++i) {
+      mlir::Value value = lowerExpression(expressions[i].get());
+      if (!value) {
+        llvm::errs() << "Error: Failed to lower initializer expression\n";
+        return nullptr;
+      }
+
+      mlir::Value index = builder.create<mlir::simp::ConstantOp>(
+          loc, builder.getI64Type(), builder.getI64IntegerAttr(i));
+
+      array = builder.create<mlir::simp::ArraySetOp>(loc, arrayType, array, index, value);
+    }
+
+    return array;
+  } else {
+    // Dimension specification: lower all dimensions
+    mlir::SmallVector<mlir::Value> dimValues;
+    for (const auto& dim : expressions) {
+      mlir::Value dimValue = lowerExpression(dim.get());
+      if (!dimValue) {
+        llvm::errs() << "Error: Failed to lower array dimension\n";
+        return nullptr;
+      }
+      dimValues.push_back(dimValue);
+    }
+
+    // Calculate total size as product of all dimensions
+    mlir::Value totalSize = dimValues[0];
+    for (size_t i = 1; i < dimValues.size(); ++i) {
+      totalSize = builder.create<mlir::arith::MulIOp>(loc, totalSize, dimValues[i]);
+    }
+
+    // Create simp.array_create operation with total flattened size
+    return builder.create<mlir::simp::ArrayCreateOp>(loc, arrayType, totalSize);
+  }
 }
 
 mlir::Value MLIRCodeGenContext::lowerArrayAccess(ArrayAccessExprAST* arrayAccess,
@@ -818,7 +965,7 @@ mlir::Value MLIRCodeGenContext::lowerArrayAccess(ArrayAccessExprAST* arrayAccess
   // Lower all index expressions
   const auto& indices = arrayAccess->getIndices();
   if (indices.empty()) {
-    llvm::errs() << "Error: Array access requires at least one index\n";
+    llvm::errs() << "Error: Array/tensor access requires at least one index\n";
     return nullptr;
   }
 
@@ -826,10 +973,24 @@ mlir::Value MLIRCodeGenContext::lowerArrayAccess(ArrayAccessExprAST* arrayAccess
   for (const auto& idx : indices) {
     mlir::Value indexValue = lowerExpression(idx.get());
     if (!indexValue) {
-      llvm::errs() << "Error: Failed to lower array index\n";
+      llvm::errs() << "Error: Failed to lower index\n";
       return nullptr;
     }
     indexValues.push_back(indexValue);
+  }
+
+  // Check if this is a tensor type (static multi-dimensional)
+  auto tensorType = array.getType().dyn_cast<mlir::simp::SimpTensorType>();
+  if (tensorType) {
+    // For tensors, use multi-dimensional indexing directly
+    if (newValue) {
+      // tensor_set: returns updated tensor
+      return builder.create<mlir::simp::TensorSetOp>(loc, tensorType, array, indexValues, newValue);
+    } else {
+      // tensor_get: returns element
+      mlir::Type elemType = tensorType.getElementType();
+      return builder.create<mlir::simp::TensorGetOp>(loc, elemType, array, indexValues);
+    }
   }
 
   // Compute flattened index for multi-dimensional arrays
@@ -978,6 +1139,27 @@ mlir::Value MLIRCodeGenContext::lowerArrayStore(ArrayStoreExprAST* arrayStore) {
     indexValues.push_back(indexValue);
   }
 
+  // Lower the value to store
+  mlir::Value value = lowerExpression(arrayStore->getValue());
+  if (!value) {
+    llvm::errs() << "Error: Failed to lower store value\n";
+    return nullptr;
+  }
+
+  // Check if this is a tensor type
+  auto tensorType = array.getType().dyn_cast<mlir::simp::SimpTensorType>();
+  if (tensorType) {
+    // For tensors, use tensor_set with multi-dimensional indices
+    mlir::Value result = builder.create<mlir::simp::TensorSetOp>(loc, tensorType, array, indexValues, value);
+
+    // Update symbol table if this is a variable assignment
+    if (!varName.empty()) {
+      declareVariable(varName, result);
+    }
+
+    return result;
+  }
+
   // Compute flattened index for multi-dimensional arrays
   mlir::Value index;
   if (indexValues.size() == 1) {
@@ -1017,14 +1199,7 @@ mlir::Value MLIRCodeGenContext::lowerArrayStore(ArrayStoreExprAST* arrayStore) {
     index = builder.create<mlir::arith::IndexCastOp>(loc, builder.getI64Type(), index);
   }
 
-  // Lower the value to store
-  mlir::Value value = lowerExpression(arrayStore->getValue());
-  if (!value) {
-    llvm::errs() << "Error: Failed to lower value in array store\n";
-    return nullptr;
-  }
-
-  // Cast value to match array element type if needed
+  // Cast value to match array element type if needed (value already lowered above)
   auto arrayType = array.getType().dyn_cast<mlir::simp::ArrayType>();
   if (arrayType) {
     mlir::Type elemType = arrayType.getElementType();
@@ -1402,6 +1577,628 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
     return builder.create<math::SinOp>(loc, args[0]);
   }
 
+  // Handle tensor reduction builtins
+  if (calleeName == "tensor_sum") {
+    if (args.size() < 1 || args.size() > 2) {
+      llvm::errs() << "Error: tensor_sum requires 1-2 arguments (tensor, [axis]), got " << args.size() << "\n";
+      return nullptr;
+    }
+    mlir::Value tensor = args[0];
+    auto tensorType = tensor.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    if (!tensorType) {
+      llvm::errs() << "Error: tensor_sum requires a tensor argument\n";
+      return nullptr;
+    }
+
+    mlir::Value axisValue = nullptr;
+    mlir::Type resultType;
+
+    if (args.size() == 2) {
+      axisValue = args[1];
+
+      // Extract axis value to compute result shape
+      int64_t axis = -1;
+      if (auto simpConstOp = axisValue.getDefiningOp<mlir::simp::ConstantOp>()) {
+        if (auto intAttr = simpConstOp.value().dyn_cast<mlir::IntegerAttr>()) {
+          axis = intAttr.getInt();
+        }
+      } else if (auto arithConstOp = axisValue.getDefiningOp<mlir::arith::ConstantOp>()) {
+        if (auto intAttr = arithConstOp.getValue().dyn_cast<mlir::IntegerAttr>()) {
+          axis = intAttr.getInt();
+        }
+      }
+
+      if (axis != -1) {
+        auto shape = tensorType.getShape();
+        int64_t rank = shape.size();
+        if (axis < 0) axis += rank;
+
+        // Compute result shape (remove axis dimension)
+        llvm::SmallVector<int64_t, 4> resultShape;
+        for (int64_t i = 0; i < rank; i++) {
+          if (i != axis) {
+            resultShape.push_back(shape[i]);
+          }
+        }
+        resultType = mlir::simp::SimpTensorType::get(builder.getContext(), resultShape, tensorType.getElementType());
+      } else {
+        // Couldn't extract axis, use input type as placeholder
+        resultType = tensorType;
+      }
+    } else {
+      // No axis: result is scalar
+      resultType = tensorType.getElementType();
+    }
+
+    return builder.create<mlir::simp::TensorSumOp>(loc, resultType, tensor, axisValue);
+  }
+
+  // Helper lambda to compute result type for axis reductions
+  auto computeAxisReductionType = [&](mlir::simp::SimpTensorType tensorType, mlir::Value axisValue, mlir::Type elemType) -> mlir::Type {
+    if (!axisValue) return elemType;  // No axis: scalar result
+
+    // Extract axis to compute result shape
+    int64_t axis = -1;
+    if (auto simpConstOp = axisValue.getDefiningOp<mlir::simp::ConstantOp>()) {
+      if (auto intAttr = simpConstOp.value().dyn_cast<mlir::IntegerAttr>()) {
+        axis = intAttr.getInt();
+      }
+    } else if (auto arithConstOp = axisValue.getDefiningOp<mlir::arith::ConstantOp>()) {
+      if (auto intAttr = arithConstOp.getValue().dyn_cast<mlir::IntegerAttr>()) {
+        axis = intAttr.getInt();
+      }
+    }
+
+    if (axis != -1) {
+      auto shape = tensorType.getShape();
+      int64_t rank = shape.size();
+      if (axis < 0) axis += rank;
+
+      llvm::SmallVector<int64_t, 4> resultShape;
+      for (int64_t i = 0; i < rank; i++) {
+        if (i != axis) {
+          resultShape.push_back(shape[i]);
+        }
+      }
+      return mlir::simp::SimpTensorType::get(builder.getContext(), resultShape, elemType);
+    }
+    return tensorType;  // Fallback
+  };
+
+  if (calleeName == "tensor_mean") {
+    if (args.size() < 1 || args.size() > 2) {
+      llvm::errs() << "Error: tensor_mean requires 1-2 arguments (tensor, [axis]), got " << args.size() << "\n";
+      return nullptr;
+    }
+    mlir::Value tensor = args[0];
+    auto tensorType = tensor.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    if (!tensorType) {
+      llvm::errs() << "Error: tensor_mean requires a tensor argument\n";
+      return nullptr;
+    }
+
+    mlir::Value axisValue = (args.size() == 2) ? args[1] : nullptr;
+    mlir::Type resultType = computeAxisReductionType(tensorType, axisValue, tensorType.getElementType());
+    return builder.create<mlir::simp::TensorMeanOp>(loc, resultType, tensor, axisValue);
+  }
+
+  if (calleeName == "tensor_max") {
+    if (args.size() < 1 || args.size() > 2) {
+      llvm::errs() << "Error: tensor_max requires 1-2 arguments (tensor, [axis]), got " << args.size() << "\n";
+      return nullptr;
+    }
+    mlir::Value tensor = args[0];
+    auto tensorType = tensor.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    if (!tensorType) {
+      llvm::errs() << "Error: tensor_max requires a tensor argument\n";
+      return nullptr;
+    }
+
+    mlir::Value axisValue = (args.size() == 2) ? args[1] : nullptr;
+    mlir::Type resultType = computeAxisReductionType(tensorType, axisValue, tensorType.getElementType());
+    return builder.create<mlir::simp::TensorMaxOp>(loc, resultType, tensor, axisValue);
+  }
+
+  if (calleeName == "tensor_min") {
+    if (args.size() < 1 || args.size() > 2) {
+      llvm::errs() << "Error: tensor_min requires 1-2 arguments (tensor, [axis]), got " << args.size() << "\n";
+      return nullptr;
+    }
+    mlir::Value tensor = args[0];
+    auto tensorType = tensor.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    if (!tensorType) {
+      llvm::errs() << "Error: tensor_min requires a tensor argument\n";
+      return nullptr;
+    }
+
+    mlir::Value axisValue = (args.size() == 2) ? args[1] : nullptr;
+    mlir::Type resultType = computeAxisReductionType(tensorType, axisValue, tensorType.getElementType());
+    return builder.create<mlir::simp::TensorMinOp>(loc, resultType, tensor, axisValue);
+  }
+
+  if (calleeName == "tensor_argmax") {
+    if (args.size() < 1 || args.size() > 2) {
+      llvm::errs() << "Error: tensor_argmax requires 1-2 arguments (tensor, [axis]), got " << args.size() << "\n";
+      return nullptr;
+    }
+    mlir::Value tensor = args[0];
+    auto tensorType = tensor.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    if (!tensorType) {
+      llvm::errs() << "Error: tensor_argmax requires a tensor argument\n";
+      return nullptr;
+    }
+
+    mlir::Value axisValue = (args.size() == 2) ? args[1] : nullptr;
+    mlir::Type resultType = computeAxisReductionType(tensorType, axisValue, builder.getI64Type());
+    return builder.create<mlir::simp::TensorArgmaxOp>(loc, resultType, tensor, axisValue);
+  }
+
+  // tensor_reshape: tensor_reshape(tensor, dim0, dim1, ...)
+  if (calleeName == "tensor_reshape") {
+    if (args.size() < 2) {
+      llvm::errs() << "Error: tensor_reshape requires at least 2 arguments (tensor, new_dims...), got " << args.size() << "\n";
+      return nullptr;
+    }
+
+    mlir::Value tensor = args[0];
+    auto tensorType = tensor.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    if (!tensorType) {
+      llvm::errs() << "Error: tensor_reshape requires a tensor argument\n";
+      return nullptr;
+    }
+
+    // Extract new shape from arguments
+    llvm::SmallVector<int64_t, 4> newShape;
+    for (size_t i = 1; i < args.size(); i++) {
+      if (auto constOp = args[i].getDefiningOp<mlir::simp::ConstantOp>()) {
+        if (auto intAttr = constOp.value().dyn_cast<mlir::IntegerAttr>()) {
+          newShape.push_back(intAttr.getInt());
+        }
+      } else if (auto arithConstOp = args[i].getDefiningOp<mlir::arith::ConstantOp>()) {
+        if (auto intAttr = arithConstOp.getValue().dyn_cast<mlir::IntegerAttr>()) {
+          newShape.push_back(intAttr.getInt());
+        }
+      }
+    }
+
+    if (newShape.empty()) {
+      llvm::errs() << "Error: tensor_reshape requires constant dimension arguments\n";
+      return nullptr;
+    }
+
+    mlir::Type resultType = mlir::simp::SimpTensorType::get(builder.getContext(), newShape, tensorType.getElementType());
+    llvm::SmallVector<mlir::Value, 4> shapeArgs(args.begin() + 1, args.end());
+    return builder.create<mlir::simp::TensorReshapeOp>(loc, resultType, tensor, shapeArgs);
+  }
+
+  // tensor_transpose: tensor_transpose(tensor) or tensor_transpose(tensor, perm0, perm1, ...)
+  if (calleeName == "tensor_transpose") {
+    if (args.size() < 1) {
+      llvm::errs() << "Error: tensor_transpose requires at least 1 argument (tensor, [perm...]), got " << args.size() << "\n";
+      return nullptr;
+    }
+
+    mlir::Value tensor = args[0];
+    auto tensorType = tensor.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    if (!tensorType) {
+      llvm::errs() << "Error: tensor_transpose requires a tensor argument\n";
+      return nullptr;
+    }
+
+    auto shape = tensorType.getShape();
+    int64_t rank = shape.size();
+
+    // Compute result shape
+    llvm::SmallVector<int64_t, 4> resultShape;
+    if (args.size() == 1 && rank == 2) {
+      // Default 2D transpose: swap dims
+      resultShape = {shape[1], shape[0]};
+    } else if (args.size() > 1) {
+      // Extract permutation from args
+      llvm::SmallVector<int64_t, 4> perm;
+      for (size_t i = 1; i < args.size(); i++) {
+        if (auto constOp = args[i].getDefiningOp<mlir::simp::ConstantOp>()) {
+          if (auto intAttr = constOp.value().dyn_cast<mlir::IntegerAttr>()) {
+            perm.push_back(intAttr.getInt());
+          }
+        } else if (auto arithConstOp = args[i].getDefiningOp<mlir::arith::ConstantOp>()) {
+          if (auto intAttr = arithConstOp.getValue().dyn_cast<mlir::IntegerAttr>()) {
+            perm.push_back(intAttr.getInt());
+          }
+        }
+      }
+
+      if (perm.size() != rank) {
+        llvm::errs() << "Error: transpose permutation size must match tensor rank\n";
+        return nullptr;
+      }
+
+      // Compute result shape from permutation
+      for (auto p : perm) {
+        resultShape.push_back(shape[p]);
+      }
+    } else {
+      llvm::errs() << "Error: tensor_transpose requires permutation for rank > 2\n";
+      return nullptr;
+    }
+
+    mlir::Type resultType = mlir::simp::SimpTensorType::get(builder.getContext(), resultShape, tensorType.getElementType());
+    llvm::SmallVector<mlir::Value, 4> permArgs(args.begin() + 1, args.end());
+    return builder.create<mlir::simp::TensorTransposeOp>(loc, resultType, tensor, permArgs);
+  }
+
+  // tensor_slice: tensor_slice(tensor, start0, end0, start1, end1, ...)
+  if (calleeName == "tensor_slice") {
+    if (args.size() < 1) {
+      llvm::errs() << "Error: tensor_slice requires arguments (tensor, indices...), got " << args.size() << "\n";
+      return nullptr;
+    }
+
+    mlir::Value tensor = args[0];
+    auto tensorType = tensor.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    if (!tensorType) {
+      llvm::errs() << "Error: tensor_slice requires a tensor argument\n";
+      return nullptr;
+    }
+
+    auto shape = tensorType.getShape();
+    int64_t rank = shape.size();
+
+    if (args.size() != 1 + 2 * rank) {
+      llvm::errs() << "Error: tensor_slice requires 2 indices per dimension (start, end), got " << (args.size() - 1) << " for rank " << rank << "\n";
+      return nullptr;
+    }
+
+    // Extract start/end pairs and compute result shape
+    llvm::SmallVector<int64_t, 4> resultShape;
+    for (int64_t i = 0; i < rank; i++) {
+      int64_t start = -1, end = -1;
+
+      if (auto constOp = args[1 + i * 2].getDefiningOp<mlir::simp::ConstantOp>()) {
+        if (auto intAttr = constOp.value().dyn_cast<mlir::IntegerAttr>()) {
+          start = intAttr.getInt();
+        }
+      } else if (auto arithConstOp = args[1 + i * 2].getDefiningOp<mlir::arith::ConstantOp>()) {
+        if (auto intAttr = arithConstOp.getValue().dyn_cast<mlir::IntegerAttr>()) {
+          start = intAttr.getInt();
+        }
+      }
+
+      if (auto constOp = args[1 + i * 2 + 1].getDefiningOp<mlir::simp::ConstantOp>()) {
+        if (auto intAttr = constOp.value().dyn_cast<mlir::IntegerAttr>()) {
+          end = intAttr.getInt();
+        }
+      } else if (auto arithConstOp = args[1 + i * 2 + 1].getDefiningOp<mlir::arith::ConstantOp>()) {
+        if (auto intAttr = arithConstOp.getValue().dyn_cast<mlir::IntegerAttr>()) {
+          end = intAttr.getInt();
+        }
+      }
+
+      if (start == -1 || end == -1) {
+        llvm::errs() << "Error: tensor_slice requires constant start/end indices\n";
+        return nullptr;
+      }
+
+      resultShape.push_back(end - start);
+    }
+
+    mlir::Type resultType = mlir::simp::SimpTensorType::get(builder.getContext(), resultShape, tensorType.getElementType());
+    llvm::SmallVector<mlir::Value, 4> indexArgs(args.begin() + 1, args.end());
+    return builder.create<mlir::simp::TensorSliceOp>(loc, resultType, tensor, indexArgs);
+  }
+
+  // tensor_gather: tensor_gather(source, indices, [axis])
+  if (calleeName == "tensor_gather") {
+    if (args.size() < 2 || args.size() > 3) {
+      llvm::errs() << "Error: tensor_gather requires 2-3 arguments (source, indices, [axis]), got " << args.size() << "\n";
+      return nullptr;
+    }
+
+    mlir::Value source = args[0];
+    mlir::Value indices = args[1];
+    auto sourceType = source.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    auto indicesType = indices.getType().dyn_cast<mlir::simp::SimpTensorType>();
+
+    if (!sourceType) {
+      llvm::errs() << "Error: tensor_gather requires tensor source argument\n";
+      return nullptr;
+    }
+    if (!indicesType) {
+      llvm::errs() << "Error: tensor_gather requires tensor indices argument\n";
+      return nullptr;
+    }
+
+    // Validate indices tensor is 1D and i64
+    if (indicesType.getShape().size() != 1) {
+      llvm::errs() << "Error: tensor_gather indices must be 1D tensor, got rank " << indicesType.getShape().size() << "\n";
+      return nullptr;
+    }
+
+    // Get axis (default 0)
+    int64_t axis = 0;
+    mlir::Value axisVal = nullptr;
+    if (args.size() == 3) {
+      if (auto constOp = args[2].getDefiningOp<mlir::simp::ConstantOp>()) {
+        if (auto intAttr = constOp.value().dyn_cast<mlir::IntegerAttr>()) {
+          axis = intAttr.getInt();
+        }
+      } else if (auto arithConstOp = args[2].getDefiningOp<mlir::arith::ConstantOp>()) {
+        if (auto intAttr = arithConstOp.getValue().dyn_cast<mlir::IntegerAttr>()) {
+          axis = intAttr.getInt();
+        }
+      }
+      axisVal = args[2];
+    }
+
+    auto sourceShape = sourceType.getShape();
+    int64_t rank = sourceShape.size();
+    int64_t numIndices = indicesType.getShape()[0];
+
+    // Handle negative axis
+    if (axis < 0) {
+      axis += rank;
+    }
+    if (axis < 0 || axis >= rank) {
+      llvm::errs() << "Error: tensor_gather axis " << axis << " out of bounds for rank " << rank << "\n";
+      return nullptr;
+    }
+
+    // Compute result shape: replace axis dimension with numIndices
+    llvm::SmallVector<int64_t, 4> resultShape;
+    for (int64_t i = 0; i < rank; i++) {
+      if (i == axis) {
+        resultShape.push_back(numIndices);
+      } else {
+        resultShape.push_back(sourceShape[i]);
+      }
+    }
+
+    mlir::Type resultType = mlir::simp::SimpTensorType::get(builder.getContext(), resultShape, sourceType.getElementType());
+
+    if (axisVal) {
+      return builder.create<mlir::simp::TensorGatherOp>(loc, resultType, source, indices, axisVal);
+    } else {
+      return builder.create<mlir::simp::TensorGatherOp>(loc, resultType, source, indices, nullptr);
+    }
+  }
+
+  // tensor_scatter: tensor_scatter(dst, indices, values, [axis])
+  if (calleeName == "tensor_scatter") {
+    if (args.size() < 3 || args.size() > 4) {
+      llvm::errs() << "Error: tensor_scatter requires 3-4 arguments (dst, indices, values, [axis]), got " << args.size() << "\n";
+      return nullptr;
+    }
+
+    mlir::Value dst = args[0];
+    mlir::Value indices = args[1];
+    mlir::Value values = args[2];
+    auto dstType = dst.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    auto indicesType = indices.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    auto valuesType = values.getType().dyn_cast<mlir::simp::SimpTensorType>();
+
+    if (!dstType) {
+      llvm::errs() << "Error: tensor_scatter requires tensor dst argument\n";
+      return nullptr;
+    }
+    if (!indicesType) {
+      llvm::errs() << "Error: tensor_scatter requires tensor indices argument\n";
+      return nullptr;
+    }
+    if (!valuesType) {
+      llvm::errs() << "Error: tensor_scatter requires tensor values argument\n";
+      return nullptr;
+    }
+
+    // Validate indices tensor is 1D
+    if (indicesType.getShape().size() != 1) {
+      llvm::errs() << "Error: tensor_scatter indices must be 1D tensor, got rank " << indicesType.getShape().size() << "\n";
+      return nullptr;
+    }
+
+    // Get axis (default 0)
+    int64_t axis = 0;
+    mlir::Value axisVal = nullptr;
+    if (args.size() == 4) {
+      if (auto constOp = args[3].getDefiningOp<mlir::simp::ConstantOp>()) {
+        if (auto intAttr = constOp.value().dyn_cast<mlir::IntegerAttr>()) {
+          axis = intAttr.getInt();
+        }
+      } else if (auto arithConstOp = args[3].getDefiningOp<mlir::arith::ConstantOp>()) {
+        if (auto intAttr = arithConstOp.getValue().dyn_cast<mlir::IntegerAttr>()) {
+          axis = intAttr.getInt();
+        }
+      }
+      axisVal = args[3];
+    }
+
+    auto dstShape = dstType.getShape();
+    int64_t rank = dstShape.size();
+    int64_t numIndices = indicesType.getShape()[0];
+
+    // Handle negative axis
+    if (axis < 0) {
+      axis += rank;
+    }
+    if (axis < 0 || axis >= rank) {
+      llvm::errs() << "Error: tensor_scatter axis " << axis << " out of bounds for rank " << rank << "\n";
+      return nullptr;
+    }
+
+    // Validate values shape matches dst shape with axis replaced by numIndices
+    auto valuesShape = valuesType.getShape();
+    if (valuesShape.size() != rank) {
+      llvm::errs() << "Error: tensor_scatter values rank must match dst rank\n";
+      return nullptr;
+    }
+    for (int64_t i = 0; i < rank; i++) {
+      if (i == axis) {
+        if (valuesShape[i] != numIndices) {
+          llvm::errs() << "Error: tensor_scatter values axis dimension must match indices length\n";
+          return nullptr;
+        }
+      } else {
+        if (valuesShape[i] != dstShape[i]) {
+          llvm::errs() << "Error: tensor_scatter values shape must match dst shape (except axis)\n";
+          return nullptr;
+        }
+      }
+    }
+
+    // Result type is same as dst
+    mlir::Type resultType = dstType;
+
+    if (axisVal) {
+      return builder.create<mlir::simp::TensorScatterOp>(loc, resultType, dst, indices, values, axisVal);
+    } else {
+      return builder.create<mlir::simp::TensorScatterOp>(loc, resultType, dst, indices, values, nullptr);
+    }
+  }
+
+  // tensor_from_array is handled specially in variable declarations
+  // See lowerVariableDeclaration for the implementation
+  if (calleeName == "tensor_from_array") {
+    llvm::errs() << "Error: tensor_from_array must be used in a tensor variable declaration\n";
+    llvm::errs() << "  Example: f32<32000, 768> embedding = tensor_from_array(array);\n";
+    return nullptr;
+  }
+
+  // tensor_matmul: tensor_matmul(lhs, rhs)
+  if (calleeName == "tensor_matmul") {
+    if (args.size() != 2) {
+      llvm::errs() << "Error: tensor_matmul requires 2 arguments (lhs, rhs), got " << args.size() << "\n";
+      return nullptr;
+    }
+
+    mlir::Value lhs = args[0];
+    mlir::Value rhs = args[1];
+    auto lhsType = lhs.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    auto rhsType = rhs.getType().dyn_cast<mlir::simp::SimpTensorType>();
+
+    if (!lhsType) {
+      llvm::errs() << "Error: tensor_matmul requires tensor lhs argument\n";
+      return nullptr;
+    }
+    if (!rhsType) {
+      llvm::errs() << "Error: tensor_matmul requires tensor rhs argument\n";
+      return nullptr;
+    }
+
+    auto lhsShape = lhsType.getShape();
+    auto rhsShape = rhsType.getShape();
+    int64_t lhsRank = lhsShape.size();
+    int64_t rhsRank = rhsShape.size();
+
+    // Compute result shape based on input dimensions
+    llvm::SmallVector<int64_t, 4> resultShape;
+
+    if (lhsRank == 2 && rhsRank == 2) {
+      // 2D matmul: (M, K) × (K, N) → (M, N)
+      int64_t M = lhsShape[0];
+      int64_t K_lhs = lhsShape[1];
+      int64_t K_rhs = rhsShape[0];
+      int64_t N = rhsShape[1];
+
+      if (K_lhs != K_rhs) {
+        llvm::errs() << "Error: tensor_matmul dimension mismatch: lhs K=" << K_lhs << ", rhs K=" << K_rhs << "\n";
+        return nullptr;
+      }
+
+      resultShape = {M, N};
+
+    } else if (lhsRank == 3 && rhsRank == 3) {
+      // Batched 3D matmul: (B, M, K) × (B, K, N) → (B, M, N)
+      int64_t B_lhs = lhsShape[0];
+      int64_t B_rhs = rhsShape[0];
+      int64_t M = lhsShape[1];
+      int64_t K_lhs = lhsShape[2];
+      int64_t K_rhs = rhsShape[1];
+      int64_t N = rhsShape[2];
+
+      if (B_lhs != B_rhs) {
+        llvm::errs() << "Error: tensor_matmul batch size mismatch\n";
+        return nullptr;
+      }
+      if (K_lhs != K_rhs) {
+        llvm::errs() << "Error: tensor_matmul dimension mismatch\n";
+        return nullptr;
+      }
+
+      resultShape = {B_lhs, M, N};
+
+    } else if (lhsRank == 4 && rhsRank == 2) {
+      // 4D NHWC matmul: (N, H, W, C_in) × (C_out, C_in) → (N, H, W, C_out)
+      int64_t N = lhsShape[0];
+      int64_t H = lhsShape[1];
+      int64_t W = lhsShape[2];
+      int64_t C_in_lhs = lhsShape[3];
+      int64_t C_out = rhsShape[0];
+      int64_t C_in_rhs = rhsShape[1];
+
+      if (C_in_lhs != C_in_rhs) {
+        llvm::errs() << "Error: tensor_matmul channel mismatch\n";
+        return nullptr;
+      }
+
+      resultShape = {N, H, W, C_out};
+
+    } else {
+      llvm::errs() << "Error: tensor_matmul unsupported dimensions: lhs rank=" << lhsRank
+                   << ", rhs rank=" << rhsRank << "\n";
+      return nullptr;
+    }
+
+    // For i8/i16 inputs, promote result type to i32 to prevent overflow
+    mlir::Type elemType = lhsType.getElementType();
+    if (elemType.isInteger(8) || elemType.isInteger(16)) {
+      elemType = builder.getI32Type();
+    }
+
+    mlir::Type resultType = mlir::simp::SimpTensorType::get(
+        builder.getContext(), resultShape, elemType);
+
+    return builder.create<mlir::simp::TensorMatMulOp>(loc, resultType, lhs, rhs, /*layout=*/nullptr);
+  }
+
+  // tensor_dot: tensor_dot(lhs, rhs)
+  if (calleeName == "tensor_dot") {
+    if (args.size() != 2) {
+      llvm::errs() << "Error: tensor_dot requires 2 arguments (lhs, rhs), got " << args.size() << "\n";
+      return nullptr;
+    }
+
+    mlir::Value lhs = args[0];
+    mlir::Value rhs = args[1];
+    auto lhsType = lhs.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    auto rhsType = rhs.getType().dyn_cast<mlir::simp::SimpTensorType>();
+
+    if (!lhsType) {
+      llvm::errs() << "Error: tensor_dot requires tensor lhs argument\n";
+      return nullptr;
+    }
+    if (!rhsType) {
+      llvm::errs() << "Error: tensor_dot requires tensor rhs argument\n";
+      return nullptr;
+    }
+
+    auto lhsShape = lhsType.getShape();
+    auto rhsShape = rhsType.getShape();
+
+    if (lhsShape.size() != 1 || rhsShape.size() != 1) {
+      llvm::errs() << "Error: tensor_dot requires 1D tensors\n";
+      return nullptr;
+    }
+
+    if (lhsShape[0] != rhsShape[0]) {
+      llvm::errs() << "Error: tensor_dot dimension mismatch: " << lhsShape[0] << " vs " << rhsShape[0] << "\n";
+      return nullptr;
+    }
+
+    // Result is a scalar of the same element type
+    mlir::Type resultType = lhsType.getElementType();
+
+    return builder.create<mlir::simp::TensorDotOp>(loc, resultType, lhs, rhs);
+  }
+
   // Look up user-defined functions in the module
   mlir::FuncOp callee = module.lookupSymbol<mlir::FuncOp>(calleeName);
   if (!callee) {
@@ -1470,6 +2267,10 @@ mlir::LogicalResult MLIRCodeGenContext::lowerStatement(StmtAST* stmt) {
 }
 
 mlir::LogicalResult MLIRCodeGenContext::lowerDeclaration(VariableDeclarationAST* decl) {
+  LOG_DEBUG("Lowering variable declaration: ", decl->getName(),
+            ", staticType=", (decl->isStaticallyTyped() ? "yes" : "no"),
+            ", isTensor=", (decl->isStaticallyTyped() && decl->getStaticType()->isTensor() ? "yes" : "no"));
+
   // Check if this is an array creation - we need to track dimensions
   ExprAST* initExpr = decl->getAssignmentExpr();
   ArrayCreateExprAST* arrayCreate = nullptr;
@@ -1477,9 +2278,160 @@ mlir::LogicalResult MLIRCodeGenContext::lowerDeclaration(VariableDeclarationAST*
     arrayCreate = static_cast<ArrayCreateExprAST*>(initExpr);
   }
 
-  // Lower the initialization expression
-  mlir::Value initValue = lowerExpression(decl->getAssignmentExpr());
-  if (!initValue) {
+  mlir::Value initValue;
+
+  // Handle uninitialized tensor declarations (auto-create tensor)
+  if (!initExpr && decl->isStaticallyTyped() && decl->getStaticType()->isTensor()) {
+    auto loc = getUnknownLocation();
+    auto tensorType = getMLIRType(const_cast<TypeInfo*>(decl->getStaticType()));
+    initValue = builder.create<mlir::simp::TensorCreateOp>(loc, tensorType);
+  }
+  // Handle tensor declarations with initializer lists (e.g., f32<2,3> a = {1.0, 2.0, ...})
+  else if (arrayCreate && decl->isStaticallyTyped() && decl->getStaticType()->isTensor()) {
+    auto loc = getUnknownLocation();
+    // Get the full tensor type from the declaration
+    auto tensorType = getMLIRType(const_cast<TypeInfo*>(decl->getStaticType()));
+    auto simpTensorType = tensorType.dyn_cast<mlir::simp::SimpTensorType>();
+
+    if (!simpTensorType) {
+      llvm::errs() << "Error: Expected SimpTensorType for tensor declaration\n";
+      return mlir::failure();
+    }
+
+    // Create a tensor with the proper type
+    initValue = builder.create<mlir::simp::TensorCreateOp>(loc, tensorType);
+
+    // Now populate it with values from the initializer list
+    auto& values = arrayCreate->getDimensions();  // dimensionExprs contains the initializer values
+    auto shape = simpTensorType.getShape();
+
+    // Compute total number of elements
+    int64_t totalElements = 1;
+    for (int64_t dim : shape) {
+      totalElements *= dim;
+    }
+
+    if (values.size() != static_cast<size_t>(totalElements)) {
+      llvm::errs() << "Error: Initializer list size (" << values.size()
+                   << ") doesn't match tensor size (" << totalElements << ")\n";
+      return mlir::failure();
+    }
+
+    // Directly create tensor with the proper shape (not via array conversion)
+    initValue = builder.create<mlir::simp::TensorCreateOp>(loc, tensorType);
+
+    // Initialize tensor elements with values from initializer list
+    // Store values using multi-dimensional indices (row-major order)
+    for (size_t flatIdx = 0; flatIdx < values.size(); ++flatIdx) {
+      // Compute multi-dimensional indices from flat index
+      // For shape [D0, D1, D2], index i maps to:
+      // i0 = i / (D1*D2), i1 = (i % (D1*D2)) / D2, i2 = i % D2
+      llvm::SmallVector<mlir::Value, 4> indices;
+      size_t remainingIndex = flatIdx;
+      size_t stride = totalElements;
+
+      for (size_t dim = 0; dim < shape.size(); ++dim) {
+        stride /= shape[dim];
+        size_t dimIndex = remainingIndex / stride;
+        remainingIndex %= stride;
+
+        // Create index value as i64 (TensorSetOp expects i64 indices)
+        mlir::Value idxValue = builder.create<mlir::arith::ConstantIntOp>(
+            loc, dimIndex, builder.getI64Type());
+        indices.push_back(idxValue);
+      }
+
+      // Lower the initializer value expression
+      mlir::Value valueToStore = lowerExpression(values[flatIdx].get());
+      if (!valueToStore) {
+        llvm::errs() << "Error: Failed to lower initializer value at index " << flatIdx << "\n";
+        return mlir::failure();
+      }
+
+      // Store value into tensor using TensorSetOp (functional, returns new tensor)
+      initValue = builder.create<mlir::simp::TensorSetOp>(loc, tensorType, initValue, indices, valueToStore);
+    }
+  }
+  // Handle tensor_from_array conversion
+  else if (initExpr && initExpr->getKind() == ASTKind::CallExpr &&
+           decl->isStaticallyTyped() && decl->getStaticType()->isTensor()) {
+    auto* funcCall = static_cast<CallExprAST*>(initExpr);
+    if (funcCall->getCallee() == "tensor_from_array") {
+      LOG_DEBUG("Processing tensor_from_array for variable: ", decl->getName());
+
+      auto loc = getUnknownLocation();
+      auto tensorType = getMLIRType(const_cast<TypeInfo*>(decl->getStaticType()));
+
+      // Get arguments: tensor_from_array(array) or tensor_from_array(array, offset)
+      size_t numArgs = funcCall->getArguments().size();
+      LOG_DEBUG("tensor_from_array has ", numArgs, " arguments");
+      if (numArgs != 1 && numArgs != 2) {
+        llvm::errs() << "Error: tensor_from_array requires 1 or 2 arguments (array, [offset])\n";
+        return mlir::failure();
+      }
+
+      mlir::Value arrayArg = lowerExpression(funcCall->getArguments()[0]);
+      if (!arrayArg) {
+        llvm::errs() << "Error: Failed to lower tensor_from_array array argument\n";
+        return mlir::failure();
+      }
+
+      // Get offset (default to 0 if not provided)
+      mlir::Value offsetArg;
+      if (numArgs == 2) {
+        offsetArg = lowerExpression(funcCall->getArguments()[1]);
+        if (!offsetArg) {
+          llvm::errs() << "Error: Failed to lower tensor_from_array offset argument\n";
+          return mlir::failure();
+        }
+      } else {
+        // Default offset = 0
+        offsetArg = builder.create<mlir::arith::ConstantIntOp>(loc, 0, builder.getI64Type());
+      }
+
+      // Create tensor_from_array operation with explicit result type
+      initValue = builder.create<mlir::simp::TensorFromArrayOp>(loc, tensorType, arrayArg, offsetArg);
+    } else {
+      // Regular function call
+      initValue = lowerExpression(decl->getAssignmentExpr());
+      if (!initValue) {
+        return mlir::failure();
+      }
+    }
+  }
+  // Lower the initialization expression if provided
+  else if (initExpr) {
+    LOG_DEBUG("Lowering init expression for: ", decl->getName());
+    initValue = lowerExpression(initExpr);
+    if (!initValue) {
+      LOG_ERROR("Failed to lower init expression for: ", decl->getName());
+      return mlir::failure();
+    }
+  }
+  // Handle uninitialized arrays (allocate memory)
+  else if (decl->isStaticallyTyped() && decl->getStaticType()->isArray()) {
+    LOG_DEBUG("Creating uninitialized array for: ", decl->getName());
+    auto loc = getUnknownLocation();
+    auto arrayType = getMLIRType(const_cast<TypeInfo*>(decl->getStaticType()));
+
+    // Cast to ArrayTypeInfo to get size
+    auto* arrayTypeInfo = static_cast<const ArrayTypeInfo*>(decl->getStaticType());
+    int arraySize = arrayTypeInfo->size;
+
+    if (arraySize <= 0) {
+      LOG_ERROR("Array ", decl->getName(), " has invalid size: ", arraySize);
+      return mlir::failure();
+    }
+
+    // Create size constant
+    mlir::Value sizeValue = builder.create<mlir::simp::ConstantOp>(
+        loc, builder.getI64Type(), builder.getI64IntegerAttr(arraySize));
+
+    // For arrays, create an ArrayCreateOp with the declared size
+    initValue = builder.create<mlir::simp::ArrayCreateOp>(loc, arrayType, sizeValue);
+  }
+  else {
+    LOG_ERROR("No initialization for variable: ", decl->getName());
     return mlir::failure();
   }
 
@@ -1496,6 +2448,20 @@ mlir::LogicalResult MLIRCodeGenContext::lowerDeclaration(VariableDeclarationAST*
       }
     }
     if (dimValues.size() > 1) {
+      arrayDimensions[decl->getName()] = dimValues;
+    }
+  }
+
+  // Also track dimensions for tensor types (from tensor operations)
+  auto tensorType = initValue.getType().dyn_cast<mlir::simp::SimpTensorType>();
+  if (tensorType) {
+    auto shape = tensorType.getShape();
+    if (shape.size() > 1) {
+      llvm::SmallVector<mlir::Value, 4> dimValues;
+      auto loc = getUnknownLocation();
+      for (int64_t dim : shape) {
+        dimValues.push_back(builder.create<mlir::arith::ConstantIndexOp>(loc, dim));
+      }
       arrayDimensions[decl->getName()] = dimValues;
     }
   }
