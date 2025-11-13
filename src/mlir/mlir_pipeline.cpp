@@ -93,50 +93,40 @@ bool MLIRCompilationPipeline::runPasses() {
     return false;
   }
 
+  // Use a SINGLE PassManager for all phases (instead of creating multiple)
+  // This is more efficient and follows MLIR best practices
+  mlir::PassManager pm(module.getContext());
+
+  // Enable IR printing between passes if requested
+  if (dumpIntermediateIR) {
+    pm.enableIRPrinting();
+  }
+
   // Phase 1: Lower Simp dialect to MemRef + Arith + Linalg
   // This converts all Simp operations, including matmul → linalg.matmul
-  if (!runSimpToMemRefLowering()) {
-    llvm::errs() << "Error: Failed to lower Simp to MemRef + Linalg\n";
+  buildPhase1_SimpLowering(pm);
+
+  // Phase 2: Linalg optimization (tiling, vectorization, loop lowering)
+  buildPhase2_LinalgOptimization(pm);
+
+  // Phase 2.5: Buffer management (hoisting, deallocation)
+  buildPhase2_5_BufferManagement(pm);
+
+  // Phase 3: Lower to LLVM dialect (vector, control flow, arithmetic)
+  buildPhase3_LLVMDialectLowering(pm);
+
+  // Run all passes in a single pipeline
+  if (failed(pm.run(module))) {
+    llvm::errs() << "Error: MLIR compilation pipeline failed\n";
+    module.dump();
     return false;
-  }
-  if (dumpIntermediateIR) {
-    llvm::outs() << "\n=== After Phase 1: Simp → MemRef + Linalg ===\n";
-    module.print(llvm::outs());
-    llvm::outs() << "\n";
   }
 
-  // Phase 2: Lower Linalg ops to SCF loops
-  if (!runLinalgToLoopsLowering()) {
-    llvm::errs() << "Error: Failed to lower Linalg to loops\n";
+  // Apply vector lowering patterns and LLVM dialect conversion
+  // This must be done AFTER the pass pipeline since it requires direct module access
+  if (!applyLLVMDialectConversion()) {
+    llvm::errs() << "Error: LLVM dialect conversion failed\n";
     return false;
-  }
-  if (dumpIntermediateIR) {
-    llvm::outs() << "\n=== After Phase 2: Linalg → SCF Loops ===\n";
-    module.print(llvm::outs());
-    llvm::outs() << "\n";
-  }
-
-  // Phase 2.5: Insert buffer deallocations
-  // This adds memref.dealloc operations after the last use of allocated buffers
-  if (!runBufferDeallocationPass()) {
-    llvm::errs() << "Error: Failed to insert buffer deallocations\n";
-    return false;
-  }
-  if (dumpIntermediateIR) {
-    llvm::outs() << "\n=== After Phase 2.5: Buffer Deallocation ===\n";
-    module.print(llvm::outs());
-    llvm::outs() << "\n";
-  }
-
-  // Phase 3: Lower MemRef + Arith + SCF + Standard to LLVM dialect
-  if (!runToLLVMDialectLowering()) {
-    llvm::errs() << "Error: Failed to lower to LLVM dialect\n";
-    return false;
-  }
-  if (dumpIntermediateIR) {
-    llvm::outs() << "\n=== After Phase 3: → LLVM Dialect ===\n";
-    module.print(llvm::outs());
-    llvm::outs() << "\n";
   }
 
   // Verify the final module
@@ -180,31 +170,16 @@ std::unique_ptr<llvm::Module> MLIRCompilationPipeline::translateToLLVMIR(
 // Phase 1: Simp → MemRef + Arith + Linalg
 //===----------------------------------------------------------------------===//
 
-bool MLIRCompilationPipeline::runSimpToMemRefLowering() {
-  mlir::PassManager pm(module.getContext());
-
+void MLIRCompilationPipeline::buildPhase1_SimpLowering(mlir::OpPassManager& pm) {
   // Add our custom Simp → MemRef + Arith + Linalg lowering pass
   pm.addPass(mlir::simp::createConvertSimpToMemRefPass());
-
-  // Run the pass
-  if (failed(pm.run(module))) {
-    llvm::errs() << "Error: ConvertSimpToMemRef pass failed\n";
-    module.dump();
-    return false;
-  }
-
-  return true;
 }
 
 //===----------------------------------------------------------------------===//
 // Phase 2: Linalg Vectorization and Loop Lowering
 //===----------------------------------------------------------------------===//
 
-bool MLIRCompilationPipeline::runLinalgToLoopsLowering() {
-  mlir::PassManager pm(module.getContext());
-
-  // Enable IR printing for debugging (comment out for production)
-  // pm.enableIRPrinting();
+void MLIRCompilationPipeline::buildPhase2_LinalgOptimization(mlir::OpPassManager& pm) {
 
   // OPTIONAL: Tile matmul BEFORE vectorization (enabled by default)
   // Vectorizing large matrices (768x768) directly causes 1.6GB memory usage and hangs
@@ -314,24 +289,13 @@ bool MLIRCompilationPipeline::runLinalgToLoopsLowering() {
 
   // Apply loop unrolling for better ILP
   pm.addNestedPass<mlir::FuncOp>(mlir::createLoopUnrollPass(4));
-
-  // Run the passes
-  if (failed(pm.run(module))) {
-    llvm::errs() << "Error: Linalg vectorization/lowering pass failed\n";
-    module.dump();
-    return false;
-  }
-
-  return true;
 }
 
 //===----------------------------------------------------------------------===//
 // Phase 2.5: Insert Buffer Deallocations
 //===----------------------------------------------------------------------===//
 
-bool MLIRCompilationPipeline::runBufferDeallocationPass() {
-  mlir::PassManager pm(module.getContext());
-
+void MLIRCompilationPipeline::buildPhase2_5_BufferManagement(mlir::OpPassManager& pm) {
   // First, hoist buffer allocations out of loops to avoid repeated allocation
   pm.addNestedPass<mlir::FuncOp>(mlir::bufferization::createBufferHoistingPass());
   pm.addNestedPass<mlir::FuncOp>(mlir::bufferization::createBufferLoopHoistingPass());
@@ -342,81 +306,60 @@ bool MLIRCompilationPipeline::runBufferDeallocationPass() {
 
   // Convert bufferization ops (like bufferization.clone) to memref ops
   pm.addPass(mlir::createBufferizationToMemRefPass());
-
-  // Run the passes
-  if (failed(pm.run(module))) {
-    llvm::errs() << "Error: Buffer deallocation/conversion pass failed\n";
-    module.dump();
-    return false;
-  }
-
-  return true;
 }
 
 //===----------------------------------------------------------------------===//
 // Phase 3: MemRef + Arith + SCF + Standard → LLVM Dialect
 //===----------------------------------------------------------------------===//
 
-bool MLIRCompilationPipeline::runToLLVMDialectLowering() {
+void MLIRCompilationPipeline::buildPhase3_LLVMDialectLowering(mlir::OpPassManager& pm) {
   // Follow the Toy Chapter 6 pattern for lowering to LLVM dialect
   // This uses pattern-based conversion with full dialect conversion
 
   // 1. First, lower Vector transfer ops to simpler vector operations
-  {
-    mlir::PassManager pm(module.getContext());
-    // Lower vector.transfer_read/write to simpler vector operations
-    // This converts high-level vector ops to operations LLVM can handle
-    pm.addNestedPass<mlir::FuncOp>(mlir::createConvertVectorToSCFPass());
-    if (failed(pm.run(module))) {
-      llvm::errs() << "Error: Vector to SCF lowering failed\n";
-      module.dump();
-      return false;
-    }
-  }
+  // Lower vector.transfer_read/write to simpler vector operations
+  // This converts high-level vector ops to operations LLVM can handle
+  pm.addNestedPass<mlir::FuncOp>(mlir::createConvertVectorToSCFPass());
 
   // 2. Lower Affine and SCF to Standard dialect control flow
-  {
-    mlir::PassManager pm(module.getContext());
-    // Lower Affine ops (affine.min, etc.) to Standard
-    pm.addPass(mlir::createLowerAffinePass());
+  // Lower Affine ops (affine.min, etc.) to Standard
+  pm.addPass(mlir::createLowerAffinePass());
 
-    // Always lower SCF to CF, even when OpenMP is enabled
-    // The SCF-to-OpenMP pass only converts scf.parallel, leaving other SCF ops
-    // (scf.while, scf.for, scf.if) that need to be converted to CF
-    pm.addPass(mlir::createLowerToCFGPass());
+  // Always lower SCF to CF, even when OpenMP is enabled
+  // The SCF-to-OpenMP pass only converts scf.parallel, leaving other SCF ops
+  // (scf.while, scf.for, scf.if) that need to be converted to CF
+  pm.addPass(mlir::createLowerToCFGPass());
 
-    // CRITICAL: Run createConvertOpenMPToLLVMPass() AFTER createLowerToCFGPass()!
-    // This fixes index/i64 type mismatches in branches inside OpenMP regions
-    if (enableOpenMP) {
-      llvm::outs() << "[OpenMP] Converting OpenMP index types to i64\n";
-      pm.addPass(mlir::createConvertOpenMPToLLVMPass());
-    }
-
-    if (failed(pm.run(module))) {
-      llvm::errs() << "Error: Affine/SCF to Standard lowering failed\n";
-      module.dump();
-      return false;
-    }
+  // CRITICAL: Run createConvertOpenMPToLLVMPass() AFTER createLowerToCFGPass()!
+  // This fixes index/i64 type mismatches in branches inside OpenMP regions
+  if (enableOpenMP) {
+    llvm::outs() << "[OpenMP] Converting OpenMP index types to i64\n";
+    pm.addPass(mlir::createConvertOpenMPToLLVMPass());
   }
 
   // 2.5. Expand Arithmetic ops (maxf, minf) to operations that can be lowered to LLVM
   //      MaxFOp/MinFOp don't have direct LLVM lowering - they must be expanded to CmpF + Select
-  {
-    mlir::PassManager pm(module.getContext());
-    pm.addNestedPass<mlir::FuncOp>(mlir::arith::createArithmeticExpandOpsPass());
-    if (failed(pm.run(module))) {
-      llvm::errs() << "Error: Arithmetic expand ops pass failed\n";
-      module.dump();
-      return false;
-    }
-  }
+  pm.addNestedPass<mlir::FuncOp>(mlir::arith::createArithmeticExpandOpsPass());
 
-  // 3. Lower MemRef, Arith, Vector, and Standard to LLVM dialect
-  //    Using pattern-based conversion like Toy Ch6
+  // 3. Add canonicalization and CSE passes for cleanup
+  // Pattern-based conversions will be applied after running the pipeline
+  pm.addPass(mlir::createCanonicalizerPass());
+  pm.addPass(mlir::createCSEPass());
 
-  // CRITICAL: Lower vector operations to simpler forms BEFORE LLVM conversion
+  // 4. Final reconciliation of unrealized casts
+  pm.addPass(mlir::createReconcileUnrealizedCastsPass());
+}
+
+//===----------------------------------------------------------------------===//
+// Helper: Apply Vector Lowering Patterns and LLVM Dialect Conversion
+//===----------------------------------------------------------------------===//
+
+bool MLIRCompilationPipeline::applyLLVMDialectConversion() {
+  // This method applies pattern-based conversions that require direct module access
+  // It must be called AFTER the main pass pipeline has run
+
+  // Step 1: Lower vector operations to simpler forms BEFORE LLVM conversion
   {
-    mlir::PassManager pm(module.getContext());
     mlir::RewritePatternSet patterns(module.getContext());
 
     // Lower vector.contract to outer products and vector.transpose to shuffles
@@ -434,16 +377,6 @@ bool MLIRCompilationPipeline::runToLLVMDialectLowering() {
 
     if (failed(mlir::applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
       llvm::errs() << "Warning: Vector lowering patterns failed\n";
-    }
-    pm.addPass(mlir::createCanonicalizerPass());
-
-    // Run additional vector lowering iterations
-    pm.addPass(mlir::createCanonicalizerPass());
-    pm.addPass(mlir::createCSEPass());
-
-    if (failed(pm.run(module))) {
-      llvm::errs() << "Error: Post-vector-lowering canonicalization failed\n";
-      return false;
     }
   }
 
@@ -465,16 +398,7 @@ bool MLIRCompilationPipeline::runToLLVMDialectLowering() {
     }
   }
 
-  // Canonicalize after progressive lowering
-  {
-    mlir::PassManager pm(module.getContext());
-    pm.addPass(mlir::createCanonicalizerPass());
-    pm.addPass(mlir::createCSEPass());
-    if (failed(pm.run(module))) {
-      llvm::errs() << "Warning: Post-vector-lowering canonicalization failed\n";
-    }
-  }
-
+  // Step 2: Define the conversion target - only LLVM dialect operations are legal
   // DON'T run createConvertVectorToLLVMPass as a separate pass
   // This creates unrealized_conversion_cast that applyFullConversion marks as illegal
   // Instead, we add vector conversion patterns to the main pattern set below
@@ -526,13 +450,8 @@ bool MLIRCompilationPipeline::runToLLVMDialectLowering() {
     return false;
   }
 
-  // Reconcile unrealized casts outside OpenMP regions
-  {
-    mlir::PassManager pm(module.getContext());
-    pm.addPass(mlir::createReconcileUnrealizedCastsPass());
-    // Ignore failures - with OpenMP some casts inside regions can't be reconciled
-    (void)pm.run(module);
-  }
+  // Note: createReconcileUnrealizedCastsPass() is already added in buildPhase3_LLVMDialectLowering
+  // and will run after the main pipeline completes
 
   return true;
 }

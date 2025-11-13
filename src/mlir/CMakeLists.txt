@@ -42,9 +42,12 @@ add_mlir_dialect_library(simp_dialect
   mlir_codegen.cpp
   mlir_pipeline.cpp
   cache_info.cpp
+  Passes.cpp
   lowering/ConvertSimpToMemRef.cpp
   lowering/ConvertSimpToLinalg.cpp
   lowering/SpecializeShapes.cpp
+  passes/LinalgTiling.cpp
+  passes/Pipelines.cpp
   PromoteLargeAllocaToHeap.cpp
 
   ADDITIONAL_HEADER_DIRS

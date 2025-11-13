@@ -21,6 +21,8 @@ class LLVMContext;
 
 namespace mlir {
 class MLIRContext;
+class OpPassManager;
+
 namespace simp {
 
 //===----------------------------------------------------------------------===//
@@ -115,20 +117,24 @@ private:
   bool dumpIntermediateIR = false;
 
   //===--------------------------------------------------------------------===//
-  // Private Helpers
+  // Private Helpers: Pipeline Builders
   //===--------------------------------------------------------------------===//
 
-  /// Run Phase 1: Simp → MemRef + Arith + Linalg
-  bool runSimpToMemRefLowering();
+  /// Build Phase 1 passes: Simp → MemRef + Arith + Linalg
+  void buildPhase1_SimpLowering(mlir::OpPassManager& pm);
 
-  /// Run Phase 2: Linalg ops → SCF loops
-  bool runLinalgToLoopsLowering();
+  /// Build Phase 2 passes: Linalg ops → SCF loops (with tiling, vectorization)
+  void buildPhase2_LinalgOptimization(mlir::OpPassManager& pm);
 
-  /// Run Phase 2.5: Insert buffer deallocations
-  bool runBufferDeallocationPass();
+  /// Build Phase 2.5 passes: Buffer management (hoisting, deallocation)
+  void buildPhase2_5_BufferManagement(mlir::OpPassManager& pm);
 
-  /// Run Phase 3: MemRef + Arith + SCF + Standard → LLVM dialect
-  bool runToLLVMDialectLowering();
+  /// Build Phase 3 passes: MemRef + Arith + SCF + Standard → LLVM dialect
+  void buildPhase3_LLVMDialectLowering(mlir::OpPassManager& pm);
+
+  /// Apply vector lowering patterns and LLVM dialect conversion
+  /// Must be called after the pass pipeline runs (requires direct module access)
+  bool applyLLVMDialectConversion();
 };
 
 } // namespace simp
