@@ -93,33 +93,102 @@ bool MLIRCompilationPipeline::runPasses() {
     return false;
   }
 
-  // Use a SINGLE PassManager for all phases (instead of creating multiple)
-  // This is more efficient and follows MLIR best practices
-  mlir::PassManager pm(module.getContext());
-
-  // Enable IR printing between passes if requested
+  // Disable multi-threading if IR dumping is enabled (required by MLIR)
   if (dumpIntermediateIR) {
-    pm.enableIRPrinting();
+    module.getContext()->disableMultithreading();
   }
 
   // Phase 1: Lower Simp dialect to MemRef + Arith + Linalg
-  // This converts all Simp operations, including matmul → linalg.matmul
-  buildPhase1_SimpLowering(pm);
+  {
+    mlir::PassManager pm(module.getContext());
+    if (dumpIntermediateIR) pm.enableIRPrinting();
+    buildPhase1_SimpLowering(pm);
+
+    if (failed(pm.run(module))) {
+      llvm::errs() << "Error: Phase 1 (Simp lowering) failed\n";
+      module.dump();
+      return false;
+    }
+
+    if (dumpIntermediateIR && !outputPath.empty()) {
+      std::string dumpPath = outputPath + "_phase1_simp_lowering.mlir";
+      std::error_code EC;
+      llvm::raw_fd_ostream out(dumpPath, EC);
+      if (!EC) {
+        module.print(out);
+        llvm::outs() << "Phase 1 dump: " << dumpPath << "\n";
+      }
+    }
+  }
 
   // Phase 2: Linalg optimization (tiling, vectorization, loop lowering)
-  buildPhase2_LinalgOptimization(pm);
+  // This phase should create scf.for loops and insert memref.prefetch
+  {
+    mlir::PassManager pm(module.getContext());
+    if (dumpIntermediateIR) pm.enableIRPrinting();
+    buildPhase2_LinalgOptimization(pm);
+
+    if (failed(pm.run(module))) {
+      llvm::errs() << "Error: Phase 2 (Linalg optimization) failed\n";
+      module.dump();
+      return false;
+    }
+
+    if (dumpIntermediateIR && !outputPath.empty()) {
+      std::string dumpPath = outputPath + "_phase2_with_prefetch.mlir";
+      std::error_code EC;
+      llvm::raw_fd_ostream out(dumpPath, EC);
+      if (!EC) {
+        module.print(out);
+        llvm::outs() << "Phase 2 dump (should have scf.for + memref.prefetch): " << dumpPath << "\n";
+      }
+    }
+  }
 
   // Phase 2.5: Buffer management (hoisting, deallocation)
-  buildPhase2_5_BufferManagement(pm);
+  {
+    mlir::PassManager pm(module.getContext());
+    if (dumpIntermediateIR) pm.enableIRPrinting();
+    buildPhase2_5_BufferManagement(pm);
+
+    if (failed(pm.run(module))) {
+      llvm::errs() << "Error: Phase 2.5 (Buffer management) failed\n";
+      module.dump();
+      return false;
+    }
+
+    if (dumpIntermediateIR && !outputPath.empty()) {
+      std::string dumpPath = outputPath + "_phase2_5_buffer_mgmt.mlir";
+      std::error_code EC;
+      llvm::raw_fd_ostream out(dumpPath, EC);
+      if (!EC) {
+        module.print(out);
+        llvm::outs() << "Phase 2.5 dump: " << dumpPath << "\n";
+      }
+    }
+  }
 
   // Phase 3: Lower to LLVM dialect (vector, control flow, arithmetic)
-  buildPhase3_LLVMDialectLowering(pm);
+  {
+    mlir::PassManager pm(module.getContext());
+    if (dumpIntermediateIR) pm.enableIRPrinting();
+    buildPhase3_LLVMDialectLowering(pm);
 
-  // Run all passes in a single pipeline
-  if (failed(pm.run(module))) {
-    llvm::errs() << "Error: MLIR compilation pipeline failed\n";
-    module.dump();
-    return false;
+    if (failed(pm.run(module))) {
+      llvm::errs() << "Error: Phase 3 (LLVM dialect lowering) failed\n";
+      module.dump();
+      return false;
+    }
+
+    if (dumpIntermediateIR && !outputPath.empty()) {
+      std::string dumpPath = outputPath + "_phase3_llvm_dialect.mlir";
+      std::error_code EC;
+      llvm::raw_fd_ostream out(dumpPath, EC);
+      if (!EC) {
+        module.print(out);
+        llvm::outs() << "Phase 3 dump (LLVM dialect): " << dumpPath << "\n";
+      }
+    }
   }
 
   // Apply vector lowering patterns and LLVM dialect conversion
@@ -255,7 +324,8 @@ void MLIRCompilationPipeline::buildPhase2_LinalgOptimization(mlir::OpPassManager
                      << "  Use OMP_NUM_THREADS to control thread count. Benchmark your specific workload.\n\n";
       } else {
         // Regular hierarchical: balanced for cache hierarchy
-        outer_tile = 64;   // L2/L3 cache blocking
+        // Use 32×32 outer tiles for 768×768 matrices (fits better in L2)
+        outer_tile = 32;   // L2 cache blocking (4KB per tile)
         inner_tile = 16;   // L1 cache + vectorization
         llvm::outs() << "[Hierarchical Tiling] Outer: " << outer_tile
                      << "×" << outer_tile << "×" << outer_tile
@@ -324,6 +394,12 @@ void MLIRCompilationPipeline::buildPhase2_LinalgOptimization(mlir::OpPassManager
   // Apply general canonicalization and CSE to clean up generated code
   pm.addPass(mlir::createCanonicalizerPass());
   pm.addPass(mlir::createCSEPass());
+
+  // INSERT PREFETCH: Add prefetch operations to hide memory latency
+  // Run after linalg-to-loops so we can find memref.load in all loops
+  llvm::outs() << "[Prefetch] Inserting prefetch operations into loops\n";
+  pm.addNestedPass<mlir::FuncOp>(mlir::simp::createInsertPrefetchPass());
+  pm.addPass(mlir::createCanonicalizerPass());
 
   // OPTIMIZATION: Optimize loops for better performance
   // Apply loop invariant code motion to hoist invariant operations

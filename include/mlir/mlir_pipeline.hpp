@@ -93,6 +93,9 @@ public:
   /// Enable/disable IR dumping at each pipeline stage
   void setDumpIntermediateIR(bool enable) { dumpIntermediateIR = enable; }
 
+  /// Set output path for intermediate IR dumps
+  void setOutputPath(const std::string& path) { outputPath = path; }
+
 private:
   //===--------------------------------------------------------------------===//
   // Private Members
@@ -115,6 +118,9 @@ private:
 
   /// Enable IR dumping at each pipeline stage (default: false)
   bool dumpIntermediateIR = false;
+
+  /// Output path for intermediate IR dumps
+  std::string outputPath;
 
   //===--------------------------------------------------------------------===//
   // Private Helpers: Pipeline Builders

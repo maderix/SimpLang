@@ -47,6 +47,9 @@ std::unique_ptr<Pass> createSimpLinalgTilingPass(int64_t tileSize, bool hierarch
 /// Register the SimpLinalgTiling pass for command-line usage
 void registerSimpLinalgTilingPass();
 
+/// Create a pass that inserts prefetch operations into tiled loops
+std::unique_ptr<Pass> createInsertPrefetchPass();
+
 /// Register all Simp dialect passes for command-line usage
 void registerSimpPasses();
 

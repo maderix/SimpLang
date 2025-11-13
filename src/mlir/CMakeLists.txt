@@ -48,6 +48,7 @@ add_mlir_dialect_library(simp_dialect
   lowering/SpecializeShapes.cpp
   passes/LinalgTiling.cpp
   passes/Pipelines.cpp
+  passes/InsertPrefetch.cpp
   PromoteLargeAllocaToHeap.cpp
 
   ADDITIONAL_HEADER_DIRS
