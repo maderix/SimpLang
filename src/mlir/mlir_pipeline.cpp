@@ -129,6 +129,15 @@ bool MLIRCompilationPipeline::runPasses() {
     return false;
   }
 
+  // Try to reconcile unrealized casts after pattern conversion
+  // With OpenMP, some casts inside omp regions will remain (expected behavior)
+  {
+    mlir::PassManager reconcilePM(module.getContext());
+    reconcilePM.addPass(mlir::createReconcileUnrealizedCastsPass());
+    // Ignore failures - with OpenMP some casts can't be reconciled
+    (void)reconcilePM.run(module);
+  }
+
   // Verify the final module
   // NOTE: When OpenMP is enabled, unrealized_conversion_cast ops are expected
   // (see mlir/test/Conversion/OpenMPToLLVM/convert-to-llvmir.mlir)
@@ -347,7 +356,10 @@ void MLIRCompilationPipeline::buildPhase3_LLVMDialectLowering(mlir::OpPassManage
   pm.addPass(mlir::createCSEPass());
 
   // 4. Final reconciliation of unrealized casts
-  pm.addPass(mlir::createReconcileUnrealizedCastsPass());
+  // Skip when OpenMP is enabled - casts inside omp regions can't be reconciled until LLVM IR translation
+  if (!enableOpenMP) {
+    pm.addPass(mlir::createReconcileUnrealizedCastsPass());
+  }
 }
 
 //===----------------------------------------------------------------------===//

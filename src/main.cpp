@@ -21,6 +21,7 @@
 #ifdef USE_MLIR
 #include "mlir/mlir_codegen.hpp"
 #include "mlir/mlir_pipeline.hpp"
+#include "mlir/Passes.h"
 #include "mlir/ExecutionEngine/OptUtils.h"
 #include "mlir/PromoteLargeAllocaToHeap.h"
 #include "ast/transforms/normalize_returns.hpp"
@@ -199,6 +200,10 @@ int main(int argc, char** argv) {
 #ifdef USE_MLIR
     if (emitMLIR) {
         LOG_INFO("MLIR mode enabled - generating MLIR...");
+
+        // Register all SimpLang MLIR passes and pipelines for CLI usage
+        mlir::simp::registerSimpPasses();
+        mlir::simp::registerSimpPipelines();
 
         // Apply return normalization pass (required for MLIR structured control flow)
         LOG_INFO("Applying return normalization pass...");
