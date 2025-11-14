@@ -86,6 +86,16 @@ struct SpecializeReinterpretCastPattern
 /// Pass that specializes dynamic memref shapes to static shapes
 struct SpecializeShapesPass
     : public PassWrapper<SpecializeShapesPass, OperationPass<FuncOp>> {
+
+
+  StringRef getArgument() const override {
+    return "specialize-shapes";
+  }
+
+  StringRef getDescription() const override {
+    return "Specialize dynamic memref shapes to static shapes when known";
+  }
+
   void runOnOperation() override {
     FuncOp func = getOperation();
     MLIRContext *context = &getContext();
@@ -106,6 +116,11 @@ namespace simp {
 
 std::unique_ptr<Pass> createSpecializeShapesPass() {
   return std::make_unique<SpecializeShapesPass>();
+}
+
+/// Register the pass for command-line usage
+void registerSpecializeShapesPass() {
+  PassRegistration<SpecializeShapesPass>();
 }
 
 } // namespace simp

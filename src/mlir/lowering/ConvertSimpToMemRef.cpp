@@ -3136,6 +3136,15 @@ namespace {
 struct ConvertSimpToMemRefPass
     : public PassWrapper<ConvertSimpToMemRefPass, OperationPass<ModuleOp>> {
 
+
+  StringRef getArgument() const override {
+    return "convert-simp-to-memref";
+  }
+
+  StringRef getDescription() const override {
+    return "Lower Simp dialect operations to MemRef, Arith, and Linalg dialects";
+  }
+
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<memref::MemRefDialect>();
     registry.insert<arith::ArithmeticDialect>();
@@ -3253,6 +3262,11 @@ namespace simp {
 /// Create the Simp to MemRef lowering pass
 std::unique_ptr<Pass> createConvertSimpToMemRefPass() {
   return std::make_unique<ConvertSimpToMemRefPass>();
+}
+
+/// Register the pass for command-line usage
+void registerConvertSimpToMemRefPass() {
+  PassRegistration<ConvertSimpToMemRefPass>();
 }
 
 } // namespace simp
