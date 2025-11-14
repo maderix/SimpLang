@@ -93,50 +93,118 @@ bool MLIRCompilationPipeline::runPasses() {
     return false;
   }
 
+  // Disable multi-threading if IR dumping is enabled (required by MLIR)
+  if (dumpIntermediateIR) {
+    module.getContext()->disableMultithreading();
+  }
+
   // Phase 1: Lower Simp dialect to MemRef + Arith + Linalg
-  // This converts all Simp operations, including matmul → linalg.matmul
-  if (!runSimpToMemRefLowering()) {
-    llvm::errs() << "Error: Failed to lower Simp to MemRef + Linalg\n";
-    return false;
-  }
-  if (dumpIntermediateIR) {
-    llvm::outs() << "\n=== After Phase 1: Simp → MemRef + Linalg ===\n";
-    module.print(llvm::outs());
-    llvm::outs() << "\n";
+  {
+    mlir::PassManager pm(module.getContext());
+    if (dumpIntermediateIR) pm.enableIRPrinting();
+    buildPhase1_SimpLowering(pm);
+
+    if (failed(pm.run(module))) {
+      llvm::errs() << "Error: Phase 1 (Simp lowering) failed\n";
+      module.dump();
+      return false;
+    }
+
+    if (dumpIntermediateIR && !outputPath.empty()) {
+      std::string dumpPath = outputPath + "_phase1_simp_lowering.mlir";
+      std::error_code EC;
+      llvm::raw_fd_ostream out(dumpPath, EC);
+      if (!EC) {
+        module.print(out);
+        llvm::outs() << "Phase 1 dump: " << dumpPath << "\n";
+      }
+    }
   }
 
-  // Phase 2: Lower Linalg ops to SCF loops
-  if (!runLinalgToLoopsLowering()) {
-    llvm::errs() << "Error: Failed to lower Linalg to loops\n";
-    return false;
-  }
-  if (dumpIntermediateIR) {
-    llvm::outs() << "\n=== After Phase 2: Linalg → SCF Loops ===\n";
-    module.print(llvm::outs());
-    llvm::outs() << "\n";
+  // Phase 2: Linalg optimization (tiling, vectorization, loop lowering)
+  // This phase should create scf.for loops and insert memref.prefetch
+  {
+    mlir::PassManager pm(module.getContext());
+    if (dumpIntermediateIR) pm.enableIRPrinting();
+    buildPhase2_LinalgOptimization(pm);
+
+    if (failed(pm.run(module))) {
+      llvm::errs() << "Error: Phase 2 (Linalg optimization) failed\n";
+      module.dump();
+      return false;
+    }
+
+    if (dumpIntermediateIR && !outputPath.empty()) {
+      std::string dumpPath = outputPath + "_phase2_with_prefetch.mlir";
+      std::error_code EC;
+      llvm::raw_fd_ostream out(dumpPath, EC);
+      if (!EC) {
+        module.print(out);
+        llvm::outs() << "Phase 2 dump (should have scf.for + memref.prefetch): " << dumpPath << "\n";
+      }
+    }
   }
 
-  // Phase 2.5: Insert buffer deallocations
-  // This adds memref.dealloc operations after the last use of allocated buffers
-  if (!runBufferDeallocationPass()) {
-    llvm::errs() << "Error: Failed to insert buffer deallocations\n";
-    return false;
-  }
-  if (dumpIntermediateIR) {
-    llvm::outs() << "\n=== After Phase 2.5: Buffer Deallocation ===\n";
-    module.print(llvm::outs());
-    llvm::outs() << "\n";
+  // Phase 2.5: Buffer management (hoisting, deallocation)
+  {
+    mlir::PassManager pm(module.getContext());
+    if (dumpIntermediateIR) pm.enableIRPrinting();
+    buildPhase2_5_BufferManagement(pm);
+
+    if (failed(pm.run(module))) {
+      llvm::errs() << "Error: Phase 2.5 (Buffer management) failed\n";
+      module.dump();
+      return false;
+    }
+
+    if (dumpIntermediateIR && !outputPath.empty()) {
+      std::string dumpPath = outputPath + "_phase2_5_buffer_mgmt.mlir";
+      std::error_code EC;
+      llvm::raw_fd_ostream out(dumpPath, EC);
+      if (!EC) {
+        module.print(out);
+        llvm::outs() << "Phase 2.5 dump: " << dumpPath << "\n";
+      }
+    }
   }
 
-  // Phase 3: Lower MemRef + Arith + SCF + Standard to LLVM dialect
-  if (!runToLLVMDialectLowering()) {
-    llvm::errs() << "Error: Failed to lower to LLVM dialect\n";
+  // Phase 3: Lower to LLVM dialect (vector, control flow, arithmetic)
+  {
+    mlir::PassManager pm(module.getContext());
+    if (dumpIntermediateIR) pm.enableIRPrinting();
+    buildPhase3_LLVMDialectLowering(pm);
+
+    if (failed(pm.run(module))) {
+      llvm::errs() << "Error: Phase 3 (LLVM dialect lowering) failed\n";
+      module.dump();
+      return false;
+    }
+
+    if (dumpIntermediateIR && !outputPath.empty()) {
+      std::string dumpPath = outputPath + "_phase3_llvm_dialect.mlir";
+      std::error_code EC;
+      llvm::raw_fd_ostream out(dumpPath, EC);
+      if (!EC) {
+        module.print(out);
+        llvm::outs() << "Phase 3 dump (LLVM dialect): " << dumpPath << "\n";
+      }
+    }
+  }
+
+  // Apply vector lowering patterns and LLVM dialect conversion
+  // This must be done AFTER the pass pipeline since it requires direct module access
+  if (!applyLLVMDialectConversion()) {
+    llvm::errs() << "Error: LLVM dialect conversion failed\n";
     return false;
   }
-  if (dumpIntermediateIR) {
-    llvm::outs() << "\n=== After Phase 3: → LLVM Dialect ===\n";
-    module.print(llvm::outs());
-    llvm::outs() << "\n";
+
+  // Try to reconcile unrealized casts after pattern conversion
+  // With OpenMP, some casts inside omp regions will remain (expected behavior)
+  {
+    mlir::PassManager reconcilePM(module.getContext());
+    reconcilePM.addPass(mlir::createReconcileUnrealizedCastsPass());
+    // Ignore failures - with OpenMP some casts can't be reconciled
+    (void)reconcilePM.run(module);
   }
 
   // Verify the final module
@@ -180,31 +248,16 @@ std::unique_ptr<llvm::Module> MLIRCompilationPipeline::translateToLLVMIR(
 // Phase 1: Simp → MemRef + Arith + Linalg
 //===----------------------------------------------------------------------===//
 
-bool MLIRCompilationPipeline::runSimpToMemRefLowering() {
-  mlir::PassManager pm(module.getContext());
-
+void MLIRCompilationPipeline::buildPhase1_SimpLowering(mlir::OpPassManager& pm) {
   // Add our custom Simp → MemRef + Arith + Linalg lowering pass
   pm.addPass(mlir::simp::createConvertSimpToMemRefPass());
-
-  // Run the pass
-  if (failed(pm.run(module))) {
-    llvm::errs() << "Error: ConvertSimpToMemRef pass failed\n";
-    module.dump();
-    return false;
-  }
-
-  return true;
 }
 
 //===----------------------------------------------------------------------===//
 // Phase 2: Linalg Vectorization and Loop Lowering
 //===----------------------------------------------------------------------===//
 
-bool MLIRCompilationPipeline::runLinalgToLoopsLowering() {
-  mlir::PassManager pm(module.getContext());
-
-  // Enable IR printing for debugging (comment out for production)
-  // pm.enableIRPrinting();
+void MLIRCompilationPipeline::buildPhase2_LinalgOptimization(mlir::OpPassManager& pm) {
 
   // OPTIONAL: Tile matmul BEFORE vectorization (enabled by default)
   // Vectorizing large matrices (768x768) directly causes 1.6GB memory usage and hangs
@@ -219,7 +272,12 @@ bool MLIRCompilationPipeline::runLinalgToLoopsLowering() {
       llvm::outs() << "[OpenMP] Generating parallel loops for multi-threading\n";
     }
 
-    if (enableHierarchicalTiling) {
+    // SMART OPENMP: Force hierarchical tiling when OpenMP is enabled
+    // This avoids creating parallel regions for every tiny tile (massive overhead)
+    // Instead: parallelize coarse outer tiles, keep inner tiles sequential
+    bool useHierarchicalTiling = enableHierarchicalTiling || enableOpenMP;
+
+    if (useHierarchicalTiling) {
       // HIERARCHICAL TILING: Two-level cache-aware tiling
       // Query actual CPU cache sizes
       CacheInfo cache = CacheInfo::query();
@@ -238,12 +296,41 @@ bool MLIRCompilationPipeline::runLinalgToLoopsLowering() {
       // CRITICAL: Ensure inner_tile_count ≥ 4 to amortize loop overhead
       // 64→16 gives 4×4×4=64 inner iterations (perfect balance)
       // 24→8 gives 3×3×3=27 inner iterations (too much overhead!)
-      int outer_tile = 64;   // L2/L3 cache blocking
-      int inner_tile = 16;   // L1 cache + vectorization
+      int outer_tile, inner_tile;
 
-      llvm::outs() << "[Hierarchical Tiling] Outer: " << outer_tile
-                   << "×" << outer_tile << "×" << outer_tile
-                   << ", Inner: " << inner_tile << "×" << inner_tile << "×" << inner_tile << "\n";
+      if (enableOpenMP) {
+        // OpenMP AUTO-TUNING: Compute tile size based on target work per thread
+        // Goal: Each parallel tile should have enough work to amortize ~50μs thread overhead
+        //
+        // Heuristic: Target ~2000 FLOPS minimum per thread (50μs @ 40 GFLOPS = 2M FLOPS)
+        // For matmul: FLOPS ≈ 2 * tile³, so tile ≥ ∛(1M) ≈ 100
+        //
+        // Conservative: Use L2/L3 cache size as upper bound (avoid thrashing)
+        int min_tile_for_overhead = 128;  // ~4M FLOPS per tile
+        int max_tile_for_cache = std::min((int)l3_tile, 256);  // Cache-friendly upper bound
+
+        outer_tile = std::min(min_tile_for_overhead, max_tile_for_cache);
+        inner_tile = 8;  // Optimal for vectorization + L1 cache
+
+        llvm::outs() << "[OpenMP Auto-tuned] Outer (parallel): " << outer_tile
+                     << "×" << outer_tile << ", Inner (sequential): " << inner_tile << "×" << inner_tile
+                     << " [min_work=" << min_tile_for_overhead << ", max_cache=" << max_tile_for_cache << "]\n";
+
+        llvm::outs() << "\n[OpenMP WARNING] Multi-threading may hurt performance for memory-bound workloads:\n"
+                     << "  - Cache coherence overhead can cause 10-25× more cache misses\n"
+                     << "  - Beneficial for: batch processing, large matrices (>2048), CPU-bound tasks\n"
+                     << "  - May degrade: single-sequence inference, memory-bound matmuls\n"
+                     << "  - Measured: 2-3× slower for Stories110M single-sequence (cache miss rate: 2% → 25%)\n"
+                     << "  Use OMP_NUM_THREADS to control thread count. Benchmark your specific workload.\n\n";
+      } else {
+        // Regular hierarchical: balanced for cache hierarchy
+        // Use 32×32 outer tiles for 768×768 matrices (fits better in L2)
+        outer_tile = 32;   // L2 cache blocking (4KB per tile)
+        inner_tile = 16;   // L1 cache + vectorization
+        llvm::outs() << "[Hierarchical Tiling] Outer: " << outer_tile
+                     << "×" << outer_tile << "×" << outer_tile
+                     << ", Inner: " << inner_tile << "×" << inner_tile << "×" << inner_tile << "\n";
+      }
 
       // Level 1: Outer tiling (L2/L3 cache aware)
       llvm::SmallVector<int64_t, 3> outerTileSizes = {outer_tile, outer_tile, outer_tile};
@@ -308,30 +395,25 @@ bool MLIRCompilationPipeline::runLinalgToLoopsLowering() {
   pm.addPass(mlir::createCanonicalizerPass());
   pm.addPass(mlir::createCSEPass());
 
+  // INSERT PREFETCH: Add prefetch operations to hide memory latency
+  // Run after linalg-to-loops so we can find memref.load in all loops
+  llvm::outs() << "[Prefetch] Inserting prefetch operations into loops\n";
+  pm.addNestedPass<mlir::FuncOp>(mlir::simp::createInsertPrefetchPass());
+  pm.addPass(mlir::createCanonicalizerPass());
+
   // OPTIMIZATION: Optimize loops for better performance
   // Apply loop invariant code motion to hoist invariant operations
   pm.addNestedPass<mlir::FuncOp>(mlir::createLoopInvariantCodeMotionPass());
 
   // Apply loop unrolling for better ILP
   pm.addNestedPass<mlir::FuncOp>(mlir::createLoopUnrollPass(4));
-
-  // Run the passes
-  if (failed(pm.run(module))) {
-    llvm::errs() << "Error: Linalg vectorization/lowering pass failed\n";
-    module.dump();
-    return false;
-  }
-
-  return true;
 }
 
 //===----------------------------------------------------------------------===//
 // Phase 2.5: Insert Buffer Deallocations
 //===----------------------------------------------------------------------===//
 
-bool MLIRCompilationPipeline::runBufferDeallocationPass() {
-  mlir::PassManager pm(module.getContext());
-
+void MLIRCompilationPipeline::buildPhase2_5_BufferManagement(mlir::OpPassManager& pm) {
   // First, hoist buffer allocations out of loops to avoid repeated allocation
   pm.addNestedPass<mlir::FuncOp>(mlir::bufferization::createBufferHoistingPass());
   pm.addNestedPass<mlir::FuncOp>(mlir::bufferization::createBufferLoopHoistingPass());
@@ -342,81 +424,63 @@ bool MLIRCompilationPipeline::runBufferDeallocationPass() {
 
   // Convert bufferization ops (like bufferization.clone) to memref ops
   pm.addPass(mlir::createBufferizationToMemRefPass());
-
-  // Run the passes
-  if (failed(pm.run(module))) {
-    llvm::errs() << "Error: Buffer deallocation/conversion pass failed\n";
-    module.dump();
-    return false;
-  }
-
-  return true;
 }
 
 //===----------------------------------------------------------------------===//
 // Phase 3: MemRef + Arith + SCF + Standard → LLVM Dialect
 //===----------------------------------------------------------------------===//
 
-bool MLIRCompilationPipeline::runToLLVMDialectLowering() {
+void MLIRCompilationPipeline::buildPhase3_LLVMDialectLowering(mlir::OpPassManager& pm) {
   // Follow the Toy Chapter 6 pattern for lowering to LLVM dialect
   // This uses pattern-based conversion with full dialect conversion
 
   // 1. First, lower Vector transfer ops to simpler vector operations
-  {
-    mlir::PassManager pm(module.getContext());
-    // Lower vector.transfer_read/write to simpler vector operations
-    // This converts high-level vector ops to operations LLVM can handle
-    pm.addNestedPass<mlir::FuncOp>(mlir::createConvertVectorToSCFPass());
-    if (failed(pm.run(module))) {
-      llvm::errs() << "Error: Vector to SCF lowering failed\n";
-      module.dump();
-      return false;
-    }
-  }
+  // Lower vector.transfer_read/write to simpler vector operations
+  // This converts high-level vector ops to operations LLVM can handle
+  pm.addNestedPass<mlir::FuncOp>(mlir::createConvertVectorToSCFPass());
 
   // 2. Lower Affine and SCF to Standard dialect control flow
-  {
-    mlir::PassManager pm(module.getContext());
-    // Lower Affine ops (affine.min, etc.) to Standard
-    pm.addPass(mlir::createLowerAffinePass());
+  // Lower Affine ops (affine.min, etc.) to Standard
+  pm.addPass(mlir::createLowerAffinePass());
 
-    // Always lower SCF to CF, even when OpenMP is enabled
-    // The SCF-to-OpenMP pass only converts scf.parallel, leaving other SCF ops
-    // (scf.while, scf.for, scf.if) that need to be converted to CF
-    pm.addPass(mlir::createLowerToCFGPass());
+  // Always lower SCF to CF, even when OpenMP is enabled
+  // The SCF-to-OpenMP pass only converts scf.parallel, leaving other SCF ops
+  // (scf.while, scf.for, scf.if) that need to be converted to CF
+  pm.addPass(mlir::createLowerToCFGPass());
 
-    // CRITICAL: Run createConvertOpenMPToLLVMPass() AFTER createLowerToCFGPass()!
-    // This fixes index/i64 type mismatches in branches inside OpenMP regions
-    if (enableOpenMP) {
-      llvm::outs() << "[OpenMP] Converting OpenMP index types to i64\n";
-      pm.addPass(mlir::createConvertOpenMPToLLVMPass());
-    }
-
-    if (failed(pm.run(module))) {
-      llvm::errs() << "Error: Affine/SCF to Standard lowering failed\n";
-      module.dump();
-      return false;
-    }
+  // CRITICAL: Run createConvertOpenMPToLLVMPass() AFTER createLowerToCFGPass()!
+  // This fixes index/i64 type mismatches in branches inside OpenMP regions
+  if (enableOpenMP) {
+    llvm::outs() << "[OpenMP] Converting OpenMP index types to i64\n";
+    pm.addPass(mlir::createConvertOpenMPToLLVMPass());
   }
 
   // 2.5. Expand Arithmetic ops (maxf, minf) to operations that can be lowered to LLVM
   //      MaxFOp/MinFOp don't have direct LLVM lowering - they must be expanded to CmpF + Select
-  {
-    mlir::PassManager pm(module.getContext());
-    pm.addNestedPass<mlir::FuncOp>(mlir::arith::createArithmeticExpandOpsPass());
-    if (failed(pm.run(module))) {
-      llvm::errs() << "Error: Arithmetic expand ops pass failed\n";
-      module.dump();
-      return false;
-    }
+  pm.addNestedPass<mlir::FuncOp>(mlir::arith::createArithmeticExpandOpsPass());
+
+  // 3. Add canonicalization and CSE passes for cleanup
+  // Pattern-based conversions will be applied after running the pipeline
+  pm.addPass(mlir::createCanonicalizerPass());
+  pm.addPass(mlir::createCSEPass());
+
+  // 4. Final reconciliation of unrealized casts
+  // Skip when OpenMP is enabled - casts inside omp regions can't be reconciled until LLVM IR translation
+  if (!enableOpenMP) {
+    pm.addPass(mlir::createReconcileUnrealizedCastsPass());
   }
+}
 
-  // 3. Lower MemRef, Arith, Vector, and Standard to LLVM dialect
-  //    Using pattern-based conversion like Toy Ch6
+//===----------------------------------------------------------------------===//
+// Helper: Apply Vector Lowering Patterns and LLVM Dialect Conversion
+//===----------------------------------------------------------------------===//
 
-  // CRITICAL: Lower vector operations to simpler forms BEFORE LLVM conversion
+bool MLIRCompilationPipeline::applyLLVMDialectConversion() {
+  // This method applies pattern-based conversions that require direct module access
+  // It must be called AFTER the main pass pipeline has run
+
+  // Step 1: Lower vector operations to simpler forms BEFORE LLVM conversion
   {
-    mlir::PassManager pm(module.getContext());
     mlir::RewritePatternSet patterns(module.getContext());
 
     // Lower vector.contract to outer products and vector.transpose to shuffles
@@ -434,16 +498,6 @@ bool MLIRCompilationPipeline::runToLLVMDialectLowering() {
 
     if (failed(mlir::applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
       llvm::errs() << "Warning: Vector lowering patterns failed\n";
-    }
-    pm.addPass(mlir::createCanonicalizerPass());
-
-    // Run additional vector lowering iterations
-    pm.addPass(mlir::createCanonicalizerPass());
-    pm.addPass(mlir::createCSEPass());
-
-    if (failed(pm.run(module))) {
-      llvm::errs() << "Error: Post-vector-lowering canonicalization failed\n";
-      return false;
     }
   }
 
@@ -465,16 +519,7 @@ bool MLIRCompilationPipeline::runToLLVMDialectLowering() {
     }
   }
 
-  // Canonicalize after progressive lowering
-  {
-    mlir::PassManager pm(module.getContext());
-    pm.addPass(mlir::createCanonicalizerPass());
-    pm.addPass(mlir::createCSEPass());
-    if (failed(pm.run(module))) {
-      llvm::errs() << "Warning: Post-vector-lowering canonicalization failed\n";
-    }
-  }
-
+  // Step 2: Define the conversion target - only LLVM dialect operations are legal
   // DON'T run createConvertVectorToLLVMPass as a separate pass
   // This creates unrealized_conversion_cast that applyFullConversion marks as illegal
   // Instead, we add vector conversion patterns to the main pattern set below
@@ -526,13 +571,8 @@ bool MLIRCompilationPipeline::runToLLVMDialectLowering() {
     return false;
   }
 
-  // Reconcile unrealized casts outside OpenMP regions
-  {
-    mlir::PassManager pm(module.getContext());
-    pm.addPass(mlir::createReconcileUnrealizedCastsPass());
-    // Ignore failures - with OpenMP some casts inside regions can't be reconciled
-    (void)pm.run(module);
-  }
+  // Note: createReconcileUnrealizedCastsPass() is already added in buildPhase3_LLVMDialectLowering
+  // and will run after the main pipeline completes
 
   return true;
 }

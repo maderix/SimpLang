@@ -150,6 +150,15 @@ namespace {
 struct ConvertSimpToLinalgPass
     : public PassWrapper<ConvertSimpToLinalgPass, OperationPass<ModuleOp>> {
 
+
+  StringRef getArgument() const override {
+    return "convert-simp-to-linalg";
+  }
+
+  StringRef getDescription() const override {
+    return "Lower Simp MatMul operations to Linalg dialect";
+  }
+
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<linalg::LinalgDialect>();
     registry.insert<memref::MemRefDialect>();
@@ -193,6 +202,11 @@ namespace simp {
 /// Create the Simp to Linalg lowering pass
 std::unique_ptr<Pass> createConvertSimpToLinalgPass() {
   return std::make_unique<ConvertSimpToLinalgPass>();
+}
+
+/// Register the pass for command-line usage
+void registerConvertSimpToLinalgPass() {
+  PassRegistration<ConvertSimpToLinalgPass>();
 }
 
 } // namespace simp

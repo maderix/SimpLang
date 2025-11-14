@@ -11,9 +11,12 @@
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/Host.h>
+#include <llvm/Support/CommandLine.h>
 #include <llvm/MC/SubtargetFeature.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/Transforms/Vectorize.h>
+#include <llvm/Transforms/Scalar.h>
+#include <llvm/Transforms/Utils.h>
 #include <llvm/Analysis/TargetTransformInfo.h>
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/MC/TargetRegistry.h>
@@ -21,6 +24,7 @@
 #ifdef USE_MLIR
 #include "mlir/mlir_codegen.hpp"
 #include "mlir/mlir_pipeline.hpp"
+#include "mlir/Passes.h"
 #include "mlir/ExecutionEngine/OptUtils.h"
 #include "mlir/PromoteLargeAllocaToHeap.h"
 #include "ast/transforms/normalize_returns.hpp"
@@ -200,6 +204,10 @@ int main(int argc, char** argv) {
     if (emitMLIR) {
         LOG_INFO("MLIR mode enabled - generating MLIR...");
 
+        // Register all SimpLang MLIR passes and pipelines for CLI usage
+        mlir::simp::registerSimpPasses();
+        mlir::simp::registerSimpPipelines();
+
         // Apply return normalization pass (required for MLIR structured control flow)
         LOG_INFO("Applying return normalization pass...");
         ast::transforms::normalizeAllReturns(programBlock);
@@ -272,6 +280,7 @@ int main(int argc, char** argv) {
         }
 
         pipeline.setDumpIntermediateIR(dumpMLIRPasses);
+        pipeline.setOutputPath(outputPath);
         if (dumpMLIRPasses) {
             LOG_INFO("MLIR intermediate IR dumping enabled");
         }
@@ -485,6 +494,23 @@ int main(int argc, char** argv) {
 
     // Add target transform info for vectorizer
     modulePM.add(llvm::createTargetTransformInfoWrapperPass(context.getTargetMachine()->getTargetIRAnalysis()));
+
+    // Configure and add loop data prefetch pass
+    // LoopDataPrefetch requires canonical loops (LoopSimplify + LCSSA)
+    llvm::legacy::FunctionPassManager fpm(context.getModule());
+    fpm.add(llvm::createLoopSimplifyPass());
+    fpm.doInitialization();
+    for (auto &F : *context.getModule()) {
+        if (!F.isDeclaration())
+            fpm.run(F);
+    }
+    fpm.doFinalization();
+
+    // Set prefetch distance (default is 0 which disables prefetching)
+    std::cout << "[Prefetch] Configuring loop data prefetch (distance=256, stride=1)" << std::endl;
+    const char* prefetch_args[] = {"simplang", "-prefetch-distance=256", "-min-prefetch-stride=1"};
+    llvm::cl::ParseCommandLineOptions(3, prefetch_args, "", &llvm::errs());
+    modulePM.add(llvm::createLoopDataPrefetchPass());
 
     // Add vectorization passes directly
     modulePM.add(llvm::createLoopVectorizePass());        // Loop vectorizer
