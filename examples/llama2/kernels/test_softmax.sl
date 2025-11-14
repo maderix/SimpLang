@@ -16,6 +16,6 @@ fn test_softmax() -> f32 {
     output[2i] = 0.0;
     output[3i] = 0.0;
 
-    var result = softmax(input, output, size);
-    return result[0i];
+    output = softmax(input, output, size, 0i, 0i);
+    return output[0i];
 }

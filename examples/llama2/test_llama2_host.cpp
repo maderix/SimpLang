@@ -1,6 +1,7 @@
 #include <iostream>
 #include <dlfcn.h>
 #include <cmath>
+#include <cstring>
 #include <chrono>
 #include <vector>
 #include <random>
@@ -10,14 +11,14 @@
 #define MEMREF_PARAMS float*, float*, int64_t, int64_t, int64_t
 
 typedef float (*LLaMA2Func)(
-    // 24 arrays × 5 params each = 120 params
+    // 26 arrays × 5 params each = 130 params
     MEMREF_PARAMS,  // token_emb
     MEMREF_PARAMS,  // rms_att_w
-    MEMREF_PARAMS,  // rms_ffn_w
     MEMREF_PARAMS,  // wq
     MEMREF_PARAMS,  // wk
     MEMREF_PARAMS,  // wv
     MEMREF_PARAMS,  // wo
+    MEMREF_PARAMS,  // rms_ffn_w
     MEMREF_PARAMS,  // w1
     MEMREF_PARAMS,  // w2
     MEMREF_PARAMS,  // w3
@@ -26,16 +27,17 @@ typedef float (*LLaMA2Func)(
     MEMREF_PARAMS,  // x
     MEMREF_PARAMS,  // xb
     MEMREF_PARAMS,  // xb2
+    MEMREF_PARAMS,  // hb
+    MEMREF_PARAMS,  // hb_silu
     MEMREF_PARAMS,  // q
     MEMREF_PARAMS,  // k
     MEMREF_PARAMS,  // v
     MEMREF_PARAMS,  // att
-    MEMREF_PARAMS,  // hb
-    MEMREF_PARAMS,  // hb2
+    MEMREF_PARAMS,  // att_soft
     MEMREF_PARAMS,  // logits
     MEMREF_PARAMS,  // key_cache
     MEMREF_PARAMS,  // value_cache
-    // 10 scalar params
+    // 9 scalar params
     int64_t, int64_t,  // token, pos
     int64_t, int64_t,  // dim, hidden_dim
     int64_t, int64_t, int64_t,  // n_layers, n_heads, n_kv_heads
@@ -53,15 +55,50 @@ void init_random(std::vector<float>& arr) {
     }
 }
 
-int main() {
-    // Tiny config
-    int64_t dim = 64;
-    int64_t hidden_dim = 128;
-    int64_t n_layers = 1;
-    int64_t n_heads = 4;
-    int64_t n_kv_heads = 4;
-    int64_t vocab_size = 512;
-    int64_t seq_len = 64;
+int main(int argc, char** argv) {
+    if (argc < 3) {
+        std::cerr << "Usage: " << argv[0] << " <model.so> <model_size: 1B|3B|7B>" << std::endl;
+        return 1;
+    }
+
+    const char* so_path = argv[1];
+    const char* model_size = argv[2];
+
+    // Model configurations
+    int64_t dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len;
+
+    if (strcmp(model_size, "1B") == 0) {
+        // LLaMA 2 1B: dim=1536, hidden_dim=6144, n_layers=24, n_heads=16, vocab=32000
+        dim = 1536;
+        hidden_dim = 6144;
+        n_layers = 24;
+        n_heads = 16;
+        n_kv_heads = 16;
+        vocab_size = 32000;
+        seq_len = 512;
+    } else if (strcmp(model_size, "3B") == 0) {
+        // LLaMA 2 3B: dim=2048, hidden_dim=8192, n_layers=32, n_heads=32, vocab=32000
+        dim = 2048;
+        hidden_dim = 8192;
+        n_layers = 32;
+        n_heads = 32;
+        n_kv_heads = 32;
+        vocab_size = 32000;
+        seq_len = 512;
+    } else if (strcmp(model_size, "7B") == 0) {
+        // LLaMA 2 7B: dim=4096, hidden_dim=11008, n_layers=32, n_heads=32, vocab=32000
+        dim = 4096;
+        hidden_dim = 11008;
+        n_layers = 32;
+        n_heads = 32;
+        n_kv_heads = 32;
+        vocab_size = 32000;
+        seq_len = 512;
+    } else {
+        std::cerr << "Unknown model size: " << model_size << ". Use 1B, 3B, or 7B" << std::endl;
+        return 1;
+    }
+
     int64_t kv_dim = (dim * n_kv_heads) / n_heads;
 
     std::cout << "=== LLaMA2 Forward Pass Benchmark ===" << std::endl;
@@ -86,12 +123,13 @@ int main() {
     std::vector<float> x(dim);
     std::vector<float> xb(dim);
     std::vector<float> xb2(dim);
+    std::vector<float> hb(hidden_dim);
+    std::vector<float> hb_silu(hidden_dim);
     std::vector<float> q(dim);
     std::vector<float> k(kv_dim);
     std::vector<float> v(kv_dim);
     std::vector<float> att(n_heads * seq_len);
-    std::vector<float> hb(hidden_dim);
-    std::vector<float> hb2(hidden_dim);
+    std::vector<float> att_soft(n_heads * seq_len);
     std::vector<float> logits(vocab_size);
 
     // KV cache
@@ -113,7 +151,7 @@ int main() {
     init_random(wcls);
 
     // Load library
-    void* handle = dlopen("/tmp/llama2_forward.so", RTLD_LAZY);
+    void* handle = dlopen(so_path, RTLD_LAZY);
     if (!handle) {
         std::cerr << "Error loading library: " << dlerror() << std::endl;
         return 1;
@@ -134,11 +172,11 @@ int main() {
         llama2_forward(
             PASS_MEMREF(token_emb),
             PASS_MEMREF(rms_att_w),
-            PASS_MEMREF(rms_ffn_w),
             PASS_MEMREF(wq),
             PASS_MEMREF(wk),
             PASS_MEMREF(wv),
             PASS_MEMREF(wo),
+            PASS_MEMREF(rms_ffn_w),
             PASS_MEMREF(w1),
             PASS_MEMREF(w2),
             PASS_MEMREF(w3),
@@ -147,12 +185,13 @@ int main() {
             PASS_MEMREF(x),
             PASS_MEMREF(xb),
             PASS_MEMREF(xb2),
+            PASS_MEMREF(hb),
+            PASS_MEMREF(hb_silu),
             PASS_MEMREF(q),
             PASS_MEMREF(k),
             PASS_MEMREF(v),
             PASS_MEMREF(att),
-            PASS_MEMREF(hb),
-            PASS_MEMREF(hb2),
+            PASS_MEMREF(att_soft),
             PASS_MEMREF(logits),
             PASS_MEMREF(key_cache),
             PASS_MEMREF(value_cache),
@@ -175,11 +214,11 @@ int main() {
         float res = llama2_forward(
             PASS_MEMREF(token_emb),
             PASS_MEMREF(rms_att_w),
-            PASS_MEMREF(rms_ffn_w),
             PASS_MEMREF(wq),
             PASS_MEMREF(wk),
             PASS_MEMREF(wv),
             PASS_MEMREF(wo),
+            PASS_MEMREF(rms_ffn_w),
             PASS_MEMREF(w1),
             PASS_MEMREF(w2),
             PASS_MEMREF(w3),
@@ -188,12 +227,13 @@ int main() {
             PASS_MEMREF(x),
             PASS_MEMREF(xb),
             PASS_MEMREF(xb2),
+            PASS_MEMREF(hb),
+            PASS_MEMREF(hb_silu),
             PASS_MEMREF(q),
             PASS_MEMREF(k),
             PASS_MEMREF(v),
             PASS_MEMREF(att),
-            PASS_MEMREF(hb),
-            PASS_MEMREF(hb2),
+            PASS_MEMREF(att_soft),
             PASS_MEMREF(logits),
             PASS_MEMREF(key_cache),
             PASS_MEMREF(value_cache),
@@ -205,19 +245,25 @@ int main() {
         std::cout << "  pos " << p << " (token " << tokens[p] << "): " << res << std::endl;
     }
 
-    // Benchmark
-    const int num_runs = 1000;
+    // Benchmark: Generate 10 tokens sequentially
+    std::cout << "\nBenchmark: Generating 10 tokens..." << std::endl;
+    const int num_tokens = 10;
+
+    // Clear KV cache
+    std::fill(key_cache.begin(), key_cache.end(), 0.0f);
+    std::fill(value_cache.begin(), value_cache.end(), 0.0f);
+
     auto start = std::chrono::high_resolution_clock::now();
 
-    for (int i = 0; i < num_runs; i++) {
+    for (int pos = 0; pos < num_tokens; pos++) {
         float result = llama2_forward(
             PASS_MEMREF(token_emb),
             PASS_MEMREF(rms_att_w),
-            PASS_MEMREF(rms_ffn_w),
             PASS_MEMREF(wq),
             PASS_MEMREF(wk),
             PASS_MEMREF(wv),
             PASS_MEMREF(wo),
+            PASS_MEMREF(rms_ffn_w),
             PASS_MEMREF(w1),
             PASS_MEMREF(w2),
             PASS_MEMREF(w3),
@@ -226,41 +272,49 @@ int main() {
             PASS_MEMREF(x),
             PASS_MEMREF(xb),
             PASS_MEMREF(xb2),
+            PASS_MEMREF(hb),
+            PASS_MEMREF(hb_silu),
             PASS_MEMREF(q),
             PASS_MEMREF(k),
             PASS_MEMREF(v),
             PASS_MEMREF(att),
-            PASS_MEMREF(hb),
-            PASS_MEMREF(hb2),
+            PASS_MEMREF(att_soft),
             PASS_MEMREF(logits),
             PASS_MEMREF(key_cache),
             PASS_MEMREF(value_cache),
-            100, i % 10,  // token, pos
+            100 + pos, pos,  // token, pos
             dim, hidden_dim,
             n_layers, n_heads, n_kv_heads,
             vocab_size, seq_len
         );
 
-        if (i == 0) {
-            std::cout << "\nBenchmark starting..." << std::endl;
-            if (!std::isfinite(result)) {
-                std::cerr << "ERROR: Output is not finite!" << std::endl;
-                dlclose(handle);
-                return 1;
-            }
+        if (!std::isfinite(result)) {
+            std::cerr << "ERROR: Output is not finite at position " << pos << std::endl;
+            dlclose(handle);
+            return 1;
         }
+        std::cout << "  Token " << pos << ": logit=" << result << std::endl;
     }
 
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 
-    double avg_time_ms = duration.count() / 1000.0 / num_runs;
+    double total_time_ms = duration.count() / 1000.0;
+    double avg_time_ms = total_time_ms / num_tokens;
     double tokens_per_sec = 1000.0 / avg_time_ms;
+
+    // Calculate GFLOPS
+    // FLOPs per token = 2 * n_params (forward pass approximation)
+    // For transformer: ~2 * (12 * n_layers * dim^2 + vocab * dim)
+    double flops_per_token = 2.0 * (12.0 * n_layers * dim * dim + vocab_size * dim);
+    double gflops = (flops_per_token * tokens_per_sec) / 1e9;
 
     std::cout << "\n=== Results ===" << std::endl;
     std::cout << std::fixed << std::setprecision(3);
+    std::cout << "Total time: " << total_time_ms << " ms" << std::endl;
     std::cout << "Average time per token: " << avg_time_ms << " ms" << std::endl;
-    std::cout << "Tokens/second: " << tokens_per_sec << std::endl;
+    std::cout << "Throughput: " << tokens_per_sec << " tokens/s" << std::endl;
+    std::cout << "Compute: " << gflops << " GFLOPS" << std::endl;
     std::cout << "SUCCESS!" << std::endl;
 
     dlclose(handle);

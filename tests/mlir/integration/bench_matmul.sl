@@ -28,7 +28,7 @@ fn main() -> f32 {
     var C = array<f32>([4096]);
 
     while (iter < iterations) {
-        C = matmul(A, B, 64, 64, 64);
+        C = matmul(A, B, C, 64, 64, 64, 0, 0, 0);
         iter = iter + 1;
     }
 

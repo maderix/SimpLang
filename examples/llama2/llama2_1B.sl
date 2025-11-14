@@ -1,281 +1,254 @@
-// LLaMA 2 1B Transformer Forward Pass - Vectorized with matmul builtin
-// Config: dim=1536, hidden_dim=6144, n_layers=24, n_heads=16, vocab=32000
+// LLaMA 2 1B Model
+// Config: dim=1536, n_layers=24, n_heads=16, vocab=32000, seq_len=512
+// ~1B parameters
 
 fn llama2_forward(
-    // Weights (host-allocated)
-    f32[] token_emb,
-    f32[] rms_att_w,
-    f32[] rms_ffn_w,
-    f32[] wq, f32[] wk, f32[] wv, f32[] wo,
-    f32[] w1, f32[] w2, f32[] w3,
-    f32[] rms_final_w,
-    f32[] wcls,
-    // Activations (host-allocated buffers)
-    f32[] x,
-    f32[] xb,
-    f32[] xb2,
-    f32[] q, f32[] k, f32[] v,
-    f32[] att,
-    f32[] hb, f32[] hb2,
-    f32[] logits,
-    // KV cache (host-allocated)
+    // Token embeddings
+    f32[] token_embedding_table,
+
+    // Transformer weights (24 layers)
+    f32[] rms_att_w,  // [n_layers, dim]
+    f32[] wq, f32[] wk, f32[] wv, f32[] wo,  // attention weights
+    f32[] rms_ffn_w,  // [n_layers, dim]
+    f32[] w1, f32[] w2, f32[] w3,  // FFN weights
+
+    // Final layer
+    f32[] rms_final_w,  // [dim]
+    f32[] wcls,  // classifier weights [vocab_size, dim]
+
+    // Activations and state
+    f32[] x,        // input activation [dim]
+    f32[] xb,       // intermediate buffer [dim]
+    f32[] xb2,      // second buffer [dim]
+    f32[] hb,       // hidden dimension buffer [hidden_dim=6144]
+    f32[] hb_silu,  // SiLU activation buffer [hidden_dim]
+    f32[] q, f32[] k, f32[] v,  // query, key, value [dim]
+    f32[] att,      // attention scores [n_heads, seq_len]
+    f32[] att_soft, // softmax attention [n_heads, seq_len]
+    f32[] logits,   // output logits [vocab_size]
+
+    // KV cache [n_layers, seq_len, dim]
     f32[] key_cache,
     f32[] value_cache,
-    // Parameters
-    i64 token, i64 pos,
-    i64 dim, i64 hidden_dim,
-    i64 n_layers, i64 n_heads, i64 n_kv_heads,
-    i64 vocab_size, i64 seq_len
-) -> f32 {
-    var head_size = dim / n_heads;
-    var kv_dim = (dim * n_kv_heads) / n_heads;
-    var kv_mul = n_heads / n_kv_heads;
 
-    // 1. Token embedding
-    var token_offset = token * dim;
+    // Hyperparameters
+    i64 token,      // current token
+    i64 pos,        // position in sequence
+    i64 dim,        // 1536
+    i64 hidden_dim, // 6144 (4 * dim)
+    i64 n_layers,   // 24
+    i64 n_heads,    // 16
+    i64 n_kv_heads, // 16
+    i64 vocab_size, // 32000
+    i64 seq_len     // 512
+) -> f32 {
+    // Hyperparameters
+    var head_size = dim / n_heads;  // 96
+    var kv_dim = (dim * n_kv_heads) / n_heads;  // 1536
+
+    // Copy token embedding into x
     var i = 0i;
     while (i < dim) {
-        x[i] = token_emb[token_offset + i];
+        x[i] = token_embedding_table[token * dim + i];
         i = i + 1i;
     }
 
-    // 2. Transformer layers
+    // Forward through all layers
     var layer = 0i;
     while (layer < n_layers) {
-        var layer_offset = layer * dim;
+        // Attention RMSNorm
+        var rms_w_offset = layer * dim;
+        xb = rmsnorm(x, rms_att_w, xb, dim, 0.00001, rms_w_offset);
 
-        // === Attention ===
+        // QKV projections using matmul builtin
+        var qkv_offset = layer * dim * dim;
 
-        // RMSNorm
-        var j = 0i;
-        while (j < dim) {
-            xb[j] = 0.0;
-            j = j + 1i;
+        // Zero output buffers (matmul does accumulation C += A*B)
+        i = 0i;
+        while (i < dim) {
+            q[i] = 0.0;
+            k[i] = 0.0;
+            v[i] = 0.0;
+            i = i + 1i;
         }
 
-        // Use xb2 temporarily to store rms weights
-        var rw = 0i;
-        while (rw < dim) {
-            xb2[rw] = rms_att_w[layer_offset + rw];
-            rw = rw + 1i;
-        }
-        xb = rmsnorm(x, rms_att_w, xb, dim, 0.00001, layer_offset);
+        // Q = wq @ xb (treating xb as column vector [dim x 1])
+        // matmul(lhs, rhs, output, m, k, n, lhs_offset, rhs_offset, output_offset)
+        q = matmul(wq, xb, q, 1536i, 1536i, 1i, qkv_offset, 0i, 0i);
 
-        // QKV projections
-        var qkv_i = 0i;
-        while (qkv_i < dim) {
-            q[qkv_i] = 0.0;
-            qkv_i = qkv_i + 1i;
-        }
-        var kv_i = 0i;
-        while (kv_i < kv_dim) {
-            k[kv_i] = 0.0;
-            v[kv_i] = 0.0;
-            kv_i = kv_i + 1i;
+        // K = wk @ xb
+        k = matmul(wk, xb, k, 1536i, 1536i, 1i, qkv_offset, 0i, 0i);
+
+        // V = wv @ xb
+        v = matmul(wv, xb, v, 1536i, 1536i, 1i, qkv_offset, 0i, 0i);
+
+        // RoPE: Rotary Position Embedding on Q and K
+        i = 0i;
+        while (i < dim) {
+            var head_dim_i = i % head_size;
+            var head_dim_f = head_dim_i * 1.0;  // Convert to float
+            var head_size_f = head_size * 1.0;
+            var freq = 1.0 / pow(10000.0, head_dim_f / head_size_f);
+            var pos_f = pos * 1.0;
+            var val = pos_f * freq;
+            var fcr = cos(val);
+            var fci = sin(val);
+
+            // Always rotate Q
+            var q0 = q[i];
+            var q1 = q[i + 1i];
+            q[i] = q0 * fcr - q1 * fci;
+            q[i + 1i] = q0 * fci + q1 * fcr;
+
+            // Only rotate K if i < kv_dim (for multi-query attention)
+            if (i < kv_dim) {
+                var k0 = k[i];
+                var k1 = k[i + 1i];
+                k[i] = k0 * fcr - k1 * fci;
+                k[i + 1i] = k0 * fci + k1 * fcr;
+            }
+
+            i = i + 2i;
         }
 
-        // Weight offsets for this layer
-        var wq_off = layer * dim * dim;
-        var wk_off = layer * dim * kv_dim;
-        var wv_off = layer * dim * kv_dim;
-        var wo_off = layer * dim * dim;
-
-        // Q projection: q = wq @ xb  (4096 x 4096) @ (4096 x 1) -> (4096 x 1)
-        // Zero output (matmul accumulates)
-        var qi = 0i;
-        while (qi < dim) {
-            q[qi] = 0.0;
-            qi = qi + 1i;
-        }
-        q = matmul(wq, xb, q, 1536i, 1536i, 1i, wq_off, 0i, 0i);
-
-        // K projection: k = wk @ xb  (4096 x 4096) @ (4096 x 1) -> (4096 x 1)
-        var ki = 0i;
-        while (ki < kv_dim) {
-            k[ki] = 0.0;
-            ki = ki + 1i;
-        }
-        k = matmul(wk, xb, k, 1536i, 1536i, 1i, wk_off, 0i, 0i);
-
-        // V projection: v = wv @ xb  (4096 x 4096) @ (4096 x 1) -> (4096 x 1)
-        var vi = 0i;
-        while (vi < kv_dim) {
-            v[vi] = 0.0;
-            vi = vi + 1i;
-        }
-        v = matmul(wv, xb, v, 1536i, 1536i, 1i, wv_off, 0i, 0i);
-
-        // Cache KV
-        var kv_cache_off = layer * seq_len * kv_dim + pos * kv_dim;
-        var c = 0i;
-        while (c < kv_dim) {
-            key_cache[kv_cache_off + c] = k[c];
-            value_cache[kv_cache_off + c] = v[c];
-            c = c + 1i;
+        // Store KV in cache
+        var kv_offset = layer * seq_len * dim + pos * dim;
+        i = 0i;
+        while (i < dim) {
+            key_cache[kv_offset + i] = k[i];
+            value_cache[kv_offset + i] = v[i];
+            i = i + 1i;
         }
 
         // Multi-head attention
         var h = 0i;
         while (h < n_heads) {
-            var q_off = h * head_size;
-            var kv_head = h / kv_mul;
-            var kv_off_base = kv_head * head_size;
+            var q_offset = h * head_size;
 
-            // Compute attention scores for all positions up to pos
-            var att_off = h * seq_len;
+            // Attention scores for this head
             var t = 0i;
-            while (t <= pos) {
-                var key_pos_off = layer * seq_len * kv_dim + t * kv_dim + kv_off_base;
-
-                // Dot product q @ k
+            var att_len = pos + 1i;
+            while (t < att_len) {
                 var score = 0.0;
-                var hs = 0i;
-                while (hs < head_size) {
-                    score = score + q[q_off + hs] * key_cache[key_pos_off + hs];
-                    hs = hs + 1i;
-                }
+                var kv_pos = layer * seq_len * dim + t * dim + h * head_size;
 
-                // Scale by 1/sqrt(head_size)
-                score = score / 8.0;  // Approx sqrt(64)
-                att[att_off + t] = score;
+                i = 0i;
+                while (i < head_size) {
+                    score = score + q[q_offset + i] * key_cache[kv_pos + i];
+                    i = i + 1i;
+                }
+                score = score / 9.75;  // sqrt(head_size=96) ≈ 9.75
+                att[h * seq_len + t] = score;
                 t = t + 1i;
             }
 
-            // Softmax over attention scores (positions 0 to pos)
-            var att_len = pos + 1i;
-            var att_tmp = array<f32>([seq_len]);
-            var a_idx = 0i;
-            while (a_idx < att_len) {
-                att_tmp[a_idx] = att[att_off + a_idx];
-                a_idx = a_idx + 1i;
-            }
-            var att_soft = array<f32>([seq_len]);
-            var a_init = 0i;
-            while (a_init < att_len) {
-                att_soft[a_init] = 0.0;
-                a_init = a_init + 1i;
-            }
-            att_soft = softmax(att_tmp, att_soft, att_len, 0i, 0i);
+            // Softmax (with offset for current head)
+            var att_offset = h * seq_len;
+            att_soft = softmax(att, att_soft, att_len, att_offset, att_offset);
 
             // Weighted sum of values
-            var hs2 = 0i;
-            while (hs2 < head_size) {
+            i = 0i;
+            while (i < head_size) {
                 var val = 0.0;
-                var t2 = 0i;
-                while (t2 <= pos) {
-                    var value_pos_off = layer * seq_len * kv_dim + t2 * kv_dim + kv_off_base + hs2;
-                    val = val + att_soft[t2] * value_cache[value_pos_off];
-                    t2 = t2 + 1i;
+                t = 0i;
+                while (t < att_len) {
+                    var v_pos = layer * seq_len * dim + t * dim + h * head_size;
+                    val = val + att_soft[h * seq_len + t] * value_cache[v_pos + i];
+                    t = t + 1i;
                 }
-                xb2[q_off + hs2] = val;
-                hs2 = hs2 + 1i;
+                xb[q_offset + i] = val;
+                i = i + 1i;
             }
 
             h = h + 1i;
         }
 
-        // Output projection: xb = wo @ xb2  (4096 x 4096) @ (4096 x 1) -> (4096 x 1)
-        var oi = 0i;
-        while (oi < dim) {
-            xb[oi] = 0.0;
-            oi = oi + 1i;
+        // Output projection: xb2 = wo @ xb
+        var wo_offset = layer * dim * dim;
+        // Zero output buffer
+        i = 0i;
+        while (i < dim) {
+            xb2[i] = 0.0;
+            i = i + 1i;
         }
-        xb = matmul(wo, xb2, xb, 1536i, 1536i, 1i, wo_off, 0i, 0i);
+        xb2 = matmul(wo, xb, xb2, 1536i, 1536i, 1i, wo_offset, 0i, 0i);
 
-        // Residual
-        var r1 = 0i;
-        while (r1 < dim) {
-            x[r1] = x[r1] + xb[r1];
-            r1 = r1 + 1i;
-        }
-
-        // === FFN ===
-
-        // RMSNorm
-        var j2 = 0i;
-        while (j2 < dim) {
-            xb[j2] = 0.0;
-            j2 = j2 + 1i;
+        // Residual connection
+        i = 0i;
+        while (i < dim) {
+            x[i] = x[i] + xb2[i];
+            i = i + 1i;
         }
 
-        // Use xb2 temporarily to store rms weights
-        var rw2 = 0i;
-        while (rw2 < dim) {
-            xb2[rw2] = rms_ffn_w[layer_offset + rw2];
-            rw2 = rw2 + 1i;
-        }
-        xb = rmsnorm(x, rms_att_w, xb, dim, 0.00001, layer_offset);
+        // FFN RMSNorm
+        rms_w_offset = layer * dim;
+        xb = rmsnorm(x, rms_ffn_w, xb, dim, 0.00001, rms_w_offset);
 
-        // SwiGLU FFN
-        var w1_off = layer * hidden_dim * dim;
-        var w2_off = layer * dim * hidden_dim;
-        var w3_off = layer * hidden_dim * dim;
+        // FFN: SwiGLU
+        var ffn_offset = layer * dim * hidden_dim;
 
-        // Gate projection: hb = w1 @ xb  (11008 x 4096) @ (4096 x 1) -> (11008 x 1)
-        var g_init = 0i;
-        while (g_init < hidden_dim) {
-            hb[g_init] = 0.0;
-            g_init = g_init + 1i;
+        // Zero output buffer for hb
+        i = 0i;
+        while (i < hidden_dim) {
+            hb[i] = 0.0;
+            i = i + 1i;
         }
-        hb = matmul(w1, xb, hb, 6144i, 1536i, 1i, w1_off, 0i, 0i);
 
-        // Up projection: hb2 = w3 @ xb  (11008 x 4096) @ (4096 x 1) -> (11008 x 1)
-        var u_init = 0i;
-        while (u_init < hidden_dim) {
-            hb2[u_init] = 0.0;
-            u_init = u_init + 1i;
-        }
-        hb2 = matmul(w3, xb, hb2, 6144i, 1536i, 1i, w3_off, 0i, 0i);
+        // hb = w1 @ xb (xb: [dim x 1], w1: [hidden_dim x dim])
+        hb = matmul(w1, xb, hb, 6144i, 1536i, 1i, ffn_offset, 0i, 0i);
 
-        // SiLU activation on gate
-        var hb_silu = array<f32>([hidden_dim]);
-        var s_init = 0i;
-        while (s_init < hidden_dim) {
-            hb_silu[s_init] = 0.0;
-            s_init = s_init + 1i;
-        }
+        // hb_silu = silu(hb)
         hb_silu = silu(hb, hb_silu, hidden_dim);
 
-        // Element-wise multiply: hb = hb_silu * hb2
-        var m_idx = 0i;
-        while (m_idx < hidden_dim) {
-            hb[m_idx] = hb_silu[m_idx] * hb2[m_idx];
-            m_idx = m_idx + 1i;
+        // Reuse hb for w3 output (we already saved silu result in hb_silu)
+        // Zero hb for w3 output
+        i = 0i;
+        while (i < hidden_dim) {
+            hb[i] = 0.0;
+            i = i + 1i;
         }
 
-        // Down projection: xb = w2 @ hb  (4096 x 11008) @ (11008 x 1) -> (4096 x 1)
-        var d_init = 0i;
-        while (d_init < dim) {
-            xb[d_init] = 0.0;
-            d_init = d_init + 1i;
-        }
-        xb = matmul(w2, hb, xb, 1536i, 6144i, 1i, w2_off, 0i, 0i);
+        // hb = w3 @ xb (reusing hb as temp buffer)
+        hb = matmul(w3, xb, hb, 6144i, 1536i, 1i, ffn_offset, 0i, 0i);
 
-        // Residual
-        var r2 = 0i;
-        while (r2 < dim) {
-            x[r2] = x[r2] + xb[r2];
-            r2 = r2 + 1i;
+        // Element-wise multiply: hb = hb_silu * hb (w3 output)
+        i = 0i;
+        while (i < hidden_dim) {
+            hb[i] = hb_silu[i] * hb[i];
+            i = i + 1i;
+        }
+
+        // Down projection: xb = w2 @ hb (hb: [hidden_dim x 1], w2: [dim x hidden_dim])
+        var w2_offset = layer * hidden_dim * dim;
+        // Zero output buffer
+        i = 0i;
+        while (i < dim) {
+            xb[i] = 0.0;
+            i = i + 1i;
+        }
+        xb = matmul(w2, hb, xb, 1536i, 6144i, 1i, w2_offset, 0i, 0i);
+
+        // Residual connection
+        i = 0i;
+        while (i < dim) {
+            x[i] = x[i] + xb[i];
+            i = i + 1i;
         }
 
         layer = layer + 1i;
     }
 
-    // 3. Final norm
-    var f = 0i;
-    while (f < dim) {
-        xb[f] = 0.0;
-        f = f + 1i;
-    }
+    // Final RMSNorm (no layer offset for final norm)
     xb = rmsnorm(x, rms_final_w, xb, dim, 0.00001, 0i);
 
-    // 4. Classifier: logits = wcls @ xb  (32000 x 4096) @ (4096 x 1) -> (32000 x 1)
-    var l_init = 0i;
-    while (l_init < vocab_size) {
-        logits[l_init] = 0.0;
-        l_init = l_init + 1i;
+    // Classifier: logits = wcls @ xb (xb: [dim x 1], wcls: [vocab_size x dim])
+    // Zero output buffer
+    i = 0i;
+    while (i < vocab_size) {
+        logits[i] = 0.0;
+        i = i + 1i;
     }
     logits = matmul(wcls, xb, logits, 32000i, 1536i, 1i, 0i, 0i, 0i);
 
-    return logits[0i];
+    return logits[0];
 }

@@ -4,10 +4,10 @@
 
 typedef float (*TestFunc)();
 
-int main() {
-    system("gcc -shared -o /tmp/test_swiglu_ffn.so /tmp/test_swiglu_ffn -lm");
+int main(int argc, char** argv) {
+    const char* so_path = (argc > 1) ? argv[1] : "/tmp/test_swiglu_ffn.so";
 
-    void* handle = dlopen("/tmp/test_swiglu_ffn.so", RTLD_LAZY);
+    void* handle = dlopen(so_path, RTLD_LAZY);
     if (!handle) {
         std::cerr << "Failed to load kernel: " << dlerror() << std::endl;
         return 1;

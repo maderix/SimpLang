@@ -4,11 +4,10 @@
 
 typedef float (*TestFunc)();
 
-int main() {
-    // Convert object to shared library first
-    system("gcc -shared -o /tmp/test_softmax.so /tmp/test_softmax -lm");
+int main(int argc, char** argv) {
+    const char* so_path = (argc > 1) ? argv[1] : "/tmp/test_softmax.so";
 
-    void* handle = dlopen("/tmp/test_softmax.so", RTLD_LAZY);
+    void* handle = dlopen(so_path, RTLD_LAZY);
     if (!handle) {
         std::cerr << "Failed to load kernel: " << dlerror() << std::endl;
         return 1;

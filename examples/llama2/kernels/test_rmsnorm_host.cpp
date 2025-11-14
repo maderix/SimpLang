@@ -4,9 +4,11 @@
 
 typedef float (*TestFunc)();
 
-int main() {
+int main(int argc, char** argv) {
+    const char* so_path = (argc > 1) ? argv[1] : "/tmp/test_rmsnorm.so";
+
     // Load the compiled kernel
-    void* handle = dlopen("/tmp/test_rmsnorm.so", RTLD_LAZY);
+    void* handle = dlopen(so_path, RTLD_LAZY);
     if (!handle) {
         std::cerr << "Failed to load kernel: " << dlerror() << std::endl;
         return 1;

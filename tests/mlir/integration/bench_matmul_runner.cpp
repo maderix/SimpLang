@@ -30,15 +30,16 @@ int main(int argc, char** argv) {
     auto start = std::chrono::high_resolution_clock::now();
     float result = kernel_main();
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    double duration_ms = duration_us.count() / 1000.0;
 
     std::cout << "SimpLang MLIR+Linalg:\n";
     std::cout << "  Matrix size: 64x64\n";
     std::cout << "  Iterations: 10\n";
-    std::cout << "  Total time: " << duration.count() << " ms\n";
-    std::cout << "  Time per iteration: " << (duration.count() / 10.0) << " ms\n";
+    std::cout << "  Total time: " << duration_ms << " ms\n";
+    std::cout << "  Time per iteration: " << (duration_ms / 10.0) << " ms\n";
     std::cout << "  Result C[0]: " << result << " (expected: 128.0)\n";
-    std::cout << "  GFLOPS: " << (2.0 * 64 * 64 * 64 * 10) / (duration.count() / 1000.0) / 1e9 << "\n";
+    std::cout << "  GFLOPS: " << (2.0 * 64 * 64 * 64 * 10) / (duration_ms / 1000.0) / 1e9 << "\n";
 
     if (std::abs(result - 128.0f) < 0.01f) {
         std::cout << "  ✓ Correctness: PASS\n";

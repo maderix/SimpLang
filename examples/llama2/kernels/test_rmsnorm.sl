@@ -29,12 +29,12 @@ fn test_rmsnorm() -> f32 {
     output[3i] = 0.0;
 
     // Apply RMSNorm
-    var result = rmsnorm(input, weight, output, size, eps);
+    output = rmsnorm(input, weight, output, size, eps, 0i);
 
     // Return first element for validation
     // Expected: 1.0 / sqrt((1^2 + 2^2 + 3^2 + 4^2) / 4 + 1e-5) * 1.0
     // = 1.0 / sqrt((1 + 4 + 9 + 16) / 4)
     // = 1.0 / sqrt(7.5)
     // ≈ 1.0 / 2.738 ≈ 0.365
-    return result[0i];
+    return output[0i];
 }
