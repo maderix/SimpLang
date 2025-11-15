@@ -11,6 +11,9 @@ PASSED=0
 FAILED=0
 TOTAL=0
 
+# Set VERBOSE=1 to see full output
+VERBOSE=${VERBOSE:-0}
+
 # Build MLIR compiler if needed
 if [ ! -f "build_mlir/src/simplang" ]; then
     echo -e "${BLUE}Building MLIR compiler...${NC}"
@@ -54,34 +57,74 @@ run_test() {
     local log_file="/tmp/mlir_log_$$_$TOTAL.txt"
 
     # Compile kernel
-    if ! ./build_mlir/src/simplang "$kernel" --emit-mlir $flags -o "$tmp_kernel.o" > "$log_file" 2>&1; then
+    if [ "$VERBOSE" = "1" ]; then
+        ./build_mlir/src/simplang "$kernel" --emit-mlir $flags -o "$tmp_kernel.o" 2>&1 | tee "$log_file"
+        compile_result=${PIPESTATUS[0]}
+    else
+        ./build_mlir/src/simplang "$kernel" --emit-mlir $flags -o "$tmp_kernel.o" > "$log_file" 2>&1
+        compile_result=$?
+    fi
+
+    if [ $compile_result -ne 0 ]; then
         echo -e "${RED}FAIL${NC} (kernel compilation)"
-        echo -e "  ${RED}Error:${NC} $(tail -3 $log_file | head -1)"
+        if [ "$VERBOSE" != "1" ]; then
+            echo -e "  ${RED}Error:${NC} $(tail -5 $log_file)"
+            echo -e "  ${YELLOW}Log saved to:${NC} $log_file"
+        fi
         FAILED=$((FAILED + 1))
-        rm -f "$log_file"
         return
     fi
 
     # Link to .so
-    if ! gcc -shared -o "$tmp_kernel.so" "$tmp_kernel.o" -lm > "$log_file" 2>&1; then
+    if [ "$VERBOSE" = "1" ]; then
+        gcc -shared -o "$tmp_kernel.so" "$tmp_kernel.o" -lm 2>&1 | tee -a "$log_file"
+        link_result=${PIPESTATUS[0]}
+    else
+        gcc -shared -o "$tmp_kernel.so" "$tmp_kernel.o" -lm >> "$log_file" 2>&1
+        link_result=$?
+    fi
+
+    if [ $link_result -ne 0 ]; then
         echo -e "${RED}FAIL${NC} (linking)"
-        echo -e "  ${RED}Error:${NC} $(tail -3 $log_file | head -1)"
+        if [ "$VERBOSE" != "1" ]; then
+            echo -e "  ${RED}Error:${NC} $(tail -5 $log_file)"
+            echo -e "  ${YELLOW}Log saved to:${NC} $log_file"
+        fi
         FAILED=$((FAILED + 1))
-        rm -f "$tmp_kernel.o" "$log_file"
+        rm -f "$tmp_kernel.o"
         return
     fi
 
     # Compile runner
-    if ! g++ -o "$tmp_runner" "$runner" -ldl -std=c++14 > "$log_file" 2>&1; then
+    if [ "$VERBOSE" = "1" ]; then
+        g++ -o "$tmp_runner" "$runner" -ldl -std=c++14 2>&1 | tee -a "$log_file"
+        runner_result=${PIPESTATUS[0]}
+    else
+        g++ -o "$tmp_runner" "$runner" -ldl -std=c++14 >> "$log_file" 2>&1
+        runner_result=$?
+    fi
+
+    if [ $runner_result -ne 0 ]; then
         echo -e "${RED}FAIL${NC} (runner compilation)"
-        echo -e "  ${RED}Error:${NC} $(tail -3 $log_file | head -1)"
+        if [ "$VERBOSE" != "1" ]; then
+            echo -e "  ${RED}Error:${NC} $(tail -5 $log_file)"
+            echo -e "  ${YELLOW}Log saved to:${NC} $log_file"
+        fi
         FAILED=$((FAILED + 1))
-        rm -f "$tmp_kernel.o" "$tmp_kernel.so" "$log_file"
+        rm -f "$tmp_kernel.o" "$tmp_kernel.so"
         return
     fi
 
     # Run test
-    if timeout $timeout_sec "$tmp_runner" "$tmp_kernel.so" $extra_args > "$log_file" 2>&1; then
+    if [ "$VERBOSE" = "1" ]; then
+        timeout $timeout_sec "$tmp_runner" "$tmp_kernel.so" $extra_args 2>&1 | tee -a "$log_file"
+        test_result=${PIPESTATUS[0]}
+    else
+        timeout $timeout_sec "$tmp_runner" "$tmp_kernel.so" $extra_args >> "$log_file" 2>&1
+        test_result=$?
+    fi
+
+    if [ $test_result -eq 0 ]; then
         echo -e "${GREEN}PASS${NC}"
 
         # Show performance metrics if requested
@@ -102,13 +145,17 @@ run_test() {
         fi
 
         PASSED=$((PASSED + 1))
+        rm -f "$log_file"
     else
         echo -e "${RED}FAIL${NC} (execution)"
-        echo -e "  ${RED}Error:${NC} $(tail -3 $log_file | head -1)"
+        if [ "$VERBOSE" != "1" ]; then
+            echo -e "  ${RED}Error:${NC} $(tail -5 $log_file)"
+            echo -e "  ${YELLOW}Log saved to:${NC} $log_file"
+        fi
         FAILED=$((FAILED + 1))
     fi
 
-    rm -f "$tmp_kernel.o" "$tmp_kernel.so" "$tmp_runner" "$log_file"
+    rm -f "$tmp_kernel.o" "$tmp_kernel.so" "$tmp_runner"
 }
 
 echo -e "${BLUE}========================================${NC}"
