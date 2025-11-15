@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+# Don't use set -e because tests are expected to fail sometimes
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
