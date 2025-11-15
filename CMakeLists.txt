@@ -17,10 +17,8 @@ option(ENABLE_DEBUGGER "Enable kernel debugger" ON)
 option(USE_MLIR "Enable MLIR integration" OFF)
 
 # LLVM setup
-# Prefer custom LLVM build if MLIR is enabled
-if(USE_MLIR)
-    set(LLVM_DIR "$ENV{HOME}/llvm-project/build/lib/cmake/llvm" CACHE PATH "Path to LLVM cmake config")
-endif()
+# LLVM_DIR should be set via -DLLVM_DIR=... when running cmake
+# build.sh will set this to the correct location
 find_package(LLVM REQUIRED CONFIG)
 find_package(BISON REQUIRED)
 find_package(FLEX REQUIRED)
@@ -47,9 +45,8 @@ message(STATUS "Found readline: ${READLINE_LIBRARY}")
 
 # MLIR setup (optional, controlled by USE_MLIR option)
 if(USE_MLIR)
-    # Try to find MLIR in the known build location
-    set(MLIR_DIR "$ENV{HOME}/llvm-project/build/lib/cmake/mlir" CACHE PATH "Path to MLIR cmake config")
-
+    # MLIR_DIR should be set via -DMLIR_DIR=... when running cmake
+    # build.sh will set this to the correct location
     find_package(MLIR REQUIRED CONFIG)
 
     message(STATUS "MLIR integration ENABLED")

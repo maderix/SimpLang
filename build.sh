@@ -22,17 +22,18 @@ print_usage() {
     echo "Usage: $0 [options]"
     echo ""
     echo "Options:"
-    echo "  --check-deps     Check and install dependencies"
+    echo "  --check-deps     Check dependencies"
+    echo "  --install-deps   Install missing dependencies"
     echo "  --setup-llvm     Build LLVM with MLIR support (takes 30-60 min)"
-    echo "  --mlir           Build MLIR backend"
+    echo "  --mlir           Build MLIR backend (auto-builds LLVM if needed)"
     echo "  --all            Build both standard and MLIR backends"
     echo "  --test           Run tests after building"
     echo "  --clean          Clean build directories before building"
     echo "  -h, --help       Show this help message"
     echo ""
     echo "Examples:"
+    echo "  $0 --install-deps       # Install all dependencies"
     echo "  $0 --check-deps         # Check dependencies"
-    echo "  $0 --setup-llvm         # Build LLVM+MLIR (first time only)"
     echo "  $0 --mlir --test        # Build MLIR backend and run tests"
     echo "  $0 --all --test         # Build everything and run tests"
 }
@@ -90,6 +91,41 @@ check_dependencies() {
     fi
 
     echo -e "${GREEN}All dependencies satisfied!${NC}"
+    return 0
+}
+
+install_dependencies() {
+    echo -e "${BLUE}Installing dependencies...${NC}"
+
+    # Detect OS
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS=$ID
+    elif [ "$(uname)" = "Darwin" ]; then
+        OS="macos"
+    else
+        echo -e "${RED}Unknown OS. Please install dependencies manually.${NC}"
+        return 1
+    fi
+
+    # Install based on OS
+    if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
+        echo -e "${YELLOW}Installing dependencies for Ubuntu/Debian...${NC}"
+        sudo apt-get update
+        sudo apt-get install -y cmake ninja-build bison flex g++ git build-essential python3 libreadline-dev
+    elif [ "$OS" = "macos" ]; then
+        echo -e "${YELLOW}Installing dependencies for macOS...${NC}"
+        if ! command -v brew >/dev/null 2>&1; then
+            echo -e "${RED}Homebrew not found. Please install from https://brew.sh${NC}"
+            return 1
+        fi
+        brew install cmake ninja bison flex git readline
+    else
+        echo -e "${RED}Unsupported OS: $OS${NC}"
+        return 1
+    fi
+
+    echo -e "${GREEN}Dependencies installed!${NC}"
     return 0
 }
 
@@ -226,6 +262,7 @@ run_mlir_tests() {
 
 # Parse arguments
 CHECK_DEPS=false
+INSTALL_DEPS=false
 SETUP_LLVM=false
 BUILD_STANDARD=false
 BUILD_MLIR=false
@@ -241,6 +278,10 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --check-deps)
             CHECK_DEPS=true
+            shift
+            ;;
+        --install-deps)
+            INSTALL_DEPS=true
             shift
             ;;
         --setup-llvm)
@@ -280,6 +321,29 @@ done
 if $CHECK_DEPS; then
     check_dependencies
     exit $?
+fi
+
+if $INSTALL_DEPS; then
+    install_dependencies
+    exit $?
+fi
+
+# Auto-check dependencies before building
+if $BUILD_STANDARD || $BUILD_MLIR; then
+    if ! check_dependencies 2>/dev/null; then
+        echo ""
+        read -p "Install missing dependencies? (y/N) " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            install_dependencies || {
+                echo -e "${RED}Failed to install dependencies${NC}"
+                exit 1
+            }
+        else
+            echo -e "${RED}Cannot build without dependencies${NC}"
+            exit 1
+        fi
+    fi
 fi
 
 if $SETUP_LLVM; then
