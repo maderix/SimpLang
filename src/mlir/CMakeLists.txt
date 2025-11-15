@@ -4,12 +4,9 @@
 cmake_minimum_required(VERSION 3.13.4)
 
 # Set the correct mlir-tblgen executable from our MLIR build
-# Use the mlir-tblgen from the MLIR build directory, not system LLVM
-if(DEFINED ENV{HOME})
-  set(MLIR_TABLEGEN_EXE "$ENV{HOME}/llvm-project/build/bin/mlir-tblgen")
-else()
-  set(MLIR_TABLEGEN_EXE "/home/maderix/llvm-project/build/bin/mlir-tblgen")
-endif()
+# Derive from MLIR_DIR which is set by build.sh
+get_filename_component(MLIR_BUILD_DIR "${MLIR_DIR}/../../.." ABSOLUTE)
+set(MLIR_TABLEGEN_EXE "${MLIR_BUILD_DIR}/bin/mlir-tblgen")
 
 # MLIR TableGen commands for generating operation definitions
 
