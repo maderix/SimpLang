@@ -378,12 +378,12 @@ int main() {
     std::cout << " Size    │ SimpLang │  GFLOP/s │  Eigen   │  GFLOP/s │ Ratio   │ Status" << std::endl;
     std::cout << "─────────┼──────────┼──────────┼──────────┼──────────┼─────────┼────────" << std::endl;
 
-    // Benchmark different sizes
-    benchmark_size("/tmp/bench_matmul_64.so", "benchmark_matmul_64", 64, 10);
-    benchmark_size("/tmp/bench_matmul_128.so", "benchmark_matmul_128", 128, 10);
-    benchmark_size("/tmp/bench_matmul_256.so", "benchmark_matmul_256", 256, 5);
-    benchmark_size("/tmp/bench_matmul_512.so", "benchmark_matmul_512", 512, 3);
-    benchmark_size("/tmp/bench_matmul_1024.so", "benchmark_matmul_1024", 1024, 2);
+    // Benchmark different sizes (float/f32)
+    benchmark_size("/tmp/bench_all_sizes.so", "benchmark_matmul_64", 64, 10);
+    benchmark_size("/tmp/bench_all_sizes.so", "benchmark_matmul_128", 128, 10);
+    benchmark_size("/tmp/bench_all_sizes.so", "benchmark_matmul_256", 256, 5);
+    benchmark_size("/tmp/bench_all_sizes.so", "benchmark_matmul_512", 512, 3);
+    benchmark_size("/tmp/bench_all_sizes.so", "benchmark_matmul_1024", 1024, 2);
 
     std::cout << "═══════════════════════════════════════════════════════════════════════════════" << std::endl;
     std::cout << std::endl;
