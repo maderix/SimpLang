@@ -101,6 +101,33 @@ scp model.so pi5:/tmp/
 | Float Matmul 256×256 | 10.21 GFLOP/s | 16.23 GFLOP/s | **+59%** |
 | Int Matmul 512×512 | 8.45 GFLOP/s | 6.82 GFLOP/s | -19% |
 
+## SimpleLang vs NumPy on ARM
+
+NumPy performance on Raspberry Pi 5 is surprisingly poor due to unoptimized OpenBLAS for ARM.
+
+### Float (f32) Matmul 256×256:
+| Library | Time | GFLOP/s | vs NumPy |
+|---------|------|---------|----------|
+| NumPy (OpenBLAS) | 12.345 ms | 2.72 | baseline |
+| **SimpleLang 8×8×8** | 2.068 ms | **16.23** | **6.0x faster** 🚀 |
+| Eigen | 1.659 ms | 20.23 | 7.4x faster |
+
+### Integer (i32) Matmul 256×256:
+| Library | Time | GIOP/s | vs NumPy |
+|---------|------|--------|----------|
+| NumPy (OpenBLAS) | 17.876 ms | 1.88 | baseline |
+| **SimpleLang 8×8×8** | 4.039 ms | **8.31** | **4.4x faster** 🚀 |
+| Eigen | 3.894 ms | 8.62 | 4.6x faster |
+
+### Integer (i32) Matmul 512×512:
+| Library | Time | GIOP/s | vs NumPy |
+|---------|------|--------|----------|
+| NumPy (OpenBLAS) | 145.009 ms | 1.85 | baseline |
+| **SimpleLang 8×8×8** | 39.357 ms | **6.82** | **3.7x faster** 🚀 |
+| Eigen | 42.999 ms | 6.24 | 3.4x faster |
+
+**Key Finding:** SimpleLang is **3.7-6.0x faster** than NumPy on Raspberry Pi 5, making it ideal for ARM-based ML deployment where NumPy would be too slow.
+
 ## Recommendations
 
 1. **Use `--tile-size 8`** for all ARM deployments
