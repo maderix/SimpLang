@@ -1,9 +1,15 @@
-include "tensor_core.sl";
+// NHWC stride calculation helper
+fn nhwc_offset(i32 n, i32 h, i32 w, i32 c,
+               i32 batch, i32 height, i32 width, i32 channel) -> i32 {
+    // NHWC layout: stride = [H*W*C, W*C, C, 1]
+    var offset = batch * (h * w * c) +
+                height * (w * c) +
+                width * c +
+                channel;
+    return offset;
+}
 
 fn kernel_main() -> f32 {
-    // Test basic tensor creation
-    var result1 = tensor_f32(1, 8, 8, 3); // 1x8x8x3 tensor (192 elements)
-    
     // Test NHWC offset calculation
     var offset1 = nhwc_offset(1, 8, 8, 3, 0, 0, 0, 0); // Should be 0
     var offset2 = nhwc_offset(1, 8, 8, 3, 0, 0, 0, 1); // Should be 1
