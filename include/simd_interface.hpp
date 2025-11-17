@@ -5,7 +5,14 @@
 #include <llvm/IR/IRBuilder.h>
 #include <vector>
 #include <string>
-#include <immintrin.h>
+
+// Architecture-specific intrinsics
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+    #include <immintrin.h>
+#elif defined(__aarch64__) || defined(__arm__)
+    #include <arm_neon.h>
+#endif
+
 #include <iostream>
 
 // On MSVC use __forceinline; otherwise use GCC/Clang attribute
@@ -15,6 +22,7 @@
   #define FORCE_INLINE __attribute__((always_inline)) inline
 #endif
 
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 //
 // Fallback: if __AVX512F__ not defined, create our own emulation type "SimdEmu512d".
 // We do *not* redefine __m512d nor _mm512_* symbols to avoid conflicts.
@@ -66,7 +74,9 @@ static FORCE_INLINE SimdEmu512d simd_emu_mm512_div_pd(SimdEmu512d a, SimdEmu512d
 }
 
 #endif // !__AVX512F__
+#endif  // x86
 
+// Platform-agnostic enums and interface
 enum class ArithOp { Add, Sub, Mul, Div };
 enum class CmpOp { EQ, LT, GT, LE, GE, NE };
 
@@ -241,6 +251,7 @@ public:
 // Factory function
 SIMDInterface* createSIMDInterface(const std::string& arch);
 
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 // Helpers for building SSE / AVX vectors in user code:
 
 // SSE expects exactly 2 doubles:
@@ -295,5 +306,7 @@ avx(double a, double b, double c, double d,
     ( ValidateAVXArgs<decltype(a), decltype(b), decltype(c), decltype(d), \
                      decltype(e), decltype(f), decltype(g), decltype(h)>(), \
       avx(a,b,c,d,e,f,g,h) )
+
+#endif  // x86
 
 #endif // SIMD_INTERFACE_HPP

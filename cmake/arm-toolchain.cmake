@@ -1,6 +1,18 @@
 # ARM Cross-Compilation Toolchain for Raspberry Pi
 # Usage: cmake -DCMAKE_TOOLCHAIN_FILE=cmake/arm-toolchain.cmake ..
 
+# Skip cross-compilation setup if building LLVM's NATIVE tools
+# LLVM creates a NATIVE subdirectory for host tools during cross-compilation
+# We need to detect this and skip toolchain application for those builds
+if(CMAKE_BINARY_DIR MATCHES "/NATIVE$" OR
+   CMAKE_BINARY_DIR MATCHES "/NATIVE/" OR
+   CMAKE_BINARY_DIR MATCHES "NATIVE" OR
+   LLVM_USE_HOST_TOOLS OR
+   CMAKE_CROSSCOMPILING_EMULATOR)
+    message(STATUS "Detected NATIVE tool build - skipping ARM toolchain")
+    return()
+endif()
+
 set(CMAKE_SYSTEM_NAME Linux)
 set(CMAKE_SYSTEM_PROCESSOR arm)
 
@@ -28,7 +40,8 @@ endif()
 
 # Where is the target environment
 set(CMAKE_FIND_ROOT_PATH /usr/${TRIPLE})
-set(CMAKE_SYSROOT /usr/${TRIPLE})
+# Don't override sysroot - let the cross-compiler use its default
+# set(CMAKE_SYSROOT /usr/${TRIPLE})
 
 # Search for programs in the build host directories
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)

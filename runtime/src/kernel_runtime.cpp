@@ -2,7 +2,6 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
-#include <immintrin.h>
 
 #ifdef _WIN32
     #include <malloc.h>
@@ -12,6 +11,7 @@
     #define aligned_free(ptr) free(ptr)
 #endif
 
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 // Vector creation operations
 __m128d sse(double a, double b) {
     alignas(16) double values[2] = {a, b};
@@ -96,8 +96,10 @@ __m512d* allocate_avx_vectors(size_t count) {
 void free_vectors(void* ptr) {
     aligned_free(ptr);
 }
+#endif  // x86
 
 // Slice management
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 sse_slice_t* make_sse_slice(size_t len) {
     sse_slice_t* slice = (sse_slice_t*)malloc(sizeof(sse_slice_t));
     if (!slice) {
@@ -148,11 +150,52 @@ avx_slice_t* make_avx_slice(size_t capacity) {
     //printf("  Vector size: %zu bytes\n", sizeof(__m512d));
     //printf("  Total allocation: %zu bytes\n", total_size);
     //printf("  Capacity: %zu vectors\n", capacity);
-    
+
+    return slice;
+}
+#else
+// ARM stub implementations for slice management
+sse_slice_t* make_sse_slice(size_t len) {
+    sse_slice_t* slice = (sse_slice_t*)malloc(sizeof(sse_slice_t));
+    if (!slice) {
+        abort();
+    }
+
+    size_t cap = len > 0 ? len : 1;
+    slice->data = malloc(cap * sizeof(double) * 2);  // 2 doubles per SSE vector
+    if (!slice->data) {
+        free(slice);
+        abort();
+    }
+
+    slice->len = 0;
+    slice->cap = cap;
     return slice;
 }
 
+avx_slice_t* make_avx_slice(size_t capacity) {
+    avx_slice_t* slice = (avx_slice_t*)malloc(sizeof(avx_slice_t));
+    if (!slice) {
+        return nullptr;
+    }
+
+    size_t total_size = capacity * sizeof(double) * 8;  // 8 doubles per AVX vector
+    slice->data = malloc(total_size);
+    if (!slice->data) {
+        free(slice);
+        return nullptr;
+    }
+
+    memset(slice->data, 0, total_size);
+    slice->len = 0;
+    slice->cap = capacity;
+
+    return slice;
+}
+#endif  // x86
+
 // Slice operations
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 __m128d slice_get_sse(sse_slice_t* slice, size_t idx) {
     if (idx >= slice->cap) {
         //printf("SSE slice index out of bounds\n");
@@ -255,30 +298,40 @@ void slice_set_avx_values(avx_slice_t* slice, size_t idx,
     __m512d vec = _mm512_load_pd(values);
     slice_set_avx(slice, idx, vec);
 }
+#endif  // x86
 
 void free_slice(void* slice) {
     if (!slice) return;
-    
+
     // Try as SSE slice first
     sse_slice_t* sse_slice = (sse_slice_t*)slice;
     if (sse_slice->data) {
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
         free_vectors(sse_slice->data);
+#else
+        free(sse_slice->data);
+#endif
         free(sse_slice);
         return;
     }
-    
+
     // Try as AVX slice next
     avx_slice_t* avx_slice = (avx_slice_t*)slice;
     if (avx_slice->data) {
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
         free_vectors(avx_slice->data);
+#else
+        free(avx_slice->data);
+#endif
         free(avx_slice);
         return;
     }
-    
+
     // If neither, just free
     free(slice);
 }
 
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 // Vector printing functions (these need to be defined)
 void print_sse_vector(__m128d vec) {
     alignas(16) double values[2];
@@ -293,3 +346,4 @@ void print_avx_vector(__m512d vec) {
     //       values[0], values[1], values[2], values[3],
     //       values[4], values[5], values[6], values[7]);
 }
+#endif  // x86
