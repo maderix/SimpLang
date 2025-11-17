@@ -12,9 +12,9 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# LLVM+MLIR paths
-LLVM_PROJECT_DIR="$SCRIPT_DIR/llvm-project"
-LLVM_BUILD_DIR="$LLVM_PROJECT_DIR/build"
+# LLVM+MLIR paths - will be set after argument parsing
+LLVM_PROJECT_DIR=""
+LLVM_BUILD_DIR_ENV="${LLVM_BUILD_DIR}"  # Save env variable for later
 
 print_usage() {
     echo "SimpleLang Build Script"
@@ -22,20 +22,28 @@ print_usage() {
     echo "Usage: $0 [options]"
     echo ""
     echo "Options:"
-    echo "  --check-deps     Check dependencies"
-    echo "  --install-deps   Install missing dependencies"
-    echo "  --setup-llvm     Build LLVM with MLIR support (takes 30-60 min)"
-    echo "  --mlir           Build MLIR backend (auto-builds LLVM if needed)"
-    echo "  --all            Build both standard and MLIR backends"
-    echo "  --test           Run tests after building"
-    echo "  --clean          Clean build directories before building"
-    echo "  -h, --help       Show this help message"
+    echo "  --check-deps           Check dependencies"
+    echo "  --install-deps         Install missing dependencies"
+    echo "  --setup-llvm           Build LLVM with MLIR and ARM target support (30-60 min)"
+    echo "  --mlir                 Build MLIR backend (auto-builds LLVM if needed)"
+    echo "  --all                  Build both standard and MLIR backends"
+    echo "  --test                 Run tests after building"
+    echo "  --clean                Clean build directories before building"
+    echo "  --install-cross-tools  Install ARM cross-compilation tools (for linking)"
+    echo "  -h, --help             Show this help message"
+    echo ""
+    echo "Environment Variables:"
+    echo "  LLVM_BUILD_DIR         Path to existing LLVM build (overrides default)"
     echo ""
     echo "Examples:"
-    echo "  $0 --install-deps       # Install all dependencies"
-    echo "  $0 --check-deps         # Check dependencies"
-    echo "  $0 --mlir --test        # Build MLIR backend and run tests"
-    echo "  $0 --all --test         # Build everything and run tests"
+    echo "  $0 --install-deps                      # Install all dependencies"
+    echo "  $0 --check-deps                        # Check dependencies"
+    echo "  $0 --mlir --test                       # Build MLIR backend and run tests"
+    echo "  $0 --setup-llvm                        # Build LLVM with ARM targets"
+    echo "  LLVM_BUILD_DIR=/path/to/llvm ./build.sh --mlir  # Use custom LLVM"
+    echo ""
+    echo "Note: SimpleLang is built as an x86 binary that can generate code for"
+    echo "      X86, ARM, and AArch64. Use --target flag when compiling .sl files."
 }
 
 check_command() {
@@ -129,15 +137,65 @@ install_dependencies() {
     return 0
 }
 
+install_cross_tools() {
+    echo -e "${BLUE}Installing ARM cross-compilation tools...${NC}"
+
+    # Detect OS
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS=$ID
+        OS_LIKE=$ID_LIKE
+    else
+        echo -e "${RED}Cross-compilation tools only available on Linux${NC}"
+        return 1
+    fi
+
+    # Check if OS is Ubuntu-based or Debian-based
+    if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ] || [[ "$OS_LIKE" == *"ubuntu"* ]] || [[ "$OS_LIKE" == *"debian"* ]]; then
+        echo -e "${YELLOW}Installing ARM cross-compilers...${NC}"
+        sudo apt-get update
+        sudo apt-get install -y \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabihf \
+            g++-arm-linux-gnueabihf \
+            qemu-user-static
+        echo -e "${GREEN}ARM cross-compilation tools installed!${NC}"
+        echo -e "${BLUE}Installed compilers:${NC}"
+        echo "  - aarch64-linux-gnu-gcc (ARM 64-bit)"
+        echo "  - arm-linux-gnueabihf-gcc (ARM 32-bit)"
+        echo "  - qemu-user-static (for testing ARM binaries)"
+    else
+        echo -e "${RED}Unsupported OS: $OS${NC}"
+        return 1
+    fi
+
+    return 0
+}
+
 setup_llvm_mlir() {
     local auto_mode=${1:-false}
 
     echo -e "${BLUE}Setting up LLVM with MLIR support...${NC}"
 
+    # Check if LLVM is built
     if [ -f "$LLVM_BUILD_DIR/bin/mlir-opt" ]; then
-        echo -e "${GREEN}LLVM+MLIR already built!${NC}"
-        echo -e "  Location: ${BLUE}$LLVM_BUILD_DIR${NC}"
-        return 0
+        # If cross-compiling, verify ARM targets are available
+        if [ -n "$TARGET_ARCH" ]; then
+            if [ -f "$LLVM_BUILD_DIR/bin/llc" ]; then
+                if ! "$LLVM_BUILD_DIR/bin/llc" --version | grep -q "aarch64\|arm"; then
+                    echo -e "${YELLOW}LLVM found but missing ARM targets. Rebuilding...${NC}"
+                else
+                    echo -e "${GREEN}LLVM+MLIR already built with ARM support!${NC}"
+                    echo -e "  Location: ${BLUE}$LLVM_BUILD_DIR${NC}"
+                    return 0
+                fi
+            fi
+        else
+            echo -e "${GREEN}LLVM+MLIR already built!${NC}"
+            echo -e "  Location: ${BLUE}$LLVM_BUILD_DIR${NC}"
+            return 0
+        fi
     fi
 
     if [ "$auto_mode" = "false" ]; then
@@ -159,14 +217,18 @@ setup_llvm_mlir() {
     fi
 
     # Build LLVM with MLIR
-    echo -e "${YELLOW}Building LLVM with MLIR (this will take a while)...${NC}"
+    # LLVM is built natively for x86 but with ARM target support enabled
+    # This allows SimpleLang to generate code for both x86 and ARM architectures
+    echo -e "${YELLOW}Building LLVM with MLIR and ARM target support...${NC}"
+    echo -e "${BLUE}This enables SimpleLang (x86 binary) to generate ARM code${NC}"
+
     mkdir -p "$LLVM_BUILD_DIR"
     cd "$LLVM_BUILD_DIR"
 
     cmake -G Ninja ../llvm \
         -DLLVM_ENABLE_PROJECTS="mlir;clang" \
         -DLLVM_BUILD_EXAMPLES=OFF \
-        -DLLVM_TARGETS_TO_BUILD="X86" \
+        -DLLVM_TARGETS_TO_BUILD="X86;ARM;AArch64" \
         -DCMAKE_BUILD_TYPE=Release \
         -DLLVM_ENABLE_ASSERTIONS=ON \
         -DLLVM_INSTALL_UTILS=ON
@@ -229,17 +291,20 @@ build_mlir() {
     LLVM_DIR="$LLVM_BUILD_DIR/lib/cmake/llvm"
     MLIR_DIR="$LLVM_BUILD_DIR/lib/cmake/mlir"
 
-    mkdir -p build_mlir
-    cd build_mlir
+    mkdir -p "build_mlir"
+    cd "build_mlir"
+
     cmake .. \
         -DLLVM_DIR="${LLVM_DIR}" \
         -DMLIR_DIR="${MLIR_DIR}" \
         -DUSE_MLIR=ON
+
     make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) simplang
     cd "$SCRIPT_DIR"
 
     echo -e "${GREEN}MLIR build complete!${NC}"
     echo -e "  Compiler: ${BLUE}./build_mlir/src/simplang${NC}"
+    echo -e "  ${GREEN}This x86 binary can generate code for X86, ARM, and AArch64${NC}"
 }
 
 run_standard_tests() {
@@ -263,6 +328,7 @@ run_mlir_tests() {
 # Parse arguments
 CHECK_DEPS=false
 INSTALL_DEPS=false
+INSTALL_CROSS=false
 SETUP_LLVM=false
 BUILD_STANDARD=false
 BUILD_MLIR=false
@@ -282,6 +348,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --install-deps)
             INSTALL_DEPS=true
+            shift
+            ;;
+        --install-cross-tools)
+            INSTALL_CROSS=true
             shift
             ;;
         --setup-llvm)
@@ -317,6 +387,16 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Set LLVM paths after parsing arguments
+if [ -z "$LLVM_BUILD_DIR_ENV" ]; then
+    LLVM_PROJECT_DIR="$SCRIPT_DIR/llvm-project"
+    LLVM_BUILD_DIR="$LLVM_PROJECT_DIR/build"
+else
+    LLVM_BUILD_DIR="$LLVM_BUILD_DIR_ENV"
+    LLVM_PROJECT_DIR="$(dirname "$LLVM_BUILD_DIR")"
+    echo -e "${GREEN}Using LLVM from: $LLVM_BUILD_DIR${NC}"
+fi
+
 # Execute based on flags
 if $CHECK_DEPS; then
     check_dependencies
@@ -325,6 +405,11 @@ fi
 
 if $INSTALL_DEPS; then
     install_dependencies
+    exit $?
+fi
+
+if $INSTALL_CROSS; then
+    install_cross_tools
     exit $?
 fi
 

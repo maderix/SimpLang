@@ -1,12 +1,13 @@
 # MLIR Dialect Tests
 
-# Get MLIR dialect libraries (includes base Dialect class)
-get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
+if(BUILD_TESTING)
+  # Get MLIR dialect libraries (includes base Dialect class)
+  get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
 
-# Dialect types test
-add_executable(test_simp_dialect
-  test_simp_dialect.cpp
-)
+  # Dialect types test
+  add_executable(test_simp_dialect
+    test_simp_dialect.cpp
+  )
 
 target_compile_options(test_simp_dialect PRIVATE -fno-rtti -fno-exceptions)
 
@@ -53,3 +54,5 @@ target_link_libraries(test_lowering
 )
 
 add_test(NAME SimpLoweringPass COMMAND test_lowering)
+
+endif() # BUILD_TESTING

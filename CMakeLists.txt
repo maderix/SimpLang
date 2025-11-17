@@ -69,6 +69,11 @@ if(USE_MLIR)
     include(AddLLVM)
     include(AddMLIR)
     include(HandleLLVMOptions)
+
+    # For cross-compilation, create dummy targets for missing dependencies
+    if(CMAKE_CROSSCOMPILING)
+        include(${CMAKE_SOURCE_DIR}/cmake/CrossCompileDeps.cmake)
+    endif()
 else()
     message(STATUS "MLIR integration DISABLED (use -DUSE_MLIR=ON to enable)")
 endif()
@@ -120,11 +125,15 @@ add_executable(simplang_runner
 
 # Link against required libraries
 target_link_libraries(simplang_runner
-    PRIVATE 
+    PRIVATE
         simplang_runtime
         ${CMAKE_DL_LIBS}
-        ${READLINE_LIBRARIES}
 )
+
+# Add readline libraries only if not cross-compiling
+if(NOT CMAKE_CROSSCOMPILING)
+    target_link_libraries(simplang_runner PRIVATE ${READLINE_LIBRARIES})
+endif()
 
 # Add compile definitions
 target_compile_definitions(simplang_runner

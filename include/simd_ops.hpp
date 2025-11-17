@@ -1,11 +1,19 @@
 #pragma once
-#include <immintrin.h>
+
+// Architecture-specific intrinsics
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+    #include <immintrin.h>
+#elif defined(__aarch64__) || defined(__arm__)
+    #include <arm_neon.h>
+#endif
+
 #include <llvm/IR/IRBuilder.h>
 #include <vector>
 
 // Forward declarations
 class CodeGenContext;
 
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -25,6 +33,7 @@ __m256d simd_div_avx(__m256d a, __m256d b);
 #ifdef __cplusplus
 }
 #endif
+#endif  // x86
 
 enum class SIMDOp {
     ADD,

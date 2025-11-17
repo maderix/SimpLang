@@ -7,7 +7,14 @@
 #include <mutex>
 #include <chrono>
 #include <memory>
-#include <immintrin.h>
+
+// Architecture-specific intrinsics
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+    #include <immintrin.h>
+#elif defined(__aarch64__) || defined(__arm__)
+    #include <arm_neon.h>
+#endif
+
 #include <iostream>
 
 class MemoryTracker {

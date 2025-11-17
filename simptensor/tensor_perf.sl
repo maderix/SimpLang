@@ -1,4 +1,13 @@
-include "tensor_core.sl";
+// NHWC stride calculation helper
+fn nhwc_offset(i32 n, i32 h, i32 w, i32 c,
+               i32 batch, i32 height, i32 width, i32 channel) -> i32 {
+    // NHWC layout: stride = [H*W*C, W*C, C, 1]
+    var offset = batch * (h * w * c) +
+                height * (w * c) +
+                width * c +
+                channel;
+    return offset;
+}
 
 fn kernel_main() -> f32 {
     // Large tensor dimensions for stress testing

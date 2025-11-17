@@ -46,6 +46,7 @@ int main(int argc, char** argv) {
     bool dumpMLIRPasses = false;  // Dump MLIR at each pipeline stage
     std::string outputPath;
     std::string logLevel = "INFO";  // Default log level
+    std::string targetArch = "";  // Target architecture (empty = native)
 
     // Helper function to print help
     auto printHelp = [&]() {
@@ -57,6 +58,7 @@ int main(int argc, char** argv) {
         std::cout << "  -o <file>          Output file path (default: <input>.o)" << std::endl;
         std::cout << "  -d, --debug        Enable parser debug mode" << std::endl;
         std::cout << "  --print-ir         Print LLVM IR to console" << std::endl;
+        std::cout << "  --target <arch>    Target architecture (x86_64, aarch64, armv7)" << std::endl;
         std::cout << std::endl;
 
         std::cout << "Logging Options:" << std::endl;
@@ -135,6 +137,9 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "--print-ir") == 0) {
             printIR = true;
         }
+        else if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) {
+            targetArch = argv[++i];
+        }
 #ifdef USE_MLIR
         else if (strcmp(argv[i], "--emit-mlir") == 0) {
             emitMLIR = true;
@@ -170,11 +175,13 @@ int main(int argc, char** argv) {
     // Initialize logger
     Logger::setLevelFromString(logLevel);
 
-    // Initialize LLVM
+    // Initialize LLVM - initialize ALL targets for cross-compilation support
     LOG_INFO("Initializing LLVM...");
-    llvm::InitializeNativeTarget();
-    llvm::InitializeNativeTargetAsmPrinter();
-    llvm::InitializeNativeTargetAsmParser();
+    llvm::InitializeAllTargetInfos();
+    llvm::InitializeAllTargets();
+    llvm::InitializeAllTargetMCs();
+    llvm::InitializeAllAsmParsers();
+    llvm::InitializeAllAsmPrinters();
 
 #ifdef USE_MLIR
     // Initialize LLVM optimization passes (required for makeOptimizingTransformer)
@@ -343,7 +350,26 @@ int main(int argc, char** argv) {
         // We need to create a target machine for the LLVM module
         LOG_INFO("Generating object code...");
 
-        std::string targetTriple = llvm::sys::getDefaultTargetTriple();
+        // Determine target triple based on --target flag
+        std::string targetTriple;
+        if (targetArch.empty()) {
+            // No --target specified, use native target
+            targetTriple = llvm::sys::getDefaultTargetTriple();
+            LOG_INFO("Target: native (" + targetTriple + ")");
+        } else {
+            // User specified target for cross-compilation
+            if (targetArch == "aarch64" || targetArch == "arm64") {
+                targetTriple = "aarch64-unknown-linux-gnu";
+            } else if (targetArch == "armv7" || targetArch == "arm") {
+                targetTriple = "armv7-unknown-linux-gnueabihf";
+            } else if (targetArch == "x86_64" || targetArch == "x86-64") {
+                targetTriple = "x86_64-unknown-linux-gnu";
+            } else {
+                // Assume user provided full triple
+                targetTriple = targetArch;
+            }
+            LOG_INFO("Target: " + targetTriple + " (cross-compilation)");
+        }
         llvmModule->setTargetTriple(targetTriple);
 
         std::string error;
@@ -353,15 +379,35 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        // Use native CPU features for maximum performance
-        std::string cpu = llvm::sys::getHostCPUName().str();
-        llvm::StringMap<bool> featureMap;
-        llvm::sys::getHostCPUFeatures(featureMap);
-        llvm::SubtargetFeatures subtargetFeatures;
-        for (auto &feature : featureMap) {
-            subtargetFeatures.AddFeature(feature.first(), feature.second);
+        // CPU and features configuration
+        std::string cpu;
+        std::string features;
+
+        if (targetArch.empty()) {
+            // Native compilation: use host CPU features for maximum performance
+            cpu = llvm::sys::getHostCPUName().str();
+            llvm::StringMap<bool> featureMap;
+            llvm::sys::getHostCPUFeatures(featureMap);
+            llvm::SubtargetFeatures subtargetFeatures;
+            for (auto &feature : featureMap) {
+                subtargetFeatures.AddFeature(feature.first(), feature.second);
+            }
+            features = subtargetFeatures.getString();
+            LOG_INFO("CPU: " + cpu + " (native)");
+        } else {
+            // Cross-compilation: use generic CPU for target architecture
+            if (targetArch == "aarch64" || targetArch == "arm64") {
+                cpu = "generic";
+                features = "+neon";  // Enable NEON SIMD
+            } else if (targetArch == "armv7" || targetArch == "arm") {
+                cpu = "generic";
+                features = "+neon,+vfp4";  // Enable NEON and VFPv4
+            } else {
+                cpu = "generic";
+                features = "";
+            }
+            LOG_INFO("CPU: " + cpu + " (generic for cross-compilation)");
         }
-        std::string features = subtargetFeatures.getString();
 
         llvm::TargetOptions opt;
         auto rm = llvm::Optional<llvm::Reloc::Model>(llvm::Reloc::PIC_);

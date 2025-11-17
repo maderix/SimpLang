@@ -6,7 +6,15 @@ cmake_minimum_required(VERSION 3.13.4)
 # Set the correct mlir-tblgen executable from our MLIR build
 # Derive from MLIR_DIR which is set by build.sh
 get_filename_component(MLIR_BUILD_DIR "${MLIR_DIR}/../../.." ABSOLUTE)
-set(MLIR_TABLEGEN_EXE "${MLIR_BUILD_DIR}/bin/mlir-tblgen")
+
+# When cross-compiling, use native x86 mlir-tblgen from Stage 1 build
+if(CMAKE_CROSSCOMPILING)
+    get_filename_component(NATIVE_MLIR_BUILD "${MLIR_BUILD_DIR}/../build-native" ABSOLUTE)
+    set(MLIR_TABLEGEN_EXE "${NATIVE_MLIR_BUILD}/bin/mlir-tblgen")
+    message(STATUS "Cross-compiling: Using native mlir-tblgen from ${MLIR_TABLEGEN_EXE}")
+else()
+    set(MLIR_TABLEGEN_EXE "${MLIR_BUILD_DIR}/bin/mlir-tblgen")
+endif()
 
 # MLIR TableGen commands for generating operation definitions
 

@@ -12,19 +12,25 @@ file(GLOB_RECURSE AST_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/ast/*.cpp
 )
 
-# Add executable
-add_executable(simplang
+# Common sources
+set(SIMPLANG_SOURCES
     main.cpp
     ${AST_SOURCES}
     codegen.cpp
     simd_ops.cpp
     simd_interface.cpp
-    avx512_backend.cpp
     logger.cpp
-
     ${BISON_Parser_OUTPUTS}
     ${FLEX_Scanner_OUTPUTS}
 )
+
+# Add x86-specific sources
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i686")
+    list(APPEND SIMPLANG_SOURCES avx512_backend.cpp)
+endif()
+
+# Add executable
+add_executable(simplang ${SIMPLANG_SOURCES})
 
 # Include directories
 target_include_directories(simplang PRIVATE
@@ -35,14 +41,9 @@ target_include_directories(simplang PRIVATE
 )
 
 # Link against LLVM libraries
-llvm_map_components_to_libnames(llvm_libs
+set(LLVM_COMMON_COMPONENTS
     Core
     Support
-    native
-    nativecodegen
-    x86codegen
-    x86asmparser
-    x86info
     TransformUtils
     ScalarOpts
     InstCombine
@@ -52,6 +53,31 @@ llvm_map_components_to_libnames(llvm_libs
     Object
     BitWriter
     Vectorize
+)
+
+# Add architecture-specific components for cross-compilation support
+# Include ALL target architectures to support --target flag
+set(LLVM_ARCH_COMPONENTS
+    # X86 target
+    X86CodeGen
+    X86AsmParser
+    X86Desc
+    X86Info
+    # ARM 64-bit target
+    AArch64CodeGen
+    AArch64AsmParser
+    AArch64Desc
+    AArch64Info
+    # ARM 32-bit target
+    ARMCodeGen
+    ARMAsmParser
+    ARMDesc
+    ARMInfo
+)
+
+llvm_map_components_to_libnames(llvm_libs
+    ${LLVM_COMMON_COMPONENTS}
+    ${LLVM_ARCH_COMPONENTS}
 )
 
 target_link_libraries(simplang ${llvm_libs} simplang_runtime)

@@ -1,7 +1,13 @@
 #ifndef KERNEL_H
 #define KERNEL_H
 
-#include <immintrin.h>
+// Architecture-specific intrinsics
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+    #include <immintrin.h>
+#elif defined(__aarch64__) || defined(__arm__)
+    #include <arm_neon.h>
+#endif
+
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>   // Added for printf
@@ -26,20 +32,36 @@ extern "C" {
 struct sse_slice_t;
 struct avx_slice_t;
 
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 // SSE slice type (2-wide vectors)
 typedef struct sse_slice_t {
-    __m128d* data;  // Change to __m128d for SSE
+    __m128d* data;
     size_t len;
     size_t cap;
 } sse_slice_t;
 
 // AVX slice type (8-wide vectors to match IR)
 typedef struct avx_slice_t {
-    __m512d* data;  // Change to 8-wide vectors
+    __m512d* data;
     size_t len;
     size_t cap;
 } avx_slice_t;
+#else
+// Stub types for non-x86 architectures
+typedef struct sse_slice_t {
+    void* data;
+    size_t len;
+    size_t cap;
+} sse_slice_t;
 
+typedef struct avx_slice_t {
+    void* data;
+    size_t len;
+    size_t cap;
+} avx_slice_t;
+#endif
+
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 // Vector creation functions
 #ifdef _MSC_VER
     // Windows calling convention
@@ -60,9 +82,10 @@ __m128d simd_mul(__m128d a, __m128d b);
 __m512d simd_mul_avx(__m512d a, __m512d b);
 
 // Memory management
-__m128d* allocate_sse_vectors(size_t count);  // Change return type
+__m128d* allocate_sse_vectors(size_t count);
 __m512d* allocate_avx_vectors(size_t count);
 void free_vectors(void* ptr);
+#endif  // x86
 
 // Slice management
 sse_slice_t* make_sse_slice(size_t len);
@@ -70,16 +93,17 @@ avx_slice_t* make_avx_slice(size_t len);
 void free_slice(void* slice);
 
 // Slice operations
-void slice_set_sse(sse_slice_t* slice, size_t idx, __m128d value);  // Change parameter type
-__m128d slice_get_sse(sse_slice_t* slice, size_t idx);  // Change return type
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+void slice_set_sse(sse_slice_t* slice, size_t idx, __m128d value);
+__m128d slice_get_sse(sse_slice_t* slice, size_t idx);
 void slice_set_avx(avx_slice_t* slice, size_t idx, __m512d value);
 __m512d slice_get_avx(avx_slice_t* slice, size_t idx);
-void slice_set_avx_values(avx_slice_t* slice, size_t idx, 
+void slice_set_avx_values(avx_slice_t* slice, size_t idx,
                          double v0, double v1, double v2, double v3,
                          double v4, double v5, double v6, double v7);
 
 // Vector printing functions
-void print_sse_vector(__m128d vec);  // Change parameter type
+void print_sse_vector(__m128d vec);
 void print_avx_vector(__m512d vec);
 void print_sse_slice(sse_slice_t* slice);
 void print_avx_slice(avx_slice_t* slice);
@@ -101,10 +125,11 @@ static inline void print_debug_vector_avx(const char* msg, __m512d vec) {
     #if SIMD_DEBUG
     alignas(64) double values[8];
     _mm512_store_pd(values, vec);
-    printf("[%.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f]\n", 
+    printf("[%.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f]\n",
            values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7]);
     #endif
 }
+#endif  // x86
 
 // Host runtime entry point
 double host_main(void);
