@@ -330,4 +330,4 @@ Pull requests should include test cases and performance evaluations where releva
 
 # **11 License**
 
-SimpLang is released under the MIT License.
+SimpLang is released under the Apache2.0 License.
