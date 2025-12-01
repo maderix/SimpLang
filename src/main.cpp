@@ -44,6 +44,7 @@ int main(int argc, char** argv) {
     bool enableOpenMP = false;  // OpenMP parallelization (disabled by default)
     bool enableO3 = true;  // LLVM O3 optimization (enabled by default)
     bool enablePrefetch = true;  // Prefetch insertion for memory latency hiding (enabled by default)
+    bool llvmVectorize = false;  // Skip MLIR vectorization, let LLVM handle it (better for INT8/INT4)
     bool dumpMLIRPasses = false;  // Dump MLIR at each pipeline stage
     std::string outputPath;
     std::string logLevel = "INFO";  // Default log level
@@ -82,6 +83,7 @@ int main(int argc, char** argv) {
         std::cout << "  --hierarchical-tiling  Multi-level cache-aware tiling (L1/L2/L3)" << std::endl;
         std::cout << "  --enable-openmp    Enable OpenMP parallelization (multi-threading)" << std::endl;
         std::cout << "  --no-prefetch      Disable prefetch insertion (memory latency hiding)" << std::endl;
+        std::cout << "  --llvm-vectorize   Use LLVM vectorization instead of MLIR (better for INT8/INT4)" << std::endl;
         std::cout << "  --no-opt           Disable LLVM O3 optimization (faster compilation)" << std::endl;
         std::cout << std::endl;
 #endif
@@ -167,6 +169,9 @@ int main(int argc, char** argv) {
         }
         else if (strcmp(argv[i], "--no-prefetch") == 0) {
             enablePrefetch = false;
+        }
+        else if (strcmp(argv[i], "--llvm-vectorize") == 0) {
+            llvmVectorize = true;
         }
         else if (strcmp(argv[i], "--no-opt") == 0) {
             enableO3 = false;
@@ -281,6 +286,10 @@ int main(int argc, char** argv) {
         pipeline.setEnableHierarchicalTiling(enableHierarchicalTiling);
         pipeline.setEnableOpenMP(enableOpenMP);
         pipeline.setEnablePrefetch(enablePrefetch);
+        pipeline.setSkipMLIRVectorization(llvmVectorize);
+        if (llvmVectorize) {
+            LOG_INFO("Using LLVM vectorization (MLIR vectorization disabled)");
+        }
         if (enableTiling) {
             if (enableHierarchicalTiling) {
                 LOG_INFO("Hierarchical tiling enabled (L3: 128x128x128, L2: 32x32x32, L1: 8x8x8)");

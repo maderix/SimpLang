@@ -407,9 +407,9 @@ int main() {
     std::cout << std::endl;
     std::cout << "Notes:" << std::endl;
     std::cout << "• Ratio = (Eigen time / SimpLang time) × 100%" << std::endl;
-    std::cout << "• >100% means SimpLang is slower than Eigen" << std::endl;
-    std::cout << "• <100% means SimpLang is faster than Eigen" << std::endl;
-    std::cout << "• 70-90% is competitive for a DSL compiler" << std::endl;
+    std::cout << "• >100% means SimpLang is FASTER than Eigen" << std::endl;
+    std::cout << "• <100% means SimpLang is SLOWER than Eigen" << std::endl;
+    std::cout << "• 100% = parity with Eigen" << std::endl;
     std::cout << std::endl;
 
     return 0;

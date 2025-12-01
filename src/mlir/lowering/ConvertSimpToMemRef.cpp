@@ -14,6 +14,7 @@
 #include "mlir/Dialect/SCF/SCF.h"
 #include "mlir/Dialect/SCF/Transforms.h"
 #include "mlir/Dialect/StandardOps/IR/Ops.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -2760,63 +2761,66 @@ struct TensorMatMulOpLowering : public OpConversionPattern<simp::TensorMatMulOp>
         Value product = rewriter.create<arith::MulFOp>(loc, lhsVal, rhsVal);
         rewriter.create<memref::StoreOp>(loc, product, result, ValueRange{c0, c0});
       } else if (elemType.isInteger(8) || elemType.isInteger(16)) {
-        // Special case: i8/i16 matmul returns i32 result to prevent overflow
-        // i8×i8 or i16×i16 matmul produces results that typically exceed narrow type range
-        // Result type is promoted to i32 - do NOT truncate back
-        auto wideType = rewriter.getIntegerType(32);
-        auto wideMemRefType = MemRefType::get(lhsShape, wideType);
-        auto wideResultMemRefType = MemRefType::get(resultType.getShape(), wideType);
+        // INT8/INT16 matmul with i-k-j loop order for vectorization
+        // i-k-j order allows LLVM to vectorize the innermost j-loop
+        // since C[i,j] and B[k,j] have contiguous j-access
+        //
+        // Pattern: for i: for k: a = A[i,k]; for j: C[i,j] += a * B[k,j]
+        // The j-loop is vectorizable: contiguous load from B, contiguous store to C
 
-        // Allocate wide buffers
-        Value lhsWide = rewriter.create<memref::AllocOp>(loc, wideMemRefType);
-        Value rhsWide = rewriter.create<memref::AllocOp>(loc,
-            MemRefType::get(rhsShape, wideType));
-        Value resultWide = rewriter.create<memref::AllocOp>(loc, wideResultMemRefType);
+        auto i32Type = rewriter.getIntegerType(32);
+        auto resultMemRefType = MemRefType::get(resultType.getShape(), i32Type);
 
-        // Initialize wide result to zero
-        Value wideZero = rewriter.create<arith::ConstantOp>(
-            loc, wideType, rewriter.getZeroAttr(wideType));
-        rewriter.create<linalg::FillOp>(loc, wideZero, resultWide);
+        // Allocate i32 result buffer
+        Value resultWide = rewriter.create<memref::AllocOp>(loc, resultMemRefType);
 
-        // Cast lhs to i32 using linalg.generic
-        SmallVector<AffineMap, 2> lhsCastMaps = {
-            AffineMap::getMultiDimIdentityMap(2, rewriter.getContext()),
-            AffineMap::getMultiDimIdentityMap(2, rewriter.getContext())};
-        SmallVector<StringRef, 2> lhsCastIters = {
-            getParallelIteratorTypeName(), getParallelIteratorTypeName()};
-        rewriter.create<linalg::GenericOp>(
-            loc, TypeRange{}, ValueRange{lhs}, ValueRange{lhsWide},
-            lhsCastMaps, lhsCastIters,
-            [&](OpBuilder &b, Location loc, ValueRange args) {
-              Value extended = b.create<arith::ExtSIOp>(loc, wideType, args[0]);
-              b.create<linalg::YieldOp>(loc, extended);
+        // Initialize result to zero
+        Value zero32 = rewriter.create<arith::ConstantOp>(
+            loc, i32Type, rewriter.getZeroAttr(i32Type));
+        rewriter.create<linalg::FillOp>(loc, zero32, resultWide);
+
+        // Loop bounds
+        Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+        Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+        Value M_val = rewriter.create<arith::ConstantIndexOp>(loc, M);
+        Value N_val = rewriter.create<arith::ConstantIndexOp>(loc, N);
+        Value K_val = rewriter.create<arith::ConstantIndexOp>(loc, K_lhs);
+
+        // i-k-j loop order for vectorization
+        // C[i,j] += A[i,k] * B[k,j]
+        rewriter.create<scf::ForOp>(
+            loc, c0, M_val, c1, ValueRange{},
+            [&](OpBuilder &b1, Location loc, Value i, ValueRange) {
+              b1.create<scf::ForOp>(
+                  loc, c0, K_val, c1, ValueRange{},
+                  [&](OpBuilder &b2, Location loc, Value k, ValueRange) {
+                    // Load A[i,k] once, broadcast to all j iterations
+                    Value aVal = b2.create<memref::LoadOp>(loc, lhs, ValueRange{i, k});
+                    Value aWide = b2.create<arith::ExtSIOp>(loc, i32Type, aVal);
+
+                    // Inner j-loop: vectorizable
+                    b2.create<scf::ForOp>(
+                        loc, c0, N_val, c1, ValueRange{},
+                        [&](OpBuilder &b3, Location loc, Value j, ValueRange) {
+                          // Load B[k,j] and C[i,j]
+                          Value bVal = b3.create<memref::LoadOp>(loc, rhs, ValueRange{k, j});
+                          Value cVal = b3.create<memref::LoadOp>(loc, resultWide, ValueRange{i, j});
+
+                          // Compute: C[i,j] += A[i,k] * B[k,j]
+                          Value bWide = b3.create<arith::ExtSIOp>(loc, i32Type, bVal);
+                          Value prod = b3.create<arith::MulIOp>(loc, aWide, bWide);
+                          Value sum = b3.create<arith::AddIOp>(loc, cVal, prod);
+
+                          // Store back
+                          b3.create<memref::StoreOp>(loc, sum, resultWide, ValueRange{i, j});
+                          b3.create<scf::YieldOp>(loc);
+                        });
+                    b2.create<scf::YieldOp>(loc);
+                  });
+              b1.create<scf::YieldOp>(loc);
             });
 
-        // Cast rhs to i32 using linalg.generic
-        SmallVector<AffineMap, 2> rhsCastMaps = {
-            AffineMap::getMultiDimIdentityMap(2, rewriter.getContext()),
-            AffineMap::getMultiDimIdentityMap(2, rewriter.getContext())};
-        SmallVector<StringRef, 2> rhsCastIters = {
-            getParallelIteratorTypeName(), getParallelIteratorTypeName()};
-        rewriter.create<linalg::GenericOp>(
-            loc, TypeRange{}, ValueRange{rhs}, ValueRange{rhsWide},
-            rhsCastMaps, rhsCastIters,
-            [&](OpBuilder &b, Location loc, ValueRange args) {
-              Value extended = b.create<arith::ExtSIOp>(loc, wideType, args[0]);
-              b.create<linalg::YieldOp>(loc, extended);
-            });
-
-        // Perform matmul with i32 accumulator - result stays as i32
-        rewriter.create<linalg::MatmulOp>(
-            loc, ValueRange{lhsWide, rhsWide}, ValueRange{resultWide});
-
-        // Return i32 result directly - NO truncation
-        // User gets i32 tensor instead of i8/i16 to avoid overflow
         rewriter.replaceOp(op, resultWide);
-
-        // Clean up temporary input buffers (result is returned, don't dealloc)
-        rewriter.create<memref::DeallocOp>(loc, lhsWide);
-        rewriter.create<memref::DeallocOp>(loc, rhsWide);
         return success();
       } else {
         // General 2D matmul: Use linalg.matmul for optimal performance

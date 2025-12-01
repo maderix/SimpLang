@@ -96,6 +96,9 @@ public:
   /// Enable/disable prefetch insertion for memory latency hiding
   void setEnablePrefetch(bool enable) { enablePrefetch = enable; }
 
+  /// Skip MLIR vectorization and let LLVM handle it (better for INT8/INT4)
+  void setSkipMLIRVectorization(bool skip) { skipMLIRVectorization = skip; }
+
   /// Set output path for intermediate IR dumps
   void setOutputPath(const std::string& path) { outputPath = path; }
 
@@ -127,6 +130,10 @@ private:
 
   /// Output path for intermediate IR dumps
   std::string outputPath;
+
+  /// Skip MLIR vectorization passes and let LLVM handle vectorization
+  /// Better for INT8/INT4 (avoids shuffle overhead from MLIR vector dialect)
+  bool skipMLIRVectorization = false;
 
   //===--------------------------------------------------------------------===//
   // Private Helpers: Pipeline Builders
