@@ -96,6 +96,7 @@ add_custom_target(build_all
 add_subdirectory(simpblas)   # SimpBLAS optimized kernels library
 add_subdirectory(runtime)    # Runtime library and utilities first
 add_subdirectory(src)        # SimpleLang compiler
+add_subdirectory(thirdparty/fancy_allocator)  # FancyAllocator for LD_PRELOAD
 
 # Add MLIR dialect if enabled
 if(USE_MLIR)

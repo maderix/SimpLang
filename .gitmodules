@@ -1,3 +1,6 @@
 [submodule "simpblas"]
 	path = simpblas
 	url = https://github.com/ByteInfer-Labs/simpblas.git
+[submodule "thirdparty/fancy_allocator"]
+	path = thirdparty/fancy_allocator
+	url = https://github.com/maderix/memory-allocator.git

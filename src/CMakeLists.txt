@@ -55,32 +55,58 @@ set(LLVM_COMMON_COMPONENTS
     Vectorize
 )
 
-# Add architecture-specific components for cross-compilation support
-# Include ALL target architectures to support --target flag
-set(LLVM_ARCH_COMPONENTS
-    # X86 target
-    X86CodeGen
-    X86AsmParser
-    X86Desc
-    X86Info
-    # ARM 64-bit target
-    AArch64CodeGen
-    AArch64AsmParser
-    AArch64Desc
-    AArch64Info
-    # ARM 32-bit target
-    ARMCodeGen
-    ARMAsmParser
-    ARMDesc
-    ARMInfo
-)
+# Add architecture-specific components based on available LLVM targets
+set(LLVM_ARCH_COMPONENTS "")
+
+# Check which targets are available in this LLVM build
+# X86 target (almost always available)
+if("X86" IN_LIST LLVM_TARGETS_TO_BUILD OR LLVM_TARGETS_TO_BUILD STREQUAL "all")
+    list(APPEND LLVM_ARCH_COMPONENTS
+        X86CodeGen
+        X86AsmParser
+        X86Desc
+        X86Info
+    )
+endif()
+
+# ARM 64-bit target (optional)
+if("AArch64" IN_LIST LLVM_TARGETS_TO_BUILD OR LLVM_TARGETS_TO_BUILD STREQUAL "all")
+    list(APPEND LLVM_ARCH_COMPONENTS
+        AArch64CodeGen
+        AArch64AsmParser
+        AArch64Desc
+        AArch64Info
+    )
+endif()
+
+# ARM 32-bit target (optional)
+if("ARM" IN_LIST LLVM_TARGETS_TO_BUILD OR LLVM_TARGETS_TO_BUILD STREQUAL "all")
+    list(APPEND LLVM_ARCH_COMPONENTS
+        ARMCodeGen
+        ARMAsmParser
+        ARMDesc
+        ARMInfo
+    )
+endif()
+
+# Fallback: if no arch components found, at least try native
+if(NOT LLVM_ARCH_COMPONENTS)
+    message(WARNING "No LLVM target architectures found, using native only")
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i686")
+        list(APPEND LLVM_ARCH_COMPONENTS X86CodeGen X86AsmParser X86Desc X86Info)
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+        list(APPEND LLVM_ARCH_COMPONENTS AArch64CodeGen AArch64AsmParser AArch64Desc AArch64Info)
+    endif()
+endif()
+
+message(STATUS "LLVM architecture components: ${LLVM_ARCH_COMPONENTS}")
 
 llvm_map_components_to_libnames(llvm_libs
     ${LLVM_COMMON_COMPONENTS}
     ${LLVM_ARCH_COMPONENTS}
 )
 
-target_link_libraries(simplang ${llvm_libs} simplang_runtime)
+target_link_libraries(simplang ${llvm_libs} simplang_runtime fancymalloc)
 
 # Add MLIR support if enabled
 if(USE_MLIR)
