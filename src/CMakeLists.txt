@@ -56,29 +56,33 @@ set(LLVM_COMMON_COMPONENTS
 )
 
 # Add architecture-specific components for cross-compilation support
-# Include ALL target architectures to support --target flag
-set(LLVM_ARCH_COMPONENTS
-    # X86 target
-    X86CodeGen
-    X86AsmParser
-    X86Desc
-    X86Info
-    # ARM 64-bit target
-    AArch64CodeGen
-    AArch64AsmParser
-    AArch64Desc
-    AArch64Info
-    # ARM 32-bit target
-    ARMCodeGen
-    ARMAsmParser
-    ARMDesc
-    ARMInfo
-)
+# Only include targets that are available in the LLVM build
+set(LLVM_ARCH_COMPONENTS)
+
+# X86 target (almost always available)
+if("X86" IN_LIST LLVM_TARGETS_TO_BUILD)
+    list(APPEND LLVM_ARCH_COMPONENTS X86CodeGen X86AsmParser X86Desc X86Info)
+endif()
+
+# ARM 64-bit target
+if("AArch64" IN_LIST LLVM_TARGETS_TO_BUILD)
+    list(APPEND LLVM_ARCH_COMPONENTS AArch64CodeGen AArch64AsmParser AArch64Desc AArch64Info)
+endif()
+
+# ARM 32-bit target (optional)
+if("ARM" IN_LIST LLVM_TARGETS_TO_BUILD)
+    list(APPEND LLVM_ARCH_COMPONENTS ARMCodeGen ARMAsmParser ARMDesc ARMInfo)
+endif()
 
 llvm_map_components_to_libnames(llvm_libs
     ${LLVM_COMMON_COMPONENTS}
     ${LLVM_ARCH_COMPONENTS}
 )
+
+# Link tcmalloc first to override malloc (must be before other libs)
+if(TCMALLOC_FOUND)
+    target_link_libraries(simplang ${TCMALLOC_LIBRARY})
+endif()
 
 target_link_libraries(simplang ${llvm_libs} simplang_runtime)
 

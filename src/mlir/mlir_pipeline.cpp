@@ -397,9 +397,11 @@ void MLIRCompilationPipeline::buildPhase2_LinalgOptimization(mlir::OpPassManager
 
   // INSERT PREFETCH: Add prefetch operations to hide memory latency
   // Run after linalg-to-loops so we can find memref.load in all loops
-  llvm::outs() << "[Prefetch] Inserting prefetch operations into loops\n";
-  pm.addNestedPass<mlir::FuncOp>(mlir::simp::createInsertPrefetchPass());
-  pm.addPass(mlir::createCanonicalizerPass());
+  if (enablePrefetch) {
+    llvm::outs() << "[Prefetch] Inserting prefetch operations into loops\n";
+    pm.addNestedPass<mlir::FuncOp>(mlir::simp::createInsertPrefetchPass());
+    pm.addPass(mlir::createCanonicalizerPass());
+  }
 
   // OPTIMIZATION: Optimize loops for better performance
   // Apply loop invariant code motion to hoist invariant operations

@@ -97,7 +97,11 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "armv7")
     target_compile_options(simplang_runtime PRIVATE -march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard)
 endif()
 
-# Link libraries
+# Link libraries (tcmalloc first to override malloc)
+if(TCMALLOC_FOUND)
+    target_link_libraries(simplang_runtime PRIVATE ${TCMALLOC_LIBRARY})
+endif()
+
 target_link_libraries(simplang_runtime
     PRIVATE
         Threads::Threads
@@ -111,6 +115,12 @@ endif()
 
 # Create host runner library (used by tests)
 add_library(host_runner SHARED src/host.cpp)
+
+# Link tcmalloc first to override malloc
+if(TCMALLOC_FOUND)
+    target_link_libraries(host_runner PRIVATE ${TCMALLOC_LIBRARY})
+endif()
+
 target_link_libraries(host_runner
     PRIVATE
         simplang_runtime

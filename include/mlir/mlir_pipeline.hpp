@@ -93,6 +93,9 @@ public:
   /// Enable/disable IR dumping at each pipeline stage
   void setDumpIntermediateIR(bool enable) { dumpIntermediateIR = enable; }
 
+  /// Enable/disable prefetch insertion for memory latency hiding
+  void setEnablePrefetch(bool enable) { enablePrefetch = enable; }
+
   /// Set output path for intermediate IR dumps
   void setOutputPath(const std::string& path) { outputPath = path; }
 
@@ -118,6 +121,9 @@ private:
 
   /// Enable IR dumping at each pipeline stage (default: false)
   bool dumpIntermediateIR = false;
+
+  /// Enable prefetch insertion (default: true)
+  bool enablePrefetch = true;
 
   /// Output path for intermediate IR dumps
   std::string outputPath;
