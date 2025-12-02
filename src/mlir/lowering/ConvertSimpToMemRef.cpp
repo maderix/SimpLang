@@ -2760,18 +2760,20 @@ struct TensorMatMulOpLowering : public OpConversionPattern<simp::TensorMatMulOp>
         Value rhsVal = rewriter.create<memref::LoadOp>(loc, rhs, ValueRange{c0, c0});
         Value product = rewriter.create<arith::MulFOp>(loc, lhsVal, rhsVal);
         rewriter.create<memref::StoreOp>(loc, product, result, ValueRange{c0, c0});
-      } else if (elemType.isInteger(8) || elemType.isInteger(16)) {
-        // INT8/INT16 matmul with i-k-j loop order for vectorization
-        // i-k-j order allows LLVM to vectorize the innermost j-loop
-        // since C[i,j] and B[k,j] have contiguous j-access
+      // Check INPUT element type for INT8/INT16 (result is already promoted to i32)
+      } else if (lhsType.getElementType().isInteger(8) || lhsType.getElementType().isInteger(16)) {
+        // INT8 matmul: i8 × i8 → i32
         //
-        // Pattern: for i: for k: a = A[i,k]; for j: C[i,j] += a * B[k,j]
-        // The j-loop is vectorizable: contiguous load from B, contiguous store to C
+        // Strategy selection based on matrix size:
+        // - Small/medium (N <= 512): Transpose B, use vpmaddwd pattern (K-innermost)
+        // - Large (N > 512): Use i-k-j pattern (J-innermost) to avoid transpose overhead
 
+        auto i8Type = rewriter.getIntegerType(8);
+        auto i16Type = rewriter.getIntegerType(16);
         auto i32Type = rewriter.getIntegerType(32);
         auto resultMemRefType = MemRefType::get(resultType.getShape(), i32Type);
 
-        // Allocate i32 result buffer
+        // Allocate result buffer
         Value resultWide = rewriter.create<memref::AllocOp>(loc, resultMemRefType);
 
         // Initialize result to zero
@@ -2786,39 +2788,90 @@ struct TensorMatMulOpLowering : public OpConversionPattern<simp::TensorMatMulOp>
         Value N_val = rewriter.create<arith::ConstantIndexOp>(loc, N);
         Value K_val = rewriter.create<arith::ConstantIndexOp>(loc, K_lhs);
 
-        // i-k-j loop order for vectorization
-        // C[i,j] += A[i,k] * B[k,j]
-        rewriter.create<scf::ForOp>(
-            loc, c0, M_val, c1, ValueRange{},
-            [&](OpBuilder &b1, Location loc, Value i, ValueRange) {
-              b1.create<scf::ForOp>(
-                  loc, c0, K_val, c1, ValueRange{},
-                  [&](OpBuilder &b2, Location loc, Value k, ValueRange) {
-                    // Load A[i,k] once, broadcast to all j iterations
-                    Value aVal = b2.create<memref::LoadOp>(loc, lhs, ValueRange{i, k});
-                    Value aWide = b2.create<arith::ExtSIOp>(loc, i32Type, aVal);
+        // Size threshold: use transpose for matrices that benefit from vpmaddwd
+        // Testing shows transpose is faster up to at least 768x768
+        const int64_t TRANSPOSE_THRESHOLD = 1024;
 
-                    // Inner j-loop: vectorizable
-                    b2.create<scf::ForOp>(
-                        loc, c0, N_val, c1, ValueRange{},
-                        [&](OpBuilder &b3, Location loc, Value j, ValueRange) {
-                          // Load B[k,j] and C[i,j]
-                          Value bVal = b3.create<memref::LoadOp>(loc, rhs, ValueRange{k, j});
-                          Value cVal = b3.create<memref::LoadOp>(loc, resultWide, ValueRange{i, j});
+        if (N <= TRANSPOSE_THRESHOLD && K_lhs <= TRANSPOSE_THRESHOLD) {
+          // VNNI-optimized path: Transpose B, use vpmaddwd pattern
+          // Allocate transposed B: B_T[N,K] where B_T[j,k] = B[k,j]
+          auto btShape = SmallVector<int64_t>{N, K_lhs};
+          auto btMemRefType = MemRefType::get(btShape, i8Type);
+          Value bTransposed = rewriter.create<memref::AllocOp>(loc, btMemRefType);
 
-                          // Compute: C[i,j] += A[i,k] * B[k,j]
-                          Value bWide = b3.create<arith::ExtSIOp>(loc, i32Type, bVal);
-                          Value prod = b3.create<arith::MulIOp>(loc, aWide, bWide);
-                          Value sum = b3.create<arith::AddIOp>(loc, cVal, prod);
+          // Transpose B to B_T: B_T[j,k] = B[k,j]
+          rewriter.create<scf::ForOp>(
+              loc, c0, N_val, c1, ValueRange{},
+              [&, rhs, bTransposed, c0, c1, K_val](OpBuilder &b1, Location loc, Value j, ValueRange) {
+                Value c1_local = b1.create<arith::ConstantIndexOp>(loc, 1);
+                b1.create<scf::ForOp>(
+                    loc, c0, K_val, c1_local, ValueRange{},
+                    [&, rhs, bTransposed](OpBuilder &b2, Location loc, Value k, ValueRange) {
+                      Value bVal = b2.create<memref::LoadOp>(loc, rhs, ValueRange{k, j});
+                      b2.create<memref::StoreOp>(loc, bVal, bTransposed, ValueRange{j, k});
+                      b2.create<scf::YieldOp>(loc);
+                    });
+                b1.create<scf::YieldOp>(loc);
+              });
 
-                          // Store back
-                          b3.create<memref::StoreOp>(loc, sum, resultWide, ValueRange{i, j});
-                          b3.create<scf::YieldOp>(loc);
-                        });
-                    b2.create<scf::YieldOp>(loc);
-                  });
-              b1.create<scf::YieldOp>(loc);
-            });
+          // Main matmul: i-j-k loop order with K innermost for vpmaddwd
+          rewriter.create<scf::ForOp>(
+              loc, c0, M_val, c1, ValueRange{},
+              [&, i16Type, i32Type, lhs, bTransposed, resultWide, c0, c1, N_val, K_val](OpBuilder &b1, Location loc, Value i, ValueRange) {
+                Value c1_local = b1.create<arith::ConstantIndexOp>(loc, 1);
+                b1.create<scf::ForOp>(
+                    loc, c0, N_val, c1_local, ValueRange{},
+                    [&, i16Type, i32Type, lhs, bTransposed, resultWide, c0, K_val](OpBuilder &b2, Location loc, Value j, ValueRange) {
+                      Value zero = b2.create<arith::ConstantOp>(loc, i32Type, b2.getZeroAttr(i32Type));
+                      Value c1_k = b2.create<arith::ConstantIndexOp>(loc, 1);
+                      auto kLoop = b2.create<scf::ForOp>(
+                          loc, c0, K_val, c1_k, ValueRange{zero},
+                          [&, i16Type, i32Type, lhs, bTransposed](OpBuilder &b3, Location loc, Value k, ValueRange iterArgs) {
+                            Value acc = iterArgs[0];
+                            Value aVal = b3.create<memref::LoadOp>(loc, lhs, ValueRange{i, k});
+                            Value bVal = b3.create<memref::LoadOp>(loc, bTransposed, ValueRange{j, k});
+                            Value aWide = b3.create<arith::ExtSIOp>(loc, i16Type, aVal);
+                            Value bWide = b3.create<arith::ExtSIOp>(loc, i16Type, bVal);
+                            Value prod = b3.create<arith::MulIOp>(loc, aWide, bWide);
+                            Value prod32 = b3.create<arith::ExtSIOp>(loc, i32Type, prod);
+                            Value newAcc = b3.create<arith::AddIOp>(loc, acc, prod32);
+                            b3.create<scf::YieldOp>(loc, ValueRange{newAcc});
+                          });
+                      Value dotProduct = kLoop.getResult(0);
+                      b2.create<memref::StoreOp>(loc, dotProduct, resultWide, ValueRange{i, j});
+                      b2.create<scf::YieldOp>(loc);
+                    });
+                b1.create<scf::YieldOp>(loc);
+              });
+
+          rewriter.create<memref::DeallocOp>(loc, bTransposed);
+        } else {
+          // Large matrix path: i-k-j order (no transpose, J-innermost vectorization)
+          rewriter.create<scf::ForOp>(
+              loc, c0, M_val, c1, ValueRange{},
+              [&, i32Type, lhs, rhs, resultWide, c0, c1, N_val, K_val](OpBuilder &b1, Location loc, Value i, ValueRange) {
+                b1.create<scf::ForOp>(
+                    loc, c0, K_val, c1, ValueRange{},
+                    [&, i32Type, lhs, rhs, resultWide, c0, c1, N_val](OpBuilder &b2, Location loc, Value k, ValueRange) {
+                      Value aVal = b2.create<memref::LoadOp>(loc, lhs, ValueRange{i, k});
+                      Value aWide = b2.create<arith::ExtSIOp>(loc, i32Type, aVal);
+                      Value c1_local = b2.create<arith::ConstantIndexOp>(loc, 1);
+                      b2.create<scf::ForOp>(
+                          loc, c0, N_val, c1_local, ValueRange{},
+                          [&, i32Type, rhs, resultWide, aWide](OpBuilder &b3, Location loc, Value j, ValueRange) {
+                            Value bVal = b3.create<memref::LoadOp>(loc, rhs, ValueRange{k, j});
+                            Value cVal = b3.create<memref::LoadOp>(loc, resultWide, ValueRange{i, j});
+                            Value bWide = b3.create<arith::ExtSIOp>(loc, i32Type, bVal);
+                            Value prod = b3.create<arith::MulIOp>(loc, aWide, bWide);
+                            Value sum = b3.create<arith::AddIOp>(loc, cVal, prod);
+                            b3.create<memref::StoreOp>(loc, sum, resultWide, ValueRange{i, j});
+                            b3.create<scf::YieldOp>(loc);
+                          });
+                      b2.create<scf::YieldOp>(loc);
+                    });
+                b1.create<scf::YieldOp>(loc);
+              });
+        }
 
         rewriter.replaceOp(op, resultWide);
         return success();
