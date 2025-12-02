@@ -45,8 +45,23 @@ public:
     });
 
     // Convert !simp.tensor<shape x T> to memref<shape x T>
+    // Special handling for i4: pack 2 values per i8 byte (halve last dimension)
     addConversion([](simp::SimpTensorType type) -> llvm::Optional<Type> {
-      return MemRefType::get(type.getShape(), type.getElementType());
+      auto elemType = type.getElementType();
+      auto shape = type.getShape();
+
+      // Check for i4 element type - pack into i8
+      if (auto intType = elemType.dyn_cast<IntegerType>()) {
+        if (intType.getWidth() == 4 && !shape.empty()) {
+          // Pack 2 i4 values per i8 byte: last dim becomes (dim + 1) / 2
+          SmallVector<int64_t> packedShape(shape.begin(), shape.end());
+          packedShape.back() = (packedShape.back() + 1) / 2;
+          auto i8Type = IntegerType::get(type.getContext(), 8);
+          return MemRefType::get(packedShape, i8Type);
+        }
+      }
+
+      return MemRefType::get(shape, elemType);
     });
 
     // Add argument materialization: handles function arguments
@@ -288,9 +303,24 @@ struct TensorCreateOpLowering : public OpConversionPattern<simp::TensorCreateOp>
 
     // Get the tensor type
     auto tensorType = op.getType().cast<simp::SimpTensorType>();
+    auto elemType = tensorType.getElementType();
+    auto shape = tensorType.getShape();
+
+    // Special handling for i4: pack 2 values per i8 byte
+    if (auto intType = elemType.dyn_cast<IntegerType>()) {
+      if (intType.getWidth() == 4 && !shape.empty()) {
+        // Pack 2 i4 values per i8 byte: last dim becomes (dim + 1) / 2
+        SmallVector<int64_t> packedShape(shape.begin(), shape.end());
+        packedShape.back() = (packedShape.back() + 1) / 2;
+        auto i8Type = rewriter.getIntegerType(8);
+        auto memrefType = MemRefType::get(packedShape, i8Type);
+        rewriter.replaceOpWithNewOp<memref::AllocOp>(op, memrefType);
+        return success();
+      }
+    }
 
     // Convert to memref<shape x T> with static dimensions
-    auto memrefType = MemRefType::get(tensorType.getShape(), tensorType.getElementType());
+    auto memrefType = MemRefType::get(shape, elemType);
 
     // Create memref.alloc with static shape
     rewriter.replaceOpWithNewOp<memref::AllocOp>(op, memrefType);
@@ -371,6 +401,16 @@ struct TensorGetOpLowering : public OpConversionPattern<simp::TensorGetOp> {
     auto operands = adaptor.getOperands();
     Value memref = operands[0];  // tensor (now memref)
 
+    // Check if this is a packed i4 tensor by examining the ORIGINAL tensor type
+    // (the memref is now i8 for packed storage, so we can't check memref type)
+    bool isPackedI4 = false;
+    auto origTensorType = op.tensor().getType().dyn_cast<simp::SimpTensorType>();
+    if (origTensorType) {
+      if (auto intType = origTensorType.getElementType().dyn_cast<IntegerType>()) {
+        isPackedI4 = (intType.getWidth() == 4);
+      }
+    }
+
     // Collect indices and convert to index type if needed
     SmallVector<Value, 4> indices;
     for (size_t i = 1; i < operands.size(); ++i) {
@@ -379,6 +419,61 @@ struct TensorGetOpLowering : public OpConversionPattern<simp::TensorGetOp> {
         index = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), index);
       }
       indices.push_back(index);
+    }
+
+    // Handle packed i4 tensors (2 values per i8 byte)
+    if (isPackedI4 && !indices.empty()) {
+      Value lastIdx = indices.back();
+      auto i8Type = rewriter.getIntegerType(8);
+      auto i4Type = rewriter.getIntegerType(4);
+
+      // Compute byte index and nibble position
+      // byteIdx = lastIdx / 2, nibblePos = lastIdx % 2
+      Value c2 = rewriter.create<arith::ConstantIndexOp>(loc, 2);
+      Value byteIdx = rewriter.create<arith::DivUIOp>(loc, lastIdx, c2);
+      Value nibblePos = rewriter.create<arith::RemUIOp>(loc, lastIdx, c2);
+
+      // Build indices with byte index
+      SmallVector<Value, 4> packedIndices(indices.begin(), indices.end() - 1);
+      packedIndices.push_back(byteIdx);
+
+      // Load packed byte
+      Value packedByte = rewriter.create<memref::LoadOp>(loc, memref, packedIndices);
+
+      // Extract nibble based on position
+      Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+      Value isLowNibble = rewriter.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::eq, nibblePos, zero);
+
+      Value c4_i8 = rewriter.create<arith::ConstantOp>(
+          loc, i8Type, rewriter.getI8IntegerAttr(4));
+      Value c15_i8 = rewriter.create<arith::ConstantOp>(
+          loc, i8Type, rewriter.getI8IntegerAttr(15));
+
+      // Low nibble: byte & 0x0F
+      Value lowNibble = rewriter.create<arith::AndIOp>(loc, packedByte, c15_i8);
+
+      // High nibble: (byte >> 4) & 0x0F
+      Value shifted = rewriter.create<arith::ShRUIOp>(loc, packedByte, c4_i8);
+      Value highNibble = rewriter.create<arith::AndIOp>(loc, shifted, c15_i8);
+
+      // Select based on nibble position
+      Value result8 = rewriter.create<SelectOp>(loc, isLowNibble, lowNibble, highNibble);
+
+      // Sign-extend from i4 to i8 (check if bit 3 is set)
+      Value c8_i8 = rewriter.create<arith::ConstantOp>(
+          loc, i8Type, rewriter.getI8IntegerAttr(8));
+      Value hasSign = rewriter.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::uge, result8, c8_i8);
+      Value signExtend = rewriter.create<arith::ConstantOp>(
+          loc, i8Type, rewriter.getI8IntegerAttr(0xF0));
+      Value extended = rewriter.create<arith::OrIOp>(loc, result8, signExtend);
+      Value signedResult = rewriter.create<SelectOp>(loc, hasSign, extended, result8);
+
+      // Truncate to i4
+      Value result = rewriter.create<arith::TruncIOp>(loc, i4Type, signedResult);
+      rewriter.replaceOp(op, result);
+      return success();
     }
 
     // Check if memref came from reinterpret_cast (which may have non-zero offset)
@@ -443,6 +538,16 @@ struct TensorSetOpLowering : public OpConversionPattern<simp::TensorSetOp> {
     Value memref = operands[0];  // tensor (now memref)
     Value value = operands[operands.size() - 1];  // last operand is value
 
+    // Check if this is a packed i4 tensor by examining the ORIGINAL tensor type
+    // (the memref is now i8 for packed storage, so we can't check memref type)
+    bool isPackedI4 = false;
+    auto origTensorType = op.tensor().getType().dyn_cast<simp::SimpTensorType>();
+    if (origTensorType) {
+      if (auto intType = origTensorType.getElementType().dyn_cast<IntegerType>()) {
+        isPackedI4 = (intType.getWidth() == 4);
+      }
+    }
+
     // Collect indices (all operands except first and last)
     SmallVector<Value, 4> indices;
     for (size_t i = 1; i < operands.size() - 1; ++i) {
@@ -451,6 +556,66 @@ struct TensorSetOpLowering : public OpConversionPattern<simp::TensorSetOp> {
         index = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), index);
       }
       indices.push_back(index);
+    }
+
+    // Handle packed i4 tensors (2 values per i8 byte)
+    if (isPackedI4 && !indices.empty()) {
+      Value lastIdx = indices.back();
+      auto i8Type = rewriter.getIntegerType(8);
+
+      // Compute byte index and nibble position
+      Value c2 = rewriter.create<arith::ConstantIndexOp>(loc, 2);
+      Value byteIdx = rewriter.create<arith::DivUIOp>(loc, lastIdx, c2);
+      Value nibblePos = rewriter.create<arith::RemUIOp>(loc, lastIdx, c2);
+
+      // Build indices with byte index
+      SmallVector<Value, 4> packedIndices(indices.begin(), indices.end() - 1);
+      packedIndices.push_back(byteIdx);
+
+      // Load current packed byte
+      Value packedByte = rewriter.create<memref::LoadOp>(loc, memref, packedIndices);
+
+      // Truncate/convert value to i8 and mask to 4 bits
+      Value value8;
+      auto valueIntType = value.getType().dyn_cast<IntegerType>();
+      if (valueIntType && valueIntType.getWidth() > 8) {
+        // Truncate larger integer to i8
+        value8 = rewriter.create<arith::TruncIOp>(loc, i8Type, value);
+      } else if (valueIntType && valueIntType.getWidth() < 8) {
+        // Extend smaller integer to i8
+        value8 = rewriter.create<arith::ExtSIOp>(loc, i8Type, value);
+      } else {
+        value8 = value;
+      }
+      Value c15_i8 = rewriter.create<arith::ConstantOp>(
+          loc, i8Type, rewriter.getI8IntegerAttr(15));
+      value8 = rewriter.create<arith::AndIOp>(loc, value8, c15_i8);
+
+      // Determine if low or high nibble
+      Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+      Value isLowNibble = rewriter.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::eq, nibblePos, zero);
+
+      // For low nibble: clear low 4 bits, OR with value
+      Value c240_i8 = rewriter.create<arith::ConstantOp>(
+          loc, i8Type, rewriter.getI8IntegerAttr(0xF0));
+      Value clearedLow = rewriter.create<arith::AndIOp>(loc, packedByte, c240_i8);
+      Value newByteLow = rewriter.create<arith::OrIOp>(loc, clearedLow, value8);
+
+      // For high nibble: clear high 4 bits, OR with (value << 4)
+      Value c4_i8 = rewriter.create<arith::ConstantOp>(
+          loc, i8Type, rewriter.getI8IntegerAttr(4));
+      Value shiftedValue = rewriter.create<arith::ShLIOp>(loc, value8, c4_i8);
+      Value clearedHigh = rewriter.create<arith::AndIOp>(loc, packedByte, c15_i8);
+      Value newByteHigh = rewriter.create<arith::OrIOp>(loc, clearedHigh, shiftedValue);
+
+      // Select based on nibble position
+      Value newByte = rewriter.create<SelectOp>(loc, isLowNibble, newByteLow, newByteHigh);
+
+      // Store modified byte
+      rewriter.create<memref::StoreOp>(loc, newByte, memref, packedIndices);
+      rewriter.replaceOp(op, memref);
+      return success();
     }
 
     // Ensure value type matches memref element type using type promotion
@@ -2734,14 +2899,38 @@ struct TensorMatMulOpLowering : public OpConversionPattern<simp::TensorMatMulOp>
     int64_t lhsRank = lhsShape.size();
     int64_t rhsRank = rhsShape.size();
 
-    // Allocate result tensor
-    Value result = rewriter.create<memref::AllocOp>(loc, resultType);
+    // Check ORIGINAL tensor type for i4 BEFORE any allocation
+    // (memref is now packed i8 for i4 tensors)
+    auto origLhsType = op.lhs().getType().dyn_cast<simp::SimpTensorType>();
+    bool isPackedI4 = false;
+    int64_t origK = (lhsRank >= 2) ? lhsShape[1] : 0;
+    int64_t origN = (rhsRank >= 2) ? rhsShape[1] : 0;
+    if (origLhsType) {
+      if (auto intType = origLhsType.getElementType().dyn_cast<IntegerType>()) {
+        if (intType.getWidth() == 4) {
+          isPackedI4 = true;
+          // Get original dimensions from tensor type (not packed memref)
+          auto origLhsShape = origLhsType.getShape();
+          auto origRhsType = op.rhs().getType().cast<simp::SimpTensorType>();
+          auto origRhsShape = origRhsType.getShape();
+          origK = origLhsShape[1];  // A is MxK
+          origN = origRhsShape[1];  // B is KxN
+        }
+      }
+    }
 
-    // Initialize result to zero (linalg.matmul accumulates into the output)
-    auto elemType = resultType.getElementType();
-    Value zero = rewriter.create<arith::ConstantOp>(
-        loc, elemType, rewriter.getZeroAttr(elemType));
-    rewriter.create<linalg::FillOp>(loc, zero, result);
+    // For INT4, we handle allocation separately - skip here
+    Value result;
+    if (!isPackedI4) {
+      // Allocate result tensor
+      result = rewriter.create<memref::AllocOp>(loc, resultType);
+
+      // Initialize result to zero (linalg.matmul accumulates into the output)
+      auto elemType = resultType.getElementType();
+      Value zero = rewriter.create<arith::ConstantOp>(
+          loc, elemType, rewriter.getZeroAttr(elemType));
+      rewriter.create<linalg::FillOp>(loc, zero, result);
+    }
 
     if (lhsRank == 2 && rhsRank == 2) {
       // Case 1: Standard 2D matrix multiplication (GEMM)
@@ -2752,14 +2941,196 @@ struct TensorMatMulOpLowering : public OpConversionPattern<simp::TensorMatMulOp>
       int64_t K_rhs = rhsShape[0];
       int64_t N = rhsShape[1];
 
-      // Special case: 1x1 matmul = scalar multiplication
-      // Avoid vectorization to prevent vector.broadcast lowering issues
-      if (M == 1 && K_lhs == 1 && K_rhs == 1 && N == 1) {
+      if (M == 1 && K_lhs == 1 && K_rhs == 1 && N == 1 && !isPackedI4) {
         Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
         Value lhsVal = rewriter.create<memref::LoadOp>(loc, lhs, ValueRange{c0, c0});
         Value rhsVal = rewriter.create<memref::LoadOp>(loc, rhs, ValueRange{c0, c0});
         Value product = rewriter.create<arith::MulFOp>(loc, lhsVal, rhsVal);
         rewriter.create<memref::StoreOp>(loc, product, result, ValueRange{c0, c0});
+      // INT4 matmul: packed i8 storage, i4 × i4 → i32 accumulator
+      // OPTIMIZED: Unpack to i8 buffers upfront, then use VNNI-friendly pattern
+      } else if (isPackedI4) {
+        // INT4 matmul with packed i8 storage
+        //
+        // Input tensors are packed: 2 × i4 values per i8 byte
+        // - Low nibble = even index, High nibble = odd index
+        // - memref shape has halved last dimension
+        //
+        // OPTIMIZED Strategy:
+        // 1. Unpack A from packed i4 to full i8 buffer (M × K)
+        // 2. Unpack B and transpose to B_T (N × K) for VNNI-friendly access
+        // 3. Run i8 × i8 → i32 matmul with K-innermost loop (enables vpmaddwd)
+        // 4. Store result as i16
+
+        auto i8Type = rewriter.getIntegerType(8);
+        auto i16Type = rewriter.getIntegerType(16);
+        auto i32Type = rewriter.getIntegerType(32);
+
+        // Get original result shape from tensor type
+        auto origResultType = op.getType().cast<simp::SimpTensorType>();
+        auto origResultShape = origResultType.getShape();
+        auto resultMemRefType = MemRefType::get(origResultShape, i16Type);
+
+        // Allocate unpacked i8 buffers for A (M×K) and B_T (N×K)
+        auto aUnpackedType = MemRefType::get({M, origK}, i8Type);
+        auto btUnpackedType = MemRefType::get({origN, origK}, i8Type);
+        Value aUnpacked = rewriter.create<memref::AllocOp>(loc, aUnpackedType);
+        Value btUnpacked = rewriter.create<memref::AllocOp>(loc, btUnpackedType);
+
+        // Allocate i16 result buffer
+        Value resultWide = rewriter.create<memref::AllocOp>(loc, resultMemRefType);
+
+        // Initialize result to zero
+        Value zero16 = rewriter.create<arith::ConstantOp>(
+            loc, i16Type, rewriter.getZeroAttr(i16Type));
+        rewriter.create<linalg::FillOp>(loc, zero16, resultWide);
+
+        // Loop bounds using ORIGINAL dimensions
+        Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+        Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+        Value c2 = rewriter.create<arith::ConstantIndexOp>(loc, 2);
+        Value M_val = rewriter.create<arith::ConstantIndexOp>(loc, M);
+        Value N_val = rewriter.create<arith::ConstantIndexOp>(loc, origN);
+        Value K_val = rewriter.create<arith::ConstantIndexOp>(loc, origK);
+
+        // Constants for nibble extraction
+        Value c4_i8 = rewriter.create<arith::ConstantOp>(
+            loc, i8Type, rewriter.getI8IntegerAttr(4));
+        Value c15_i8 = rewriter.create<arith::ConstantOp>(
+            loc, i8Type, rewriter.getI8IntegerAttr(15));
+        Value c8_i8 = rewriter.create<arith::ConstantOp>(
+            loc, i8Type, rewriter.getI8IntegerAttr(8));
+        Value signExtMask = rewriter.create<arith::ConstantOp>(
+            loc, i8Type, rewriter.getI8IntegerAttr(0xF0));
+
+        // ============================================================
+        // PHASE 1: Unpack A from packed i4 to i8 (M × K)
+        // ============================================================
+        rewriter.create<scf::ForOp>(
+            loc, c0, M_val, c1, ValueRange{},
+            [&](OpBuilder &b1, Location loc, Value i, ValueRange) {
+              b1.create<scf::ForOp>(
+                  loc, c0, K_val, c1, ValueRange{},
+                  [&](OpBuilder &b2, Location loc, Value k, ValueRange) {
+                    // byteIdx = k / 2
+                    Value byteIdx = b2.create<arith::DivUIOp>(loc, k, c2);
+                    // Load packed byte from A
+                    Value packedByte = b2.create<memref::LoadOp>(
+                        loc, lhs, ValueRange{i, byteIdx});
+
+                    // nibblePos = k % 2
+                    Value nibblePos = b2.create<arith::RemUIOp>(loc, k, c2);
+                    Value isLow = b2.create<arith::CmpIOp>(
+                        loc, arith::CmpIPredicate::eq, nibblePos, c0);
+
+                    // Extract nibble
+                    Value lowNibble = b2.create<arith::AndIOp>(loc, packedByte, c15_i8);
+                    Value shifted = b2.create<arith::ShRUIOp>(loc, packedByte, c4_i8);
+                    Value highNibble = b2.create<arith::AndIOp>(loc, shifted, c15_i8);
+                    Value nibble = b2.create<SelectOp>(loc, isLow, lowNibble, highNibble);
+
+                    // Sign-extend from i4 to i8
+                    Value hasSign = b2.create<arith::CmpIOp>(
+                        loc, arith::CmpIPredicate::uge, nibble, c8_i8);
+                    Value extended = b2.create<arith::OrIOp>(loc, nibble, signExtMask);
+                    Value signedVal = b2.create<SelectOp>(loc, hasSign, extended, nibble);
+
+                    // Store to unpacked A
+                    b2.create<memref::StoreOp>(loc, signedVal, aUnpacked, ValueRange{i, k});
+                    b2.create<scf::YieldOp>(loc);
+                  });
+              b1.create<scf::YieldOp>(loc);
+            });
+
+        // ============================================================
+        // PHASE 2: Unpack B and transpose to B_T (N × K)
+        // B[k,j] -> B_T[j,k] for VNNI-friendly K-innermost access
+        // ============================================================
+        rewriter.create<scf::ForOp>(
+            loc, c0, N_val, c1, ValueRange{},
+            [&](OpBuilder &b1, Location loc, Value j, ValueRange) {
+              b1.create<scf::ForOp>(
+                  loc, c0, K_val, c1, ValueRange{},
+                  [&](OpBuilder &b2, Location loc, Value k, ValueRange) {
+                    // B is packed along J dimension: B[k, j/2] contains B[k,j] and B[k,j+1]
+                    Value byteIdx = b2.create<arith::DivUIOp>(loc, j, c2);
+                    Value packedByte = b2.create<memref::LoadOp>(
+                        loc, rhs, ValueRange{k, byteIdx});
+
+                    Value nibblePos = b2.create<arith::RemUIOp>(loc, j, c2);
+                    Value isLow = b2.create<arith::CmpIOp>(
+                        loc, arith::CmpIPredicate::eq, nibblePos, c0);
+
+                    Value lowNibble = b2.create<arith::AndIOp>(loc, packedByte, c15_i8);
+                    Value shifted = b2.create<arith::ShRUIOp>(loc, packedByte, c4_i8);
+                    Value highNibble = b2.create<arith::AndIOp>(loc, shifted, c15_i8);
+                    Value nibble = b2.create<SelectOp>(loc, isLow, lowNibble, highNibble);
+
+                    Value hasSign = b2.create<arith::CmpIOp>(
+                        loc, arith::CmpIPredicate::uge, nibble, c8_i8);
+                    Value extended = b2.create<arith::OrIOp>(loc, nibble, signExtMask);
+                    Value signedVal = b2.create<SelectOp>(loc, hasSign, extended, nibble);
+
+                    // Store transposed: B_T[j,k] = B[k,j]
+                    b2.create<memref::StoreOp>(loc, signedVal, btUnpacked, ValueRange{j, k});
+                    b2.create<scf::YieldOp>(loc);
+                  });
+              b1.create<scf::YieldOp>(loc);
+            });
+
+        // ============================================================
+        // PHASE 3: VNNI-friendly matmul with K-innermost
+        // C[i,j] = sum_k A[i,k] * B_T[j,k]
+        // ============================================================
+        rewriter.create<scf::ForOp>(
+            loc, c0, M_val, c1, ValueRange{},
+            [&](OpBuilder &b1, Location loc, Value i, ValueRange) {
+              b1.create<scf::ForOp>(
+                  loc, c0, N_val, c1, ValueRange{},
+                  [&](OpBuilder &b2, Location loc, Value j, ValueRange) {
+                    Value zero32 = b2.create<arith::ConstantOp>(
+                        loc, i32Type, b2.getZeroAttr(i32Type));
+                    auto kLoop = b2.create<scf::ForOp>(
+                        loc, c0, K_val, c1, ValueRange{zero32},
+                        [&](OpBuilder &b3, Location loc, Value k, ValueRange iterArgs) {
+                          Value acc = iterArgs[0];
+
+                          // Load unpacked i8 values
+                          Value aVal = b3.create<memref::LoadOp>(
+                              loc, aUnpacked, ValueRange{i, k});
+                          Value bVal = b3.create<memref::LoadOp>(
+                              loc, btUnpacked, ValueRange{j, k});
+
+                          // Extend to i16 for VNNI-like pattern
+                          Value aWide = b3.create<arith::ExtSIOp>(loc, i16Type, aVal);
+                          Value bWide = b3.create<arith::ExtSIOp>(loc, i16Type, bVal);
+
+                          // Multiply i16 × i16
+                          Value prod = b3.create<arith::MulIOp>(loc, aWide, bWide);
+
+                          // Extend to i32 and accumulate
+                          Value prod32 = b3.create<arith::ExtSIOp>(loc, i32Type, prod);
+                          Value newAcc = b3.create<arith::AddIOp>(loc, acc, prod32);
+
+                          b3.create<scf::YieldOp>(loc, ValueRange{newAcc});
+                        });
+
+                    // Truncate result to i16 and store
+                    Value dotProduct32 = kLoop.getResult(0);
+                    Value dotProduct16 = b2.create<arith::TruncIOp>(loc, i16Type, dotProduct32);
+                    b2.create<memref::StoreOp>(loc, dotProduct16, resultWide, ValueRange{i, j});
+                    b2.create<scf::YieldOp>(loc);
+                  });
+              b1.create<scf::YieldOp>(loc);
+            });
+
+        // Free temporary buffers
+        rewriter.create<memref::DeallocOp>(loc, aUnpacked);
+        rewriter.create<memref::DeallocOp>(loc, btUnpacked);
+
+        rewriter.replaceOp(op, resultWide);
+        return success();
+
       // Check INPUT element type for INT8/INT16 (result is already promoted to i32)
       } else if (lhsType.getElementType().isInteger(8) || lhsType.getElementType().isInteger(16)) {
         // INT8 matmul: i8 × i8 → i32
@@ -2942,7 +3313,9 @@ struct TensorMatMulOpLowering : public OpConversionPattern<simp::TensorMatMulOp>
           loc, MemRefType::get({spatial, C_out}, elemType));
 
       // Initialize tempResult to zero
-      rewriter.create<linalg::FillOp>(loc, zero, tempResult);
+      Value zeroVal = rewriter.create<arith::ConstantOp>(
+          loc, elemType, rewriter.getZeroAttr(elemType));
+      rewriter.create<linalg::FillOp>(loc, zeroVal, tempResult);
 
       rewriter.create<linalg::MatmulOp>(
           loc, ValueRange{lhsCollapsed, rhsTransposed}, ValueRange{tempResult});

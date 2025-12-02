@@ -28,27 +28,23 @@ typedef int32_t (*KernelFuncI32)();
 // ============================================================================
 
 // Scalar reference implementation (for correctness verification)
-// Matches SimpLang initialization: A[i,j] = val, B[j,i] = val (B is transpose of A)
-// Then computes C = A × B (standard matmul, not A × B^T)
+// Signed × Signed: A and B both use values -64 to 62
 template<int N>
 int32_t scalar_matmul_int8() {
     std::vector<int8_t> A(N * N);
     std::vector<int8_t> B(N * N);
     std::vector<int32_t> C(N * N, 0);
 
-    // Initialize exactly like SimpLang:
-    // A[i][j] = val
-    // B[j][i] = val (means B[row=j][col=i] = val)
+    // Initialize: both A and B use same values
     for (int i = 0; i < N; i++) {
         for (int j = 0; j < N; j++) {
             int val = ((i * N + j) % 127) - 64;
-            A[i * N + j] = (int8_t)val;      // A[i][j] = val
-            B[j * N + i] = (int8_t)val;      // B[j][i] = val
+            A[i * N + j] = (int8_t)val;
+            B[j * N + i] = (int8_t)val;
         }
     }
 
-    // Compute C = A × B (standard matmul)
-    // C[i][j] = sum_k(A[i][k] * B[k][j])
+    // Compute C = A × B (i8 × i8 → i32)
     for (int i = 0; i < N; i++) {
         for (int j = 0; j < N; j++) {
             int32_t sum = 0;
@@ -67,7 +63,7 @@ int32_t scalar_matmul_int8() {
     return checksum;
 }
 
-// Eigen reference implementation
+// Eigen reference implementation (i8 × i8)
 template<int N>
 int32_t eigen_matmul_int8() {
     Eigen::Matrix<int8_t, Eigen::Dynamic, Eigen::Dynamic> A(N, N);
@@ -78,16 +74,14 @@ int32_t eigen_matmul_int8() {
         for (int j = 0; j < N; j++) {
             int val = ((i * N + j) % 127) - 64;
             A(i, j) = (int8_t)val;
-            B(j, i) = (int8_t)val;  // Transposed
+            B(j, i) = (int8_t)val;
         }
     }
 
-    // Cast to i32 and multiply - FORCE full matmul by using eval()
-    // Without eval(), Eigen's expression templates might optimize sum(A*B) to O(N²)
+    // Cast to i32 and multiply
     Eigen::Matrix<int32_t, Eigen::Dynamic, Eigen::Dynamic> C =
         (A.cast<int32_t>() * B.cast<int32_t>()).eval();
 
-    // Now sum the actual result matrix
     return C.sum();
 }
 
@@ -102,9 +96,7 @@ int32_t vnni_matmul_int8() {
     alignas(64) int32_t C[N * N];
     memset(C, 0, sizeof(C));
 
-    // Initialize exactly like SimpLang:
-    // A[i][j] = val
-    // B[j][i] = val
+    // Initialize: same values for A and B
     for (int i = 0; i < N; i++) {
         for (int j = 0; j < N; j++) {
             int val = ((i * N + j) % 127) - 64;
@@ -114,18 +106,13 @@ int32_t vnni_matmul_int8() {
     }
 
     // Create B_T where B_T[j][k] = B[k][j] for SIMD-friendly row access
-    // This allows us to compute C[i][j] = sum_k(A[i][k] * B[k][j])
-    // as C[i][j] = sum_k(A[i][k] * B_T[j][k]) with contiguous memory access
     for (int j = 0; j < N; j++) {
         for (int k = 0; k < N; k++) {
             B_T[j * N + k] = B[k * N + j];
         }
     }
 
-    // VNNI matmul: C[i,j] = sum_k(A[i,k] * B_T[j,k])
-    // Where B_T[j,k] = B[k,j], so this computes A × B correctly
-    // Using vpmaddwd for signed i8×i8→i32
-
+    // Matmul using vpmaddwd for signed i8×i8
     for (int i = 0; i < N; i++) {
         for (int j = 0; j < N; j++) {
             __m512i acc = _mm512_setzero_si512();
@@ -133,27 +120,23 @@ int32_t vnni_matmul_int8() {
             // Process K dimension in chunks of 64
             int k = 0;
             for (; k + 63 < N; k += 64) {
-                // Load 64 bytes from A[i, k:k+64] and B_T[j, k:k+64]
                 __m512i va = _mm512_loadu_si512(&A[i * N + k]);
                 __m512i vb = _mm512_loadu_si512(&B_T[j * N + k]);
 
-                // For signed×signed i8, use vpmaddwd (i16×i16→i32 with pairwise add)
-                // First extend i8 to i16
+                // Sign-extend i8 to i16 for vpmaddwd
                 __m512i va_lo = _mm512_cvtepi8_epi16(_mm512_extracti64x4_epi64(va, 0));
                 __m512i va_hi = _mm512_cvtepi8_epi16(_mm512_extracti64x4_epi64(va, 1));
                 __m512i vb_lo = _mm512_cvtepi8_epi16(_mm512_extracti64x4_epi64(vb, 0));
                 __m512i vb_hi = _mm512_cvtepi8_epi16(_mm512_extracti64x4_epi64(vb, 1));
 
-                // Multiply and add pairs: i16×i16→i32
+                // vpmaddwd: multiply i16 pairs and add adjacent
                 __m512i prod_lo = _mm512_madd_epi16(va_lo, vb_lo);
                 __m512i prod_hi = _mm512_madd_epi16(va_hi, vb_hi);
 
-                // Accumulate
                 acc = _mm512_add_epi32(acc, prod_lo);
                 acc = _mm512_add_epi32(acc, prod_hi);
             }
 
-            // Horizontal sum of acc
             int32_t sum = _mm512_reduce_add_epi32(acc);
 
             // Handle remaining elements

@@ -35,6 +35,7 @@ extern "C" int yywrap() { return 1; }
 "f32"                 { return TF32; }
 "f64"                 { return TF64; }
 "int"                 { return TI32; }  /* Alias for i32 */
+"i4"                  { return TI4; }
 "i8"                  { return TI8; }
 "i16"                 { return TI16; }
 "i32"                 { return TI32; }

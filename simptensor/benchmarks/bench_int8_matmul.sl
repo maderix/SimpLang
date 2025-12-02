@@ -5,7 +5,6 @@
 // - Small: 32, 64, 128 (embedding layers, attention heads)
 // - Medium: 256, 384, 512 (linear layers)
 // - Large: 768, 1024 (BERT, transformer FFN)
-// - Non-square: transformer-specific shapes
 
 // ========== Small Sizes ==========
 
@@ -17,7 +16,6 @@ fn benchmark_int8_matmul_32() -> i32 {
     while (i < 32) {
         var j = 0;
         while (j < 32) {
-            // Use modular arithmetic to stay in i8 range [-128, 127]
             var val = ((i * 32 + j) % 127) - 64;
             A[i as i64, j as i64] = val;
             B[j as i64, i as i64] = val;

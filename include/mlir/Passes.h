@@ -50,6 +50,10 @@ void registerSimpLinalgTilingPass();
 /// Create a pass that inserts prefetch operations into tiled loops
 std::unique_ptr<Pass> createInsertPrefetchPass();
 
+/// Create a pass that emulates sub-byte integer types (i4, i2) by packing into i8.
+/// This is required for LLVM lowering since LLVM doesn't support sub-byte addressable memory.
+std::unique_ptr<Pass> createEmulateNarrowTypePass();
+
 /// Register all Simp dialect passes for command-line usage
 void registerSimpPasses();
 

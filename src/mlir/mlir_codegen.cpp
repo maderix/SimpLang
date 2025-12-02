@@ -127,6 +127,7 @@ public:
       case TypeKind::BF16:    return builder.getBF16Type();
       case TypeKind::F32:     return builder.getF32Type();
       case TypeKind::F64:     return builder.getF64Type();
+      case TypeKind::I4:      return builder.getIntegerType(4);
       case TypeKind::I8:      return builder.getIntegerType(8);
       case TypeKind::I16:     return builder.getIntegerType(16);
       case TypeKind::I32:     return builder.getI32Type();
@@ -151,6 +152,7 @@ public:
     if (typeStr == "f64" || typeStr == "double") return builder.getF64Type();
 
     // Signed integer types
+    if (typeStr == "i4")                      return builder.getIntegerType(4);
     if (typeStr == "i8")                      return builder.getIntegerType(8);
     if (typeStr == "i16")                     return builder.getIntegerType(16);
     if (typeStr == "i32" || typeStr == "int") return builder.getI32Type();
@@ -2147,9 +2149,12 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
       return nullptr;
     }
 
-    // For i8/i16 inputs, promote result type to i32 to prevent overflow
+    // For narrow integer inputs, promote result type to prevent overflow
+    // i4 → i16, i8/i16 → i32
     mlir::Type elemType = lhsType.getElementType();
-    if (elemType.isInteger(8) || elemType.isInteger(16)) {
+    if (elemType.isInteger(4)) {
+      elemType = builder.getIntegerType(16);
+    } else if (elemType.isInteger(8) || elemType.isInteger(16)) {
       elemType = builder.getI32Type();
     }
 

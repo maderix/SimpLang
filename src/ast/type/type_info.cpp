@@ -8,6 +8,7 @@ llvm::Type* TypeInfo::getLLVMType(llvm::LLVMContext& ctx) const {
         case TypeKind::BF16:    return llvm::Type::getBFloatTy(ctx);
         case TypeKind::F32:     return llvm::Type::getFloatTy(ctx);
         case TypeKind::F64:     return llvm::Type::getDoubleTy(ctx);
+        case TypeKind::I4:      return llvm::Type::getIntNTy(ctx, 4);
         case TypeKind::I8:      return llvm::Type::getInt8Ty(ctx);
         case TypeKind::I16:     return llvm::Type::getInt16Ty(ctx);
         case TypeKind::I32:     return llvm::Type::getInt32Ty(ctx);
@@ -31,6 +32,7 @@ std::string TypeInfo::toString() const {
         case TypeKind::BF16:    return "bf16";
         case TypeKind::F32:     return "f32";
         case TypeKind::F64:     return "f64";
+        case TypeKind::I4:      return "i4";
         case TypeKind::I8:      return "i8";
         case TypeKind::I16:     return "i16";
         case TypeKind::I32:     return "i32";
