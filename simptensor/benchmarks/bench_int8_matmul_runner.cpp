@@ -89,12 +89,12 @@ int32_t eigen_matmul_int8() {
 // Uses vpmaddwd (i16×i16→i32) for signed int8 multiplication
 template<int N>
 int32_t vnni_matmul_int8() {
-    // Allocate aligned memory
-    alignas(64) int8_t A[N * N];
-    alignas(64) int8_t B[N * N];
-    alignas(64) int8_t B_T[N * N];  // Transposed B for SIMD-friendly access
-    alignas(64) int32_t C[N * N];
-    memset(C, 0, sizeof(C));
+    // Allocate aligned memory on heap for large sizes
+    int8_t* A = (int8_t*)aligned_alloc(64, N * N * sizeof(int8_t));
+    int8_t* B = (int8_t*)aligned_alloc(64, N * N * sizeof(int8_t));
+    int8_t* B_T = (int8_t*)aligned_alloc(64, N * N * sizeof(int8_t));
+    int32_t* C = (int32_t*)aligned_alloc(64, N * N * sizeof(int32_t));
+    memset(C, 0, N * N * sizeof(int32_t));
 
     // Initialize: same values for A and B
     for (int i = 0; i < N; i++) {
@@ -153,6 +153,10 @@ int32_t vnni_matmul_int8() {
     for (int i = 0; i < N * N; i++) {
         checksum += C[i];
     }
+    free(A);
+    free(B);
+    free(B_T);
+    free(C);
     return checksum;
 }
 
@@ -306,6 +310,7 @@ int main(int argc, char* argv[]) {
     print_result(benchmark_size<512>(handle, "benchmark_int8_matmul_512", 3));
     print_result(benchmark_size<768>(handle, "benchmark_int8_matmul_768", 2));
     print_result(benchmark_size<1024>(handle, "benchmark_int8_matmul_1024", 1));
+    print_result(benchmark_size<2048>(handle, "benchmark_int8_matmul_2048", 1));
 
     std::cout << "═══════════════════════════════════════════════════════════════════════════════════════════" << std::endl;
     std::cout << std::endl;

@@ -27,6 +27,7 @@
 #include "mlir/Passes.h"
 #include "mlir/ExecutionEngine/OptUtils.h"
 #include "mlir/PromoteLargeAllocaToHeap.h"
+#include "mlir/passes/VNNIPass.h"
 #include "ast/transforms/normalize_returns.hpp"
 #endif
 
@@ -429,6 +430,25 @@ int main(int argc, char** argv) {
         auto targetMachine = target->createTargetMachine(targetTriple, cpu, features, opt, rm);
 
         llvmModule->setDataLayout(targetMachine->createDataLayout());
+
+        // Run VNNI optimization pass BEFORE O3 to identify and transform i8 dot product loops
+        LOG_INFO("Running VNNI optimization pass...");
+        {
+            llvm::legacy::PassManager vnniPM;
+            // First simplify loops to create proper preheaders
+            vnniPM.add(llvm::createLoopSimplifyPass());
+            vnniPM.add(llvm::createLCSSAPass());
+            // Now run VNNI pass
+            vnniPM.add(llvm::createVNNIPass());
+            vnniPM.run(*llvmModule);
+        }
+
+        // Dump IR after VNNI pass for debugging
+        {
+            std::error_code EC;
+            llvm::raw_fd_ostream vnniIR("/tmp/after_vnni.ll", EC, llvm::sys::fs::OF_None);
+            llvmModule->print(vnniIR, nullptr);
+        }
 
         // RUN LLVM OPTIMIZATION PASSES (Critical for performance!)
         // Use MLIR's optimization transformer (same as Toy tutorial Ch6)
