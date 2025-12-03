@@ -26,14 +26,15 @@ struct VNNICandidate {
   PHINode *AccPhi;
   PHINode *IndPhi;
   BinaryOperator *Add;
-  BinaryOperator *Mul;
-  ZExtInst *ZExt;
-  SExtInst *SExt;
+  BinaryOperator *Mul;        // The i16 or i32 mul
+  Instruction *ExtA;          // sext/zext from i8
+  Instruction *ExtB;          // sext/zext from i8
   LoadInst *LoadA;
   LoadInst *LoadB;
   GetElementPtrInst *GEPA;
   GetElementPtrInst *GEPB;
   int64_t TripCount;
+  bool ViaI16;                // true if pattern goes i8->i16->mul->i32
 };
 
 struct VNNIPass : public FunctionPass {
@@ -103,35 +104,67 @@ struct VNNIPass : public FunctionPass {
 
     Value *AddOp0 = Candidate.Add->getOperand(0);
     Value *AddOp1 = Candidate.Add->getOperand(1);
+    Value *MulOrExt = nullptr;
+
+    if (AddOp0 == AccPhi) MulOrExt = AddOp1;
+    else if (AddOp1 == AccPhi) MulOrExt = AddOp0;
+    if (!MulOrExt) return false;
+
+    // Pattern 1: Direct i32 mul (i8->i32 extensions)
+    // Pattern 2: i8->i16->mul i16->sext i32 (what MLIR generates)
     BinaryOperator *Mul = nullptr;
+    Instruction *ExtA = nullptr;
+    Instruction *ExtB = nullptr;
+    Candidate.ViaI16 = false;
 
-    if (AddOp0 == AccPhi) Mul = dyn_cast<BinaryOperator>(AddOp1);
-    else if (AddOp1 == AccPhi) Mul = dyn_cast<BinaryOperator>(AddOp0);
+    // Check for Pattern 2: sext i16 to i32 wrapping a mul i16
+    if (auto *OuterSExt = dyn_cast<SExtInst>(MulOrExt)) {
+      if (OuterSExt->getSrcTy()->isIntegerTy(16) && OuterSExt->getDestTy()->isIntegerTy(32)) {
+        if (auto *I16Mul = dyn_cast<BinaryOperator>(OuterSExt->getOperand(0))) {
+          if (I16Mul->getOpcode() == Instruction::Mul && I16Mul->getType()->isIntegerTy(16)) {
+            Mul = I16Mul;
+            Candidate.ViaI16 = true;
+            errs() << "VNNI Pass: Found i8->i16->mul->i32 pattern\n";
+          }
+        }
+      }
+    }
 
-    if (!Mul || Mul->getOpcode() != Instruction::Mul) return false;
+    // Check for Pattern 1: direct i32 mul
+    if (!Mul) {
+      Mul = dyn_cast<BinaryOperator>(MulOrExt);
+      if (!Mul || Mul->getOpcode() != Instruction::Mul) return false;
+      if (!Mul->getType()->isIntegerTy(32)) return false;
+    }
+
     Candidate.Mul = Mul;
-
-    ZExtInst *ZExt = nullptr;
-    SExtInst *SExt = nullptr;
     Value *MulOp0 = Mul->getOperand(0);
     Value *MulOp1 = Mul->getOperand(1);
 
-    if (auto *Z = dyn_cast<ZExtInst>(MulOp0)) {
-      ZExt = Z;
-      SExt = dyn_cast<SExtInst>(MulOp1);
-    } else if (auto *Z = dyn_cast<ZExtInst>(MulOp1)) {
-      ZExt = Z;
-      SExt = dyn_cast<SExtInst>(MulOp0);
+    // Look for sext/zext from i8 to i16 or i32
+    auto checkExt = [&](Value *V) -> Instruction* {
+      if (auto *S = dyn_cast<SExtInst>(V)) {
+        if (S->getSrcTy()->isIntegerTy(8)) return S;
+      }
+      if (auto *Z = dyn_cast<ZExtInst>(V)) {
+        if (Z->getSrcTy()->isIntegerTy(8)) return Z;
+      }
+      return nullptr;
+    };
+
+    ExtA = checkExt(MulOp0);
+    ExtB = checkExt(MulOp1);
+
+    if (!ExtA || !ExtB) {
+      errs() << "VNNI Pass: Extensions not found from i8\n";
+      return false;
     }
 
-    if (!ZExt || !SExt) return false;
-    if (!ZExt->getSrcTy()->isIntegerTy(8) || !SExt->getSrcTy()->isIntegerTy(8)) return false;
+    Candidate.ExtA = ExtA;
+    Candidate.ExtB = ExtB;
 
-    Candidate.ZExt = ZExt;
-    Candidate.SExt = SExt;
-
-    Candidate.LoadA = dyn_cast<LoadInst>(ZExt->getOperand(0));
-    Candidate.LoadB = dyn_cast<LoadInst>(SExt->getOperand(0));
+    Candidate.LoadA = dyn_cast<LoadInst>(ExtA->getOperand(0));
+    Candidate.LoadB = dyn_cast<LoadInst>(ExtB->getOperand(0));
     if (!Candidate.LoadA || !Candidate.LoadB) return false;
 
     Candidate.GEPA = dyn_cast<GetElementPtrInst>(Candidate.LoadA->getPointerOperand());
@@ -235,45 +268,172 @@ struct VNNIPass : public FunctionPass {
     Value *BaseA = GEPA->getPointerOperand();
     Value *BaseB = GEPB->getPointerOperand();
 
-
     IRBuilder<> Builder(Ctx);
+    Builder.SetInsertPoint(Preheader->getTerminator());
 
-    // Clone RowOffsetA to preheader if it's defined inside the loop
-    if (auto *InstA = dyn_cast<Instruction>(RowOffsetA)) {
-      if (L->contains(InstA->getParent())) {
-        Builder.SetInsertPoint(Preheader->getTerminator());
-        // Clone the instruction and its operand chain
-        if (auto *MulA = dyn_cast<BinaryOperator>(InstA)) {
-          // It's a mul, clone it: %315 = mul i64 %305, 64
-          Value *NewRowA = Builder.CreateMul(MulA->getOperand(0), MulA->getOperand(1), "row.offset.A");
-          RowOffsetA = NewRowA;
+    // Helper to trace through PHI chains to find the ultimate source value
+    std::function<Value*(Value*)> tracePhiChain = [&](Value *V) -> Value* {
+      SmallPtrSet<Value*, 8> Visited;
+      while (auto *Phi = dyn_cast<PHINode>(V)) {
+        if (Visited.count(V)) break;  // Avoid infinite loops
+        Visited.insert(V);
+
+        // For single-incoming PHIs (LCSSA style), just follow through
+        if (Phi->getNumIncomingValues() == 1) {
+          V = Phi->getIncomingValue(0);
+          continue;
+        }
+
+        // For multi-incoming PHIs, look for value from entry/preheader
+        bool found = false;
+        for (unsigned i = 0; i < Phi->getNumIncomingValues(); i++) {
+          BasicBlock *InBB = Phi->getIncomingBlock(i);
+          // If incoming from entry block or outside all loops
+          if (&F.getEntryBlock() == InBB || !LI.getLoopFor(InBB)) {
+            V = Phi->getIncomingValue(i);
+            found = true;
+            break;
+          }
+        }
+        if (!found) break;
+      }
+      return V;
+    };
+
+    // Helper to trace back through PHIs to find a value that dominates preheader
+    // For MLIR memref descriptors, we need to extract the raw pointer
+    std::function<Value*(Value*, Loop*)> traceToLoopInvariant = [&](Value *V, Loop *L) -> Value* {
+      // For extractvalue - trace the aggregate and rebuild
+      if (auto *EV = dyn_cast<ExtractValueInst>(V)) {
+        Value *Agg = EV->getAggregateOperand();
+        Value *TracedAgg = tracePhiChain(Agg);
+
+        errs() << "VNNI Pass: ExtractValue aggregate traced: " << *Agg << " -> " << *TracedAgg << "\n";
+
+        if (TracedAgg != Agg) {
+          // Create new extractvalue in preheader
+          return Builder.CreateExtractValue(TracedAgg, EV->getIndices(), "traced.base");
+        }
+        return V;
+      }
+
+      // Already loop invariant
+      if (auto *Inst = dyn_cast<Instruction>(V)) {
+        if (!L->contains(Inst->getParent())) return V;
+      } else {
+        return V;  // Constants, arguments, etc.
+      }
+
+      // Trace through PHIs
+      Value *Traced = tracePhiChain(V);
+      if (Traced != V) return Traced;
+
+      return V;
+    };
+
+    // Helper to trace through all enclosing loops
+    auto traceToFunctionLevel = [&](Value *V) -> Value* {
+      Loop *CurLoop = L;
+      Value *Result = V;
+      while (CurLoop) {
+        Result = traceToLoopInvariant(Result, CurLoop);
+        CurLoop = CurLoop->getParentLoop();
+      }
+      return Result;
+    };
+
+    errs() << "VNNI Pass: Original BaseA: " << *BaseA << "\n";
+    errs() << "VNNI Pass: Original BaseB: " << *BaseB << "\n";
+
+    // Trace base pointers back to function-level values
+    BaseA = traceToFunctionLevel(BaseA);
+    BaseB = traceToFunctionLevel(BaseB);
+
+    errs() << "VNNI Pass: Traced BaseA: " << *BaseA << "\n";
+    errs() << "VNNI Pass: Traced BaseB: " << *BaseB << "\n";
+
+    // For row offsets - we need the outer loop indices multiplied by stride
+    // These come from the GEP index computation: row * stride + k
+    // The row offset is "row * stride" part
+    // IMPORTANT: Don't trace outer loop indices to entry - keep them as PHIs!
+    auto traceRowOffset = [&](Value *V) -> Value* {
+      // If it's an add, one operand is row*stride, other is k (induction var)
+      if (auto *Add = dyn_cast<BinaryOperator>(V)) {
+        if (Add->getOpcode() == Instruction::Add) {
+          Value *Op0 = Add->getOperand(0);
+          Value *Op1 = Add->getOperand(1);
+
+          // Find which operand is NOT the innermost induction variable
+          bool Op0IsInd = (Op0 == Candidate.IndPhi);
+
+          Value *RowPart = Op0IsInd ? Op1 : Op0;
+
+          // Trace the row part - it's typically a mul from outer loop
+          if (auto *Mul = dyn_cast<BinaryOperator>(RowPart)) {
+            if (Mul->getOpcode() == Instruction::Mul) {
+              // Get operands - one is stride (constant), other is outer loop index
+              Value *MulOp0 = Mul->getOperand(0);
+              Value *MulOp1 = Mul->getOperand(1);
+
+              Value *OuterIdx = isa<ConstantInt>(MulOp1) ? MulOp0 : MulOp1;
+              Value *Stride = isa<ConstantInt>(MulOp1) ? MulOp1 : MulOp0;
+
+              // DON'T trace outer loop index - we need its current value!
+              // The mul instruction itself is in the loop body, we need to
+              // recreate it in preheader using the outer loop's PHI value
+              // that's available at preheader entry
+
+              // Check if OuterIdx is defined in our innermost loop
+              if (auto *OuterInst = dyn_cast<Instruction>(OuterIdx)) {
+                if (L->contains(OuterInst->getParent())) {
+                  // It's inside our loop - trace through LCSSA PHIs only
+                  if (auto *Phi = dyn_cast<PHINode>(OuterIdx)) {
+                    // Single-entry LCSSA phi - get incoming value
+                    if (Phi->getNumIncomingValues() == 1) {
+                      OuterIdx = Phi->getIncomingValue(0);
+                    }
+                  }
+                }
+              }
+
+              return Builder.CreateMul(OuterIdx, Stride, "row.offset");
+            }
+          }
+          // If RowPart is already a value available at preheader, use it
+          return RowPart;
         }
       }
-    }
+      return V;
+    };
 
-    // Clone RowOffsetB to preheader if it's defined inside the loop
-    if (auto *InstB = dyn_cast<Instruction>(RowOffsetB)) {
-      if (L->contains(InstB->getParent())) {
-        Builder.SetInsertPoint(Preheader->getTerminator());
-        if (auto *MulB = dyn_cast<BinaryOperator>(InstB)) {
-          Value *NewRowB = Builder.CreateMul(MulB->getOperand(0), MulB->getOperand(1), "row.offset.B");
-          RowOffsetB = NewRowB;
-        }
-      }
-    }
+    RowOffsetA = traceRowOffset(IdxA);
+    RowOffsetB = traceRowOffset(IdxB);
+
+    errs() << "VNNI Pass: RowOffsetA = " << *RowOffsetA << "\n";
+    errs() << "VNNI Pass: RowOffsetB = " << *RowOffsetB << "\n";
 
     // Create new vectorized loop blocks
     BasicBlock *VecHeader = BasicBlock::Create(Ctx, "vnni.header", &F);
     BasicBlock *VecBody = BasicBlock::Create(Ctx, "vnni.body", &F);
     BasicBlock *VecExit = BasicBlock::Create(Ctx, "vnni.exit", &F);
 
+    // Check if both extensions are signed (need bias correction)
+    bool BothSigned = isa<SExtInst>(Candidate.ExtA) && isa<SExtInst>(Candidate.ExtB);
+
+    Value *ZeroVec = ConstantVector::getSplat(ElementCount::getFixed(16), ConstantInt::get(I32Ty, 0));
+    Value *VecEnd = ConstantInt::get(I64Ty, Candidate.TripCount);
+
     // VecHeader: PHIs and loop condition
     Builder.SetInsertPoint(VecHeader);
     PHINode *VecIdx = Builder.CreatePHI(I64Ty, 2, "vnni.idx");
     PHINode *VecAcc = Builder.CreatePHI(V16I32Ty, 2, "vnni.acc");
 
-    Value *ZeroVec = ConstantVector::getSplat(ElementCount::getFixed(16), ConstantInt::get(I32Ty, 0));
-    Value *VecEnd = ConstantInt::get(I64Ty, Candidate.TripCount);
+    // For signed×signed: accumulate sum(B) in the SAME loop (no extra memory reads!)
+    PHINode *BiasSumAcc = nullptr;
+    if (BothSigned) {
+      BiasSumAcc = Builder.CreatePHI(V16I32Ty, 2, "bias.acc");
+    }
+
     Value *VecCond = Builder.CreateICmpSLT(VecIdx, VecEnd, "vnni.cond");
     Builder.CreateCondBr(VecCond, VecBody, VecExit);
 
@@ -291,6 +451,20 @@ struct VNNIPass : public FunctionPass {
     Value *VecA = Builder.CreateAlignedLoad(V16I32Ty, VecPtrA, Align(1), "vecA");
     Value *VecB = Builder.CreateAlignedLoad(V16I32Ty, VecPtrB, Align(1), "vecB");
 
+    // For signed×signed: XOR A with 0x80808080 to convert to unsigned
+    // Also accumulate sum(B) using vpdpbusd with ones vector (reuses VecB we already loaded!)
+    Value *NewBiasSumAcc = nullptr;
+    if (BothSigned) {
+      Value *SignFlip = ConstantVector::getSplat(ElementCount::getFixed(16),
+          ConstantInt::get(I32Ty, 0x80808080));
+      VecA = Builder.CreateXor(VecA, SignFlip, "vecA.unsigned");
+
+      // Accumulate sum(B) - reuses VecB, no extra load!
+      Value *OnesVec = ConstantVector::getSplat(ElementCount::getFixed(16),
+          ConstantInt::get(I32Ty, 0x01010101));
+      NewBiasSumAcc = Builder.CreateCall(VPDPBUSDFn, {BiasSumAcc, OnesVec, VecB}, "bias.sum");
+    }
+
     Value *NewAcc = Builder.CreateCall(VPDPBUSDFn, {VecAcc, VecA, VecB}, "vpdpbusd");
 
     Value *NextIdx = Builder.CreateAdd(VecIdx, ConstantInt::get(I64Ty, 64), "next.idx");
@@ -301,6 +475,10 @@ struct VNNIPass : public FunctionPass {
     VecIdx->addIncoming(NextIdx, VecBody);
     VecAcc->addIncoming(ZeroVec, Preheader);
     VecAcc->addIncoming(NewAcc, VecBody);
+    if (BothSigned) {
+      BiasSumAcc->addIncoming(ZeroVec, Preheader);
+      BiasSumAcc->addIncoming(NewBiasSumAcc, VecBody);
+    }
 
     // VecExit: horizontal reduction
     Builder.SetInsertPoint(VecExit);
@@ -313,6 +491,21 @@ struct VNNIPass : public FunctionPass {
       Sum = Builder.CreateAdd(Sum, Shuffled);
     }
     Value *ScalarResult = Builder.CreateExtractElement(Sum, (uint64_t)0, "vnni.result");
+
+    // Apply bias correction: result = vpdpbusd_result - 128 * sum(B)
+    if (BothSigned) {
+      // Horizontal reduce the bias sum
+      Value *BiasSum = BiasSumAcc;
+      for (int Width = 8; Width >= 1; Width /= 2) {
+        SmallVector<int, 16> Mask;
+        for (int i = 0; i < 16; i++) Mask.push_back((i + Width) % 16);
+        Value *Shuffled = Builder.CreateShuffleVector(BiasSum, BiasSum, Mask);
+        BiasSum = Builder.CreateAdd(BiasSum, Shuffled);
+      }
+      Value *TotalBiasSum = Builder.CreateExtractElement(BiasSum, (uint64_t)0, "total.bias");
+      Value *Correction = Builder.CreateMul(TotalBiasSum, ConstantInt::get(I32Ty, 128), "correction");
+      ScalarResult = Builder.CreateSub(ScalarResult, Correction, "corrected.result");
+    }
 
     Builder.CreateBr(Exit);
 
