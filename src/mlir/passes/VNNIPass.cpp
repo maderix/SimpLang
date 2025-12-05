@@ -35,12 +35,12 @@ namespace {
 //===----------------------------------------------------------------------===//
 struct VNNICandidate {
   // Core loop components
-  PHINode *AccPhi;              // Accumulator PHI (i32)
+  PHINode *AccPhi;              // Accumulator PHI (i32) - may be null for load-store pattern
   PHINode *IndPhi;              // Induction variable PHI (i64)
   BinaryOperator *Add;          // acc = acc + product
   BinaryOperator *Mul;          // product = a * b
 
-  // Memory access pattern
+  // Memory access pattern for A and B
   Instruction *ExtA;            // sext/zext from i8
   Instruction *ExtB;            // sext/zext from i8
   LoadInst *LoadA;
@@ -48,10 +48,16 @@ struct VNNICandidate {
   GetElementPtrInst *GEPA;
   GetElementPtrInst *GEPB;
 
+  // Memory access pattern for C (load-store pattern, when AccPhi is null)
+  LoadInst *LoadC;              // Load from C for accumulation
+  StoreInst *StoreC;            // Store to C after accumulation
+  GetElementPtrInst *GEPC;      // GEP for C array
+
   // Loop properties
   int64_t TripCount;
   int64_t RowStrideA;           // Stride between A rows (for future I-tiling)
   bool BothSigned;              // true if both inputs are signed (need bias correction)
+  bool IsLoadStorePattern;      // true if using load-store instead of PHI
 };
 
 //===----------------------------------------------------------------------===//
@@ -250,6 +256,10 @@ private:
   bool findLoopPHIs(Loop *L, BasicBlock *Header, VNNICandidate &C) {
     C.AccPhi = nullptr;
     C.IndPhi = nullptr;
+    C.LoadC = nullptr;
+    C.StoreC = nullptr;
+    C.GEPC = nullptr;
+    C.IsLoadStorePattern = false;
 
     for (PHINode &Phi : Header->phis()) {
       if (Phi.getType()->isIntegerTy(32)) {
@@ -269,14 +279,66 @@ private:
         C.IndPhi = &Phi;
       }
     }
-    return C.AccPhi != nullptr;
+
+    // If we found PHI pattern, we're done
+    if (C.AccPhi != nullptr) {
+      return true;
+    }
+
+    // Otherwise, look for load-store pattern: load C, add, store C
+    // Pattern: store(add(load(C), mul(...)), C)
+    for (BasicBlock *BB : L->blocks()) {
+      for (Instruction &I : *BB) {
+        if (auto *SI = dyn_cast<StoreInst>(&I)) {
+          // Check if stored value is an add
+          if (auto *Add = dyn_cast<BinaryOperator>(SI->getValueOperand())) {
+            if (Add->getOpcode() == Instruction::Add) {
+              // Check if one operand is a load from same location
+              Value *Op0 = Add->getOperand(0);
+              Value *Op1 = Add->getOperand(1);
+              LoadInst *LI = dyn_cast<LoadInst>(Op0);
+              if (!LI) LI = dyn_cast<LoadInst>(Op1);
+
+              if (LI && LI->getType()->isIntegerTy(32)) {
+                // Verify load and store access same base (C array)
+                auto *LoadGEP = dyn_cast<GetElementPtrInst>(LI->getPointerOperand());
+                auto *StoreGEP = dyn_cast<GetElementPtrInst>(SI->getPointerOperand());
+
+                if (LoadGEP && StoreGEP) {
+                  // Found load-store pattern!
+                  C.Add = Add;
+                  C.LoadC = LI;
+                  C.StoreC = SI;
+                  C.GEPC = StoreGEP;
+                  C.IsLoadStorePattern = true;
+                  errs() << "VNNI: Found load-store pattern (no PHI accumulator)\n";
+                  return true;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return false;
   }
 
   bool findMulAccPattern(Loop *L, VNNICandidate &C) {
     Value *AddOp0 = C.Add->getOperand(0);
     Value *AddOp1 = C.Add->getOperand(1);
-    Value *MulOrExt = (AddOp0 == C.AccPhi) ? AddOp1 :
-                      (AddOp1 == C.AccPhi) ? AddOp0 : nullptr;
+
+    Value *MulOrExt = nullptr;
+    if (C.IsLoadStorePattern) {
+      // For load-store pattern: add(load(C), mul(...))
+      // The mul is the operand that isn't the load
+      MulOrExt = (AddOp0 == C.LoadC) ? AddOp1 :
+                 (AddOp1 == C.LoadC) ? AddOp0 : nullptr;
+    } else {
+      // For PHI pattern: add(phi, mul(...))
+      MulOrExt = (AddOp0 == C.AccPhi) ? AddOp1 :
+                 (AddOp1 == C.AccPhi) ? AddOp0 : nullptr;
+    }
     if (!MulOrExt) return false;
 
     // Pattern: sext(i16 mul) -> i32, where mul is from i8 operands
@@ -337,11 +399,12 @@ private:
 
     C.TripCount = TripConst->getSExtValue();
 
-    // Must be multiple of 64 for VNNI (64 bytes = 16 x i32 vector)
-    if (C.TripCount % 64 != 0) {
-      errs() << "VNNI: Trip count " << C.TripCount << " not multiple of 64\n";
+    // Must be multiple of 4 for VNNI (vpdpbusd processes 4 bytes at a time)
+    if (C.TripCount % 4 != 0) {
+      errs() << "VNNI: Trip count " << C.TripCount << " not multiple of 4\n";
       return false;
     }
+
     return true;
   }
 
@@ -396,11 +459,49 @@ private:
       return V;
     };
 
+    // Trace insertvalue chain to find the base pointer
+    // For malloc: insertvalue chain ends with bitcast of malloc result
+    auto traceInsertValue = [&](Value *V, ArrayRef<unsigned> Indices) -> Value* {
+      SmallPtrSet<Value*, 16> Visited;
+      while (V && !Visited.count(V)) {
+        Visited.insert(V);
+
+        if (auto *IV = dyn_cast<InsertValueInst>(V)) {
+          // Check if this insertvalue sets the index we want
+          if (IV->getIndices() == Indices) {
+            return IV->getInsertedValueOperand();
+          }
+          // Otherwise trace the aggregate operand
+          V = IV->getAggregateOperand();
+        } else if (isa<UndefValue>(V)) {
+          return nullptr;
+        } else {
+          break;
+        }
+      }
+      return nullptr;
+    };
+
     // Handle MLIR memref descriptors (extractvalue from struct)
     if (auto *EV = dyn_cast<ExtractValueInst>(V)) {
-      Value *Agg = tracePhis(EV->getAggregateOperand());
-      if (Agg != EV->getAggregateOperand()) {
-        return Builder.CreateExtractValue(Agg, EV->getIndices(), "base.ptr");
+      Value *Agg = EV->getAggregateOperand();
+
+      // First, trace through PHIs to find loop-invariant aggregate
+      Value *TracedAgg = tracePhis(Agg);
+
+      // If the aggregate is from an insertvalue chain (malloc case),
+      // trace it to find the actual base pointer
+      if (auto *IV = dyn_cast<InsertValueInst>(TracedAgg)) {
+        Value *BasePtr = traceInsertValue(IV, EV->getIndices());
+        if (BasePtr) {
+          errs() << "VNNI: Traced insertvalue chain to base: " << *BasePtr << "\n";
+          return BasePtr;
+        }
+      }
+
+      // Original path: create extractvalue from traced aggregate
+      if (TracedAgg != Agg) {
+        return Builder.CreateExtractValue(TracedAgg, EV->getIndices(), "base.ptr");
       }
     }
 
@@ -471,6 +572,12 @@ private:
     auto *V16I32Ty = FixedVectorType::get(I32Ty, 16);
     Type *V16I32PtrTy = PointerType::get(V16I32Ty, 0);
 
+    // For small K (< 64), we need to handle partial vectors
+    // Calculate how many bytes to load per iteration
+    int64_t BytesPerIter = std::min((int64_t)64, C.TripCount);
+    // Number of valid i32 elements (each holds 4 bytes for vpdpbusd)
+    int NumValidElements = BytesPerIter / 4;
+
     IRBuilder<> Builder(Ctx);
     Builder.SetInsertPoint(Preheader->getTerminator());
 
@@ -517,21 +624,66 @@ private:
     // === VNNI Body: load B once, load 4 A rows, compute 4 dot products ===
     Builder.SetInsertPoint(VecBody);
 
+    // For K < 64, we pad to 64 by loading available data + zeros
+    // This works because 0 * x = 0 in dot product
+    // We always load 64 bytes but use masked load for safety when K < 64
+
+    // Helper: create padded load - loads K bytes and pads rest with zeros
+    auto loadPadded = [&](Value *BasePtr, Value *Offset) -> Value* {
+      Value *Ptr = Builder.CreateGEP(I8Ty, BasePtr, Offset);
+
+      if (C.TripCount >= 64) {
+        // Full 64-byte load, no padding needed
+        return Builder.CreateAlignedLoad(V16I32Ty,
+                 Builder.CreateBitCast(Ptr, V16I32PtrTy), Align(1));
+      }
+
+      // K < 64: Load K bytes into smaller vector, then extend with zeros
+      // NumValidElements = K / 4 (number of i32 elements)
+      auto *SmallVecTy = FixedVectorType::get(I32Ty, NumValidElements);
+      Type *SmallVecPtrTy = PointerType::get(SmallVecTy, 0);
+      Value *SmallVec = Builder.CreateAlignedLoad(SmallVecTy,
+                          Builder.CreateBitCast(Ptr, SmallVecPtrTy), Align(1));
+
+      // Extend to 16 elements: [v0, v1, ..., vN, 0, 0, ..., 0]
+      // First pad SmallVec to 16 elements with undef, then shuffle with zeros
+      Value *SmallZero = ConstantVector::getSplat(
+                           ElementCount::getFixed(NumValidElements),
+                           ConstantInt::get(I32Ty, 0));
+
+      // Shuffle: indices 0..NumValidElements-1 from SmallVec, rest from SmallZero (as 0)
+      // Since both operands are same size, we can shuffle properly
+      SmallVector<int, 16> PadMask;
+      for (int i = 0; i < NumValidElements * 2; i++) {
+        PadMask.push_back(i < NumValidElements ? i : NumValidElements); // second half = zeros
+      }
+      Value *PaddedSmall = Builder.CreateShuffleVector(SmallVec, SmallZero, PadMask);
+
+      // Now extend PaddedSmall (2*NumValidElements) to 16 elements
+      // If NumValidElements=8 (K=32), PaddedSmall is 16 elements, we're done
+      if (NumValidElements * 2 == 16) {
+        return PaddedSmall;
+      }
+
+      // Otherwise need another shuffle to get to 16
+      Value *FullZero = ConstantVector::getSplat(
+                          ElementCount::getFixed(NumValidElements * 2),
+                          ConstantInt::get(I32Ty, 0));
+      SmallVector<int, 16> ExtendMask;
+      for (int i = 0; i < 16; i++) {
+        ExtendMask.push_back(i < NumValidElements * 2 ? i : NumValidElements * 2);
+      }
+      return Builder.CreateShuffleVector(PaddedSmall, FullZero, ExtendMask);
+    };
+
     // Load B vector ONCE (shared across all 4 A rows)
-    Value *PtrB = Builder.CreateGEP(I8Ty, BaseB, Builder.CreateAdd(RowOffB, VecIdx));
-    Value *VecB = Builder.CreateAlignedLoad(V16I32Ty,
-                    Builder.CreateBitCast(PtrB, V16I32PtrTy), Align(1));
+    Value *VecB = loadPadded(BaseB, Builder.CreateAdd(RowOffB, VecIdx));
 
     // Load 4 A rows
-    Value *PtrA0 = Builder.CreateGEP(I8Ty, BaseA, Builder.CreateAdd(RowOffA0, VecIdx));
-    Value *PtrA1 = Builder.CreateGEP(I8Ty, BaseA, Builder.CreateAdd(RowOffA1, VecIdx));
-    Value *PtrA2 = Builder.CreateGEP(I8Ty, BaseA, Builder.CreateAdd(RowOffA2, VecIdx));
-    Value *PtrA3 = Builder.CreateGEP(I8Ty, BaseA, Builder.CreateAdd(RowOffA3, VecIdx));
-
-    Value *VecA0 = Builder.CreateAlignedLoad(V16I32Ty, Builder.CreateBitCast(PtrA0, V16I32PtrTy), Align(1));
-    Value *VecA1 = Builder.CreateAlignedLoad(V16I32Ty, Builder.CreateBitCast(PtrA1, V16I32PtrTy), Align(1));
-    Value *VecA2 = Builder.CreateAlignedLoad(V16I32Ty, Builder.CreateBitCast(PtrA2, V16I32PtrTy), Align(1));
-    Value *VecA3 = Builder.CreateAlignedLoad(V16I32Ty, Builder.CreateBitCast(PtrA3, V16I32PtrTy), Align(1));
+    Value *VecA0 = loadPadded(BaseA, Builder.CreateAdd(RowOffA0, VecIdx));
+    Value *VecA1 = loadPadded(BaseA, Builder.CreateAdd(RowOffA1, VecIdx));
+    Value *VecA2 = loadPadded(BaseA, Builder.CreateAdd(RowOffA2, VecIdx));
+    Value *VecA3 = loadPadded(BaseA, Builder.CreateAdd(RowOffA3, VecIdx));
 
     // Signed conversion and bias accumulation
     Value *NewBiasAcc = nullptr;
@@ -554,7 +706,9 @@ private:
     Value *NewAcc2 = Builder.CreateCall(VPDPBUSD, {VecAcc2, VecA2, VecB});
     Value *NewAcc3 = Builder.CreateCall(VPDPBUSD, {VecAcc3, VecA3, VecB});
 
-    Value *NextIdx = Builder.CreateAdd(VecIdx, ConstantInt::get(I64Ty, 64));
+    // Step by 64 bytes or TripCount if smaller (for K < 64 cases)
+    int64_t StepSize = std::min((int64_t)64, C.TripCount);
+    Value *NextIdx = Builder.CreateAdd(VecIdx, ConstantInt::get(I64Ty, StepSize));
     Builder.CreateBr(VecHeader);
 
     // Complete PHIs

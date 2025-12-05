@@ -85,11 +85,11 @@ int32_t eigen_matmul_int8() {
     return C.sum();
 }
 
-// VNNI-optimized reference implementation
-// Uses vpmaddwd (i16×i16→i32) for signed int8 multiplication
+// AVX512-VNNI optimized reference using vpdpbusd with I=4 tiling
+// vpdpbusd: unsigned×signed (u8×i8→i32), so we XOR A with 0x80 and correct bias
 template<int N>
 int32_t vnni_matmul_int8() {
-    // Allocate aligned memory on heap for large sizes
+    // Allocate aligned memory
     int8_t* A = (int8_t*)aligned_alloc(64, N * N * sizeof(int8_t));
     int8_t* B = (int8_t*)aligned_alloc(64, N * N * sizeof(int8_t));
     int8_t* B_T = (int8_t*)aligned_alloc(64, N * N * sizeof(int8_t));
@@ -112,39 +112,63 @@ int32_t vnni_matmul_int8() {
         }
     }
 
-    // Matmul using vpmaddwd for signed i8×i8
-    for (int i = 0; i < N; i++) {
-        for (int j = 0; j < N; j++) {
-            __m512i acc = _mm512_setzero_si512();
+    const __m512i sign_flip = _mm512_set1_epi8((char)0x80);
+    const __m512i ones = _mm512_set1_epi8(1);
 
-            // Process K dimension in chunks of 64
+    // I=4 tiled matmul using vpdpbusd
+    for (int i = 0; i < N; i += 4) {
+        for (int j = 0; j < N; j++) {
+            __m512i acc0 = _mm512_setzero_si512();
+            __m512i acc1 = _mm512_setzero_si512();
+            __m512i acc2 = _mm512_setzero_si512();
+            __m512i acc3 = _mm512_setzero_si512();
+            __m512i bias_acc = _mm512_setzero_si512();
+
+            // Process K in chunks of 64 bytes
             int k = 0;
-            for (; k + 63 < N; k += 64) {
-                __m512i va = _mm512_loadu_si512(&A[i * N + k]);
+            for (; k + 64 <= N; k += 64) {
+                // Load B once (shared across 4 A rows)
                 __m512i vb = _mm512_loadu_si512(&B_T[j * N + k]);
 
-                // Sign-extend i8 to i16 for vpmaddwd
-                __m512i va_lo = _mm512_cvtepi8_epi16(_mm512_extracti64x4_epi64(va, 0));
-                __m512i va_hi = _mm512_cvtepi8_epi16(_mm512_extracti64x4_epi64(va, 1));
-                __m512i vb_lo = _mm512_cvtepi8_epi16(_mm512_extracti64x4_epi64(vb, 0));
-                __m512i vb_hi = _mm512_cvtepi8_epi16(_mm512_extracti64x4_epi64(vb, 1));
+                // Load 4 A rows and XOR with 0x80 (signed→unsigned conversion)
+                __m512i va0 = _mm512_xor_si512(_mm512_loadu_si512(&A[(i+0) * N + k]), sign_flip);
+                __m512i va1 = _mm512_xor_si512(_mm512_loadu_si512(&A[(i+1) * N + k]), sign_flip);
+                __m512i va2 = _mm512_xor_si512(_mm512_loadu_si512(&A[(i+2) * N + k]), sign_flip);
+                __m512i va3 = _mm512_xor_si512(_mm512_loadu_si512(&A[(i+3) * N + k]), sign_flip);
 
-                // vpmaddwd: multiply i16 pairs and add adjacent
-                __m512i prod_lo = _mm512_madd_epi16(va_lo, vb_lo);
-                __m512i prod_hi = _mm512_madd_epi16(va_hi, vb_hi);
+                // vpdpbusd: acc += u8(A) * i8(B) for each of 4 rows
+                acc0 = _mm512_dpbusd_epi32(acc0, va0, vb);
+                acc1 = _mm512_dpbusd_epi32(acc1, va1, vb);
+                acc2 = _mm512_dpbusd_epi32(acc2, va2, vb);
+                acc3 = _mm512_dpbusd_epi32(acc3, va3, vb);
 
-                acc = _mm512_add_epi32(acc, prod_lo);
-                acc = _mm512_add_epi32(acc, prod_hi);
+                // Accumulate bias: sum of B values (for signed correction)
+                bias_acc = _mm512_dpbusd_epi32(bias_acc, ones, vb);
             }
 
-            int32_t sum = _mm512_reduce_add_epi32(acc);
-
-            // Handle remaining elements
+            // Scalar fallback for remaining elements
+            int32_t scalar_sum0 = 0, scalar_sum1 = 0, scalar_sum2 = 0, scalar_sum3 = 0;
             for (; k < N; k++) {
-                sum += (int32_t)A[i * N + k] * (int32_t)B_T[j * N + k];
+                int8_t b_val = B_T[j * N + k];
+                scalar_sum0 += (int32_t)A[(i+0) * N + k] * (int32_t)b_val;
+                scalar_sum1 += (int32_t)A[(i+1) * N + k] * (int32_t)b_val;
+                scalar_sum2 += (int32_t)A[(i+2) * N + k] * (int32_t)b_val;
+                scalar_sum3 += (int32_t)A[(i+3) * N + k] * (int32_t)b_val;
             }
 
-            C[i * N + j] = sum;
+            // Horizontal reduction
+            int32_t sum0 = _mm512_reduce_add_epi32(acc0) + scalar_sum0;
+            int32_t sum1 = _mm512_reduce_add_epi32(acc1) + scalar_sum1;
+            int32_t sum2 = _mm512_reduce_add_epi32(acc2) + scalar_sum2;
+            int32_t sum3 = _mm512_reduce_add_epi32(acc3) + scalar_sum3;
+            int32_t bias = _mm512_reduce_add_epi32(bias_acc);
+
+            // Bias correction: subtract 128 * sum(B) for signed×signed (only for VNNI part)
+            int32_t correction = bias * 128;
+            C[(i+0) * N + j] = sum0 - correction;
+            C[(i+1) * N + j] = sum1 - correction;
+            C[(i+2) * N + j] = sum2 - correction;
+            C[(i+3) * N + j] = sum3 - correction;
         }
     }
 

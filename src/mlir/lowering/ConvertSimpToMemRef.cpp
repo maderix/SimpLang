@@ -3160,8 +3160,9 @@ struct TensorMatMulOpLowering : public OpConversionPattern<simp::TensorMatMulOp>
         Value K_val = rewriter.create<arith::ConstantIndexOp>(loc, K_lhs);
 
         // Size threshold: use transpose for matrices that benefit from vpmaddwd
-        // Testing shows transpose is faster up to at least 768x768
-        const int64_t TRANSPOSE_THRESHOLD = 1024;
+        // Transpose + K-innermost loop enables VNNI pattern detection
+        // Testing shows this path is needed for VNNI optimization
+        const int64_t TRANSPOSE_THRESHOLD = 16384;
 
         if (N <= TRANSPOSE_THRESHOLD && K_lhs <= TRANSPOSE_THRESHOLD) {
           // VNNI-optimized path: Transpose B, use vpmaddwd pattern
