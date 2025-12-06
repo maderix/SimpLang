@@ -20,6 +20,9 @@
 #include <llvm/Analysis/TargetTransformInfo.h>
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/MC/TargetRegistry.h>
+#include <llvm/Passes/PassBuilder.h>
+#include <llvm/Analysis/LoopAnalysisManager.h>
+#include <llvm/Analysis/CGSCCPassManager.h>
 
 #ifdef USE_MLIR
 #include "mlir/mlir_codegen.hpp"
@@ -27,6 +30,7 @@
 #include "mlir/Passes.h"
 #include "mlir/ExecutionEngine/OptUtils.h"
 #include "mlir/PromoteLargeAllocaToHeap.h"
+#include "mlir/passes/VNNIPass.h"
 #include "ast/transforms/normalize_returns.hpp"
 #endif
 
@@ -43,6 +47,8 @@ int main(int argc, char** argv) {
     bool enableHierarchicalTiling = false;  // Multi-level cache-aware tiling (experimental)
     bool enableOpenMP = false;  // OpenMP parallelization (disabled by default)
     bool enableO3 = true;  // LLVM O3 optimization (enabled by default)
+    bool enablePrefetch = true;  // Prefetch insertion for memory latency hiding (enabled by default)
+    bool llvmVectorize = false;  // Skip MLIR vectorization, let LLVM handle it (better for INT8/INT4)
     bool dumpMLIRPasses = false;  // Dump MLIR at each pipeline stage
     std::string outputPath;
     std::string logLevel = "INFO";  // Default log level
@@ -80,6 +86,8 @@ int main(int argc, char** argv) {
         std::cout << "  --tile-size N      Set tile size for matmul (default: 16)" << std::endl;
         std::cout << "  --hierarchical-tiling  Multi-level cache-aware tiling (L1/L2/L3)" << std::endl;
         std::cout << "  --enable-openmp    Enable OpenMP parallelization (multi-threading)" << std::endl;
+        std::cout << "  --no-prefetch      Disable prefetch insertion (memory latency hiding)" << std::endl;
+        std::cout << "  --llvm-vectorize   Use LLVM vectorization instead of MLIR (better for INT8/INT4)" << std::endl;
         std::cout << "  --no-opt           Disable LLVM O3 optimization (faster compilation)" << std::endl;
         std::cout << std::endl;
 #endif
@@ -162,6 +170,12 @@ int main(int argc, char** argv) {
         }
         else if (strcmp(argv[i], "--enable-openmp") == 0) {
             enableOpenMP = true;
+        }
+        else if (strcmp(argv[i], "--no-prefetch") == 0) {
+            enablePrefetch = false;
+        }
+        else if (strcmp(argv[i], "--llvm-vectorize") == 0) {
+            llvmVectorize = true;
         }
         else if (strcmp(argv[i], "--no-opt") == 0) {
             enableO3 = false;
@@ -275,6 +289,11 @@ int main(int argc, char** argv) {
         pipeline.setTileSize(tileSize);
         pipeline.setEnableHierarchicalTiling(enableHierarchicalTiling);
         pipeline.setEnableOpenMP(enableOpenMP);
+        pipeline.setEnablePrefetch(enablePrefetch);
+        pipeline.setSkipMLIRVectorization(llvmVectorize);
+        if (llvmVectorize) {
+            LOG_INFO("Using LLVM vectorization (MLIR vectorization disabled)");
+        }
         if (enableTiling) {
             if (enableHierarchicalTiling) {
                 LOG_INFO("Hierarchical tiling enabled (L3: 128x128x128, L2: 32x32x32, L1: 8x8x8)");
@@ -415,18 +434,63 @@ int main(int argc, char** argv) {
 
         llvmModule->setDataLayout(targetMachine->createDataLayout());
 
+        // Run VNNI optimization pass BEFORE O3 to identify and transform i8 dot product loops
+        LOG_INFO("Running VNNI optimization pass...");
+        {
+            llvm::legacy::PassManager vnniPM;
+            // First simplify loops to create proper preheaders
+            vnniPM.add(llvm::createLoopSimplifyPass());
+            vnniPM.add(llvm::createLCSSAPass());
+            // Now run VNNI pass
+            vnniPM.add(llvm::createVNNIPass());
+            vnniPM.run(*llvmModule);
+        }
+
+        // Dump IR after VNNI pass for debugging
+        {
+            std::error_code EC;
+            llvm::raw_fd_ostream vnniIR("/tmp/after_vnni.ll", EC, llvm::sys::fs::OF_None);
+            llvmModule->print(vnniIR, nullptr);
+        }
+
         // RUN LLVM OPTIMIZATION PASSES (Critical for performance!)
-        // Use MLIR's optimization transformer (same as Toy tutorial Ch6)
+        // Use custom pass pipeline to respect loop unroll metadata from VNNI pass
         if (enableO3) {
             LOG_INFO("Running LLVM optimization passes (O3)...");
-            auto optPipeline = mlir::makeOptimizingTransformer(
-                /*optLevel=*/3,        // O3 optimization (enables loop vectorization!)
-                /*sizeLevel=*/0,       // Optimize for speed, not size
-                /*targetMachine=*/targetMachine);
 
-            if (auto err = optPipeline(llvmModule.get())) {
-                llvm::errs() << "Failed to optimize LLVM IR: " << err << "\n";
-                return 1;
+            // Use new pass manager for better control
+            llvm::LoopAnalysisManager LAM;
+            llvm::FunctionAnalysisManager FAM;
+            llvm::CGSCCAnalysisManager CGAM;
+            llvm::ModuleAnalysisManager MAM;
+
+            llvm::PassBuilder PB(targetMachine);
+
+            // Configure PassBuilder to skip loop unrolling (preserves VNNI loops)
+            llvm::PipelineTuningOptions PTO;
+            PTO.LoopUnrolling = false;  // CRITICAL: Disable loop unrolling to preserve VNNI structure
+            PTO.LoopVectorization = true;  // Keep SIMD vectorization
+
+            llvm::PassBuilder PB2(targetMachine, PTO);
+
+            // Register analysis passes
+            PB2.registerModuleAnalyses(MAM);
+            PB2.registerCGSCCAnalyses(CGAM);
+            PB2.registerFunctionAnalyses(FAM);
+            PB2.registerLoopAnalyses(LAM);
+            PB2.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+            // Build O3 pipeline - now with unrolling disabled
+            llvm::ModulePassManager MPM = PB2.buildPerModuleDefaultPipeline(
+                llvm::OptimizationLevel::O3);
+
+            MPM.run(*llvmModule, MAM);
+
+            // Dump IR after O3 for debugging
+            {
+                std::error_code EC;
+                llvm::raw_fd_ostream afterO3("/tmp/after_o3.ll", EC, llvm::sys::fs::OF_None);
+                llvmModule->print(afterO3, nullptr);
             }
         } else {
             LOG_INFO("Skipping LLVM O3 optimization (--no-opt)");

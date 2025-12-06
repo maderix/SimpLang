@@ -15,6 +15,7 @@ set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/cmake")
 option(SIMD_DEBUG "Enable SIMD debugging" OFF)
 option(ENABLE_DEBUGGER "Enable kernel debugger" ON)
 option(USE_MLIR "Enable MLIR integration" OFF)
+option(USE_TCMALLOC "Use tcmalloc as default allocator" ON)
 
 # LLVM setup
 # LLVM_DIR should be set via -DLLVM_DIR=... when running cmake
@@ -37,6 +38,23 @@ endif()
 
 if(NOT READLINE_FOUND)
     message(FATAL_ERROR "readline library not found. Install libreadline-dev or equivalent.")
+endif()
+
+# tcmalloc setup (for better memory allocation performance)
+if(USE_TCMALLOC AND NOT CMAKE_CROSSCOMPILING)
+    find_library(TCMALLOC_LIBRARY NAMES tcmalloc_minimal tcmalloc)
+    if(TCMALLOC_LIBRARY)
+        set(TCMALLOC_FOUND TRUE)
+        message(STATUS "Found tcmalloc: ${TCMALLOC_LIBRARY}")
+    else()
+        set(TCMALLOC_FOUND FALSE)
+        message(WARNING "tcmalloc not found, using system malloc. Install with: apt install libtcmalloc-minimal4 libgoogle-perftools-dev")
+    endif()
+else()
+    set(TCMALLOC_FOUND FALSE)
+    if(CMAKE_CROSSCOMPILING)
+        message(STATUS "tcmalloc disabled for cross-compilation")
+    endif()
 endif()
 
 message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
@@ -122,6 +140,11 @@ add_dependencies(build_all
 add_executable(simplang_runner
     runtime/src/host.cpp
 )
+
+# Link tcmalloc first to override malloc
+if(TCMALLOC_FOUND)
+    target_link_libraries(simplang_runner PRIVATE ${TCMALLOC_LIBRARY})
+endif()
 
 # Link against required libraries
 target_link_libraries(simplang_runner

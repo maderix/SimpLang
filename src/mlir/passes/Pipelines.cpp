@@ -114,6 +114,10 @@ void buildBufferManagementPipeline(OpPassManager &pm) {
 /// Build the LLVM dialect lowering pipeline
 /// Lowers MemRef, Arith, SCF, Vector to LLVM dialect
 void buildLLVMLoweringPipeline(OpPassManager &pm, bool enableOpenMP) {
+  // Emulate sub-byte types (i4, i2) by packing into i8
+  // Must run before LLVM conversion since LLVM doesn't support sub-byte memrefs
+  pm.addPass(createEmulateNarrowTypePass());
+
   // Vector lowering
   pm.addNestedPass<FuncOp>(createConvertVectorToSCFPass());
 

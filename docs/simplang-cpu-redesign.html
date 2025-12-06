@@ -1,0 +1,746 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SimpLang CPU Redesign - Maximum Performance Architecture</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #333;
+        }
+        .container {
+            max-width: 1800px;
+            margin: 0 auto;
+            background: white;
+            padding: 30px;
+            border-radius: 15px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+        }
+        h1 {
+            text-align: center;
+            color: #2c3e50;
+            margin-bottom: 10px;
+            font-size: 2.5em;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.1);
+            background: linear-gradient(135deg, #e74c3c 0%, #e67e22 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .subtitle {
+            text-align: center;
+            color: #7f8c8d;
+            margin-bottom: 30px;
+            font-size: 1.2em;
+            font-weight: 600;
+        }
+        .section {
+            margin: 40px 0;
+            border-left: 5px solid #e74c3c;
+            padding-left: 20px;
+        }
+        .section h2 {
+            color: #c0392b;
+            margin-bottom: 15px;
+            font-size: 1.8em;
+        }
+        .mermaid {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 10px;
+            margin: 20px 0;
+            border: 2px solid #e0e0e0;
+        }
+        .optimization-card {
+            background: linear-gradient(135deg, #ff6b6b22 0%, #ee5a2422 100%);
+            border-left: 4px solid #e74c3c;
+            padding: 20px;
+            margin: 15px 0;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        .optimization-card h3 {
+            color: #e74c3c;
+            margin-top: 0;
+            font-size: 1.3em;
+        }
+        .tier-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 20px;
+            margin: 20px 0;
+        }
+        .tier-card {
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            transition: transform 0.3s, box-shadow 0.3s;
+        }
+        .tier-1 {
+            border: 3px solid #e74c3c;
+            background: linear-gradient(135deg, #ff6b6b11 0%, #ee5a2411 100%);
+        }
+        .tier-2 {
+            border: 3px solid #f39c12;
+            background: linear-gradient(135deg, #f39c1211 0%, #f1c40f11 100%);
+        }
+        .tier-3 {
+            border: 3px solid #3498db;
+            background: linear-gradient(135deg, #3498db11 0%, #2980b911 100%);
+        }
+        .tier-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 8px 20px rgba(0,0,0,0.25);
+        }
+        .tier-card h4 {
+            margin-top: 0;
+            font-size: 1.2em;
+            padding-bottom: 10px;
+        }
+        .tier-1 h4 {
+            color: #e74c3c;
+            border-bottom: 2px solid #e74c3c;
+        }
+        .tier-2 h4 {
+            color: #f39c12;
+            border-bottom: 2px solid #f39c12;
+        }
+        .tier-3 h4 {
+            color: #3498db;
+            border-bottom: 2px solid #3498db;
+        }
+        .performance-box {
+            background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+            color: white;
+            padding: 25px;
+            border-radius: 12px;
+            margin: 30px 0;
+            box-shadow: 0 6px 20px rgba(0,0,0,0.2);
+        }
+        .performance-box h3 {
+            margin-top: 0;
+            font-size: 1.5em;
+        }
+        .benchmark-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 15px;
+            margin-top: 20px;
+        }
+        .benchmark-item {
+            background: rgba(255, 255, 255, 0.2);
+            padding: 15px;
+            border-radius: 8px;
+            border-left: 3px solid white;
+        }
+        .benchmark-item h4 {
+            margin: 0 0 10px 0;
+            font-size: 1.1em;
+        }
+        .metric {
+            display: flex;
+            justify-content: space-between;
+            padding: 5px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.3);
+        }
+        .architecture-comparison {
+            background: #2c3e50;
+            color: #ecf0f1;
+            padding: 25px;
+            border-radius: 12px;
+            margin: 30px 0;
+        }
+        .comparison-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 30px;
+            margin-top: 20px;
+        }
+        .comparison-item {
+            background: rgba(255, 255, 255, 0.1);
+            padding: 20px;
+            border-radius: 8px;
+        }
+        .comparison-item h4 {
+            color: #3498db;
+            margin-top: 0;
+        }
+        .implementation-timeline {
+            background: #f8f9fa;
+            padding: 25px;
+            border-radius: 12px;
+            margin: 30px 0;
+            border: 2px solid #95a5a6;
+        }
+        .timeline-week {
+            display: flex;
+            margin: 15px 0;
+            align-items: center;
+        }
+        .week-label {
+            background: #e74c3c;
+            color: white;
+            padding: 5px 15px;
+            border-radius: 20px;
+            margin-right: 20px;
+            min-width: 100px;
+            text-align: center;
+            font-weight: bold;
+        }
+        .week-tasks {
+            flex-grow: 1;
+            background: white;
+            padding: 15px;
+            border-left: 3px solid #e74c3c;
+            border-radius: 5px;
+        }
+        .highlight-red {
+            background: #ff6b6b;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 3px;
+            font-weight: bold;
+        }
+        .highlight-green {
+            background: #2ecc71;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 3px;
+            font-weight: bold;
+        }
+        .highlight-blue {
+            background: #3498db;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 3px;
+            font-weight: bold;
+        }
+        .code-block {
+            background: #2c3e50;
+            color: #ecf0f1;
+            padding: 15px;
+            border-radius: 8px;
+            font-family: 'Courier New', monospace;
+            overflow-x: auto;
+            margin: 15px 0;
+            border-left: 5px solid #e74c3c;
+        }
+        .memory-hierarchy {
+            background: linear-gradient(135deg, #8e44ad 0%, #3498db 100%);
+            color: white;
+            padding: 25px;
+            border-radius: 12px;
+            margin: 30px 0;
+        }
+        .hierarchy-level {
+            background: rgba(255, 255, 255, 0.1);
+            padding: 15px;
+            margin: 10px 0;
+            border-left: 4px solid white;
+            border-radius: 5px;
+        }
+        .killer-features {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin: 30px 0;
+        }
+        .feature-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 25px;
+            border-radius: 12px;
+            box-shadow: 0 6px 20px rgba(0,0,0,0.2);
+            transition: transform 0.3s;
+        }
+        .feature-card:hover {
+            transform: scale(1.05);
+        }
+        .feature-card h3 {
+            margin-top: 0;
+            font-size: 1.3em;
+            border-bottom: 2px solid rgba(255, 255, 255, 0.5);
+            padding-bottom: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🚀 SimpLang CPU Redesign Architecture</h1>
+        <div class="subtitle">Maximum Performance Through CPU-Native Optimization</div>
+
+        <!-- HIGH-LEVEL ARCHITECTURE -->
+        <div class="section">
+            <h2>🏗️ CPU-Optimized Pipeline Architecture</h2>
+            <div class="mermaid">
+graph LR
+    A[ONNX Model] -->|Import| B[Graph Analyzer]
+    B -->|Cache Analysis| C[CPU Cost Model]
+    C -->|Layout Decision| D[SimpLang CPU IR]
+    D -->|10 CPU Passes| E[Optimization Engine]
+    E -->|Kernel Selection| F[Platform Dispatcher]
+    F -->|Intel| G1[AVX-512/AMX]
+    F -->|AMD| G2[AVX2/Zen4]
+    F -->|ARM| G3[NEON/SVE]
+    G1 --> H[Parallel Executor]
+    G2 --> H
+    G3 --> H
+    H -->|NUMA-Aware| I[Thread Pool]
+    I -->|Work Stealing| J[CPU Cores]
+    
+    style A fill:#e74c3c,color:#fff
+    style D fill:#f39c12,color:#fff
+    style E fill:#2ecc71,color:#fff
+    style H fill:#3498db,color:#fff
+    style J fill:#9b59b6,color:#fff
+            </div>
+        </div>
+
+        <!-- CPU vs NPU MAPPING -->
+        <div class="architecture-comparison">
+            <h3>🔄 Architecture Translation: NPU → CPU</h3>
+            <div class="comparison-grid">
+                <div class="comparison-item">
+                    <h4>NPU Concepts</h4>
+                    <ul>
+                        <li>SRAM (64KB-1MB)</li>
+                        <li>DMA Engine</li>
+                        <li>MAC Array</li>
+                        <li>Compute Streams</li>
+                        <li>Async Barriers</li>
+                        <li>Fixed Tiles</li>
+                    </ul>
+                </div>
+                <div class="comparison-item">
+                    <h4>CPU Mapping</h4>
+                    <ul>
+                        <li>L1/L2/L3 Cache (32KB/256KB/32MB)</li>
+                        <li>Prefetch Instructions</li>
+                        <li>SIMD Units (AVX-512)</li>
+                        <li>CPU Cores + Threads</li>
+                        <li>Memory Barriers</li>
+                        <li>Dynamic Tiling</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+
+        <!-- MEMORY HIERARCHY -->
+        <div class="memory-hierarchy">
+            <h3>📊 Memory Hierarchy Optimization</h3>
+            <div class="hierarchy-level">
+                <strong>L1 Cache (32KB)</strong> - 4 cycles latency
+                <br>→ Micro-kernel register blocking (6x16 for AVX-512)
+            </div>
+            <div class="hierarchy-level">
+                <strong>L2 Cache (256KB-1MB)</strong> - 14 cycles latency
+                <br>→ Tile size: 256-1024 elements, prefetch distance: 2-4 iterations
+            </div>
+            <div class="hierarchy-level">
+                <strong>L3 Cache (8-64MB)</strong> - 50 cycles latency
+                <br>→ Working set management, inter-core sharing
+            </div>
+            <div class="hierarchy-level">
+                <strong>DRAM (32-512GB)</strong> - 200+ cycles latency
+                <br>→ Streaming stores, huge pages, NUMA awareness
+            </div>
+        </div>
+
+        <!-- OPTIMIZATION TIERS -->
+        <div class="section">
+            <h2>💎 Three-Tier Optimization Strategy</h2>
+            <div class="tier-grid">
+                <div class="tier-card tier-1">
+                    <h4>🔥 Tier 1: Maximum Impact (2-5x)</h4>
+                    <ul>
+                        <li><strong>Cache Tiling:</strong> 10x memory traffic reduction</li>
+                        <li><strong>SIMD Kernels:</strong> 8-16x compute throughput</li>
+                        <li><strong>Operator Fusion:</strong> Eliminate memory round-trips</li>
+                        <li><strong>Smart Prefetching:</strong> Hide 200+ cycle latency</li>
+                    </ul>
+                    <div style="margin-top: 15px; padding: 10px; background: rgba(231, 76, 60, 0.1); border-radius: 5px;">
+                        <strong>Implementation:</strong> Week 1-2<br>
+                        <strong>ROI:</strong> 80% of total speedup
+                    </div>
+                </div>
+                
+                <div class="tier-card tier-2">
+                    <h4>⚡ Tier 2: Significant Gains (1.5-2x)</h4>
+                    <ul>
+                        <li><strong>Thread Pool:</strong> Scale to all cores</li>
+                        <li><strong>Memory Layout:</strong> NCHWc16 for vectorization</li>
+                        <li><strong>Streaming Stores:</strong> Reduce cache pollution</li>
+                        <li><strong>Register Blocking:</strong> Minimize spills</li>
+                    </ul>
+                    <div style="margin-top: 15px; padding: 10px; background: rgba(243, 156, 18, 0.1); border-radius: 5px;">
+                        <strong>Implementation:</strong> Week 3-4<br>
+                        <strong>ROI:</strong> 15% additional speedup
+                    </div>
+                </div>
+                
+                <div class="tier-card tier-3">
+                    <h4>🎯 Tier 3: Refinements (1.2-1.5x)</h4>
+                    <ul>
+                        <li><strong>NUMA Awareness:</strong> Multi-socket systems</li>
+                        <li><strong>Huge Pages:</strong> Reduce TLB misses</li>
+                        <li><strong>False Sharing Fix:</strong> Better scaling</li>
+                        <li><strong>Dynamic Dispatch:</strong> Runtime selection</li>
+                    </ul>
+                    <div style="margin-top: 15px; padding: 10px; background: rgba(52, 152, 219, 0.1); border-radius: 5px;">
+                        <strong>Implementation:</strong> Week 5-6<br>
+                        <strong>ROI:</strong> 5% final polish
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- KILLER FEATURES -->
+        <div class="section">
+            <h2>🎯 Killer Features for CPU</h2>
+            <div class="killer-features">
+                <div class="feature-card">
+                    <h3>1. Adaptive Micro-Kernels</h3>
+                    <ul>
+                        <li>Runtime CPU detection</li>
+                        <li>Per-architecture kernels</li>
+                        <li>Shape-specific optimization</li>
+                        <li>Auto-tuning at install</li>
+                    </ul>
+                </div>
+                <div class="feature-card">
+                    <h3>2. Three-Level Prefetch</h3>
+                    <ul>
+                        <li>L1: Next iteration (T0)</li>
+                        <li>L2: Next tile (T1)</li>
+                        <li>L3: Next operator</li>
+                        <li>Non-temporal for streaming</li>
+                    </ul>
+                </div>
+                <div class="feature-card">
+                    <h3>3. Cache-Conscious Layouts</h3>
+                    <ul>
+                        <li>NCHWc16 for AVX2</li>
+                        <li>NCHWc32 for AVX-512</li>
+                        <li>5D blocking for efficiency</li>
+                        <li>Per-layer optimization</li>
+                    </ul>
+                </div>
+                <div class="feature-card">
+                    <h3>4. INT8 with VNNI</h3>
+                    <ul>
+                        <li>Intel VNNI instructions</li>
+                        <li>ARM SDOT operations</li>
+                        <li>4x4/8x8 register tiles</li>
+                        <li>Optimal accumulation</li>
+                    </ul>
+                </div>
+                <div class="feature-card">
+                    <h3>5. Dynamic Executor</h3>
+                    <ul>
+                        <li>Memory vs compute bound</li>
+                        <li>Thermal throttling aware</li>
+                        <li>Frequency scaling</li>
+                        <li>Adaptive parallelism</li>
+                    </ul>
+                </div>
+                <div class="feature-card">
+                    <h3>6. Work Stealing</h3>
+                    <ul>
+                        <li>Dynamic load balance</li>
+                        <li>Lock-free queues</li>
+                        <li>Hierarchical stealing</li>
+                        <li>NUMA-aware pinning</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+
+        <!-- OPTIMIZATION PASSES -->
+        <div class="section">
+            <h2>🔧 10 CPU-Specific Optimization Passes</h2>
+            <div class="mermaid">
+graph TD
+    subgraph "Memory Optimization"
+        P1[1. Cache Tiling]
+        P2[2. Cache Blocking]
+        P3[3. Stream Detection]
+        P1 --> P2 --> P3
+    end
+    
+    subgraph "SIMD Optimization"
+        P4[4. Vector Width Selection]
+        P5[5. Register Blocking]
+        P6[6. Broadcast Elimination]
+        P4 --> P5 --> P6
+    end
+    
+    subgraph "Parallelization"
+        P7[7. Threading Strategy]
+        P8[8. Granularity Optimizer]
+        P9[9. Memory Pooling]
+        P7 --> P8 --> P9
+    end
+    
+    P3 --> P4
+    P6 --> P7
+    P9 --> P10[10. Aggressive Fusion]
+    
+    style P1 fill:#e74c3c,color:#fff
+    style P4 fill:#f39c12,color:#fff
+    style P7 fill:#3498db,color:#fff
+    style P10 fill:#2ecc71,color:#fff
+            </div>
+        </div>
+
+        <!-- PERFORMANCE BENCHMARKS -->
+        <div class="performance-box">
+            <h3>📈 Expected Performance Gains</h3>
+            <div class="benchmark-grid">
+                <div class="benchmark-item">
+                    <h4>ResNet-50 INT8</h4>
+                    <div class="metric">
+                        <span>Current:</span>
+                        <span>150 img/s</span>
+                    </div>
+                    <div class="metric">
+                        <span>Target:</span>
+                        <span><strong>400 img/s</strong></span>
+                    </div>
+                    <div class="metric">
+                        <span>Intel SPR:</span>
+                        <span>500+ img/s</span>
+                    </div>
+                </div>
+                <div class="benchmark-item">
+                    <h4>BERT-Base FP32</h4>
+                    <div class="metric">
+                        <span>Current:</span>
+                        <span>80 seq/s</span>
+                    </div>
+                    <div class="metric">
+                        <span>Target:</span>
+                        <span><strong>200 seq/s</strong></span>
+                    </div>
+                    <div class="metric">
+                        <span>Key:</span>
+                        <span>Attention fusion</span>
+                    </div>
+                </div>
+                <div class="benchmark-item">
+                    <h4>Stable Diffusion</h4>
+                    <div class="metric">
+                        <span>Current:</span>
+                        <span>2 img/s</span>
+                    </div>
+                    <div class="metric">
+                        <span>Target:</span>
+                        <span><strong>5 img/s</strong></span>
+                    </div>
+                    <div class="metric">
+                        <span>Key:</span>
+                        <span>Conv fusion</span>
+                    </div>
+                </div>
+                <div class="benchmark-item">
+                    <h4>LLaMA-7B INT8</h4>
+                    <div class="metric">
+                        <span>Current:</span>
+                        <span>15 tok/s</span>
+                    </div>
+                    <div class="metric">
+                        <span>Target:</span>
+                        <span><strong>42+ tok/s</strong></span>
+                    </div>
+                    <div class="metric">
+                        <span>Key:</span>
+                        <span>VNNI + Cache</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- KERNEL EXECUTION FLOW -->
+        <div class="section">
+            <h2>⚙️ Optimized Kernel Execution Flow</h2>
+            <div class="mermaid">
+sequenceDiagram
+    participant L3 as L3 Cache
+    participant L2 as L2 Cache  
+    participant L1 as L1 Cache
+    participant REG as SIMD Registers
+    participant ALU as SIMD ALU
+    
+    Note over L3: Tile Loop (4096 elements)
+    L3->>L2: Prefetch Next L2 Tile
+    Note over L2: Tile Loop (1024 elements)
+    L2->>L1: Prefetch Next L1 Tile
+    Note over L1: Tile Loop (256 elements)
+    L1->>REG: Load 16x6 Register Block
+    
+    loop Compute Loop
+        REG->>ALU: FMA Operations
+        ALU->>REG: Accumulate Results
+        L1->>REG: Load Next Block (Pipelined)
+    end
+    
+    REG->>L1: Store Results (Streaming)
+    L1->>L2: Writeback (if needed)
+    L2->>L3: Writeback (if needed)
+            </div>
+        </div>
+
+        <!-- COMPETITIVE ADVANTAGE -->
+        <div class="section">
+            <h2>🏆 Competitive Advantages</h2>
+            <div class="optimization-card">
+                <h3>vs TVM</h3>
+                <ul>
+                    <li><span class="highlight-red">Better cache modeling</span> - Multi-level tiling with prefetch control</li>
+                    <li><span class="highlight-green">Superior threading</span> - Work stealing vs static scheduling</li>
+                    <li><span class="highlight-blue">Runtime adaptation</span> - Dynamic kernel selection based on CPU state</li>
+                </ul>
+            </div>
+            <div class="optimization-card">
+                <h3>vs MLIR/IREE</h3>
+                <ul>
+                    <li><span class="highlight-red">Global scheduling</span> - Whole-graph optimization vs local</li>
+                    <li><span class="highlight-green">Hardware prefetch</span> - Explicit prefetch insertion</li>
+                    <li><span class="highlight-blue">Custom layouts</span> - Per-layer optimization vs fixed</li>
+                </ul>
+            </div>
+            <div class="optimization-card">
+                <h3>vs oneDNN/MKLDNN</h3>
+                <ul>
+                    <li><span class="highlight-red">Graph-level fusion</span> - Not just primitive operations</li>
+                    <li><span class="highlight-green">Adaptive execution</span> - Runtime decisions based on system state</li>
+                    <li><span class="highlight-blue">Memory pooling</span> - Reduced allocation overhead</li>
+                </ul>
+            </div>
+        </div>
+
+        <!-- IMPLEMENTATION TIMELINE -->
+        <div class="implementation-timeline">
+            <h3>📅 8-Week Implementation Plan</h3>
+            <div class="timeline-week">
+                <div class="week-label">Week 1-2</div>
+                <div class="week-tasks">
+                    <strong>Foundation:</strong> Cache-aware tiling • Basic SIMD kernels • OpenMP thread pool • Memory layout optimizer
+                </div>
+            </div>
+            <div class="timeline-week">
+                <div class="week-label">Week 3-4</div>
+                <div class="week-tasks">
+                    <strong>Optimization:</strong> Prefetch insertion • Register blocking • Fusion pass v2 • NUMA allocator
+                </div>
+            </div>
+            <div class="timeline-week">
+                <div class="week-label">Week 5-6</div>
+                <div class="week-tasks">
+                    <strong>Platform:</strong> Intel AMX • ARM SVE/SME • AMD Zen4 • Runtime CPU detection
+                </div>
+            </div>
+            <div class="timeline-week">
+                <div class="week-label">Week 7-8</div>
+                <div class="week-tasks">
+                    <strong>Polish:</strong> Autotuner • Profile-guided opt • Benchmark suite • Regression tests
+                </div>
+            </div>
+        </div>
+
+        <!-- KEY METRICS -->
+        <div class="section">
+            <h2>📊 Success Metrics</h2>
+            <div class="mermaid">
+graph LR
+    subgraph "Target Metrics"
+        M1[Memory BW > 85%]
+        M2[SIMD Util > 90%]
+        M3[Cache Hit > 95%]
+        M4[Thread Eff > 90%]
+        M5[Scalar Ops < 5%]
+    end
+    
+    M1 --> Success[2-5x Speedup]
+    M2 --> Success
+    M3 --> Success
+    M4 --> Success
+    M5 --> Success
+    
+    style Success fill:#2ecc71,color:#fff,stroke:#27ae60,stroke-width:3px
+            </div>
+        </div>
+
+        <!-- EXAMPLE OPTIMIZATION -->
+        <div class="section">
+            <h2>💻 Example: Optimized Conv2D Pattern</h2>
+            <div class="code-block">
+// Before: Naive implementation
+for (n = 0; n < N; n++)
+    for (co = 0; co < Cout; co++)
+        for (h = 0; h < H; h++)
+            for (w = 0; w < W; w++)
+                for (ci = 0; ci < Cin; ci++)
+                    for (kh = 0; kh < KH; kh++)
+                        for (kw = 0; kw < KW; kw++)
+                            output[n][co][h][w] += input[n][ci][h+kh][w+kw] * weight[co][ci][kh][kw];
+
+// After: CPU-optimized with all techniques
+#pragma omp parallel for collapse(2)
+for (n_tile = 0; n_tile < N; n_tile += TILE_N) {
+    for (co_tile = 0; co_tile < Cout; co_tile += TILE_CO) {
+        // L3 tiling
+        __builtin_prefetch(&input[n_tile + TILE_N], 0, 2);      // L2 prefetch
+        __builtin_prefetch(&weight[co_tile + TILE_CO], 0, 3);   // L1 prefetch
+        
+        // Register blocking with AVX-512
+        __m512 acc[6][16];  // 6x16 micro-kernel
+        
+        // Vectorized + unrolled compute
+        #pragma unroll(4)
+        for (k = 0; k < K; k++) {
+            // SIMD FMA operations
+            acc = _mm512_fmadd_ps(input_vec, weight_vec, acc);
+        }
+        
+        // Streaming store to bypass cache
+        _mm512_stream_ps(&output[...], acc);
+    }
+}
+            </div>
+        </div>
+
+        <div style="margin-top: 40px; text-align: center; color: #7f8c8d; font-size: 0.9em;">
+            <p>SimpLang CPU Redesign - Maximum Performance Architecture</p>
+            <p>© 2025 | CPU-Native Optimization for 2-5x Speedup</p>
+        </div>
+    </div>
+
+    <script>
+        mermaid.initialize({ 
+            startOnLoad: true,
+            theme: 'default',
+            flowchart: {
+                useMaxWidth: true,
+                htmlLabels: true,
+                curve: 'basis'
+            },
+            sequence: {
+                diagramMarginX: 50,
+                diagramMarginY: 20,
+                actorMargin: 50,
+                width: 150,
+                height: 65,
+                boxMargin: 10,
+                boxTextMargin: 5,
+                noteMargin: 10,
+                messageMargin: 35
+            }
+        });
+    </script>
+</body>
+</html>

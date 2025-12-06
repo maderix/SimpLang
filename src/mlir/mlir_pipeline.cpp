@@ -365,27 +365,32 @@ void MLIRCompilationPipeline::buildPhase2_LinalgOptimization(mlir::OpPassManager
 
   // VECTORIZATION: Convert linalg operations to vector dialect
   // The strategy passes work together: Enable → Vectorize → LowerVectors
+  //
+  // Use --llvm-vectorize flag to skip MLIR vectorization and let LLVM handle it.
+  // This is better for INT8/INT4 where MLIR generates excessive shuffle instructions.
+  // For FP32/INT32, MLIR vectorization (default) is typically beneficial.
+  if (!skipMLIRVectorization) {
+    // Step 1: Enable vectorization strategy (marks ops for vectorization)
+    pm.addNestedPass<mlir::FuncOp>(
+        mlir::createLinalgStrategyEnablePass());
 
-  // Step 1: Enable vectorization strategy (marks ops for vectorization)
-  pm.addNestedPass<mlir::FuncOp>(
-      mlir::createLinalgStrategyEnablePass());
+    // Step 2: Vectorize marked linalg operations
+    pm.addNestedPass<mlir::FuncOp>(
+        mlir::createLinalgStrategyVectorizePass(""));
 
-  // Step 2: Vectorize marked linalg operations
-  pm.addNestedPass<mlir::FuncOp>(
-      mlir::createLinalgStrategyVectorizePass(""));
+    // Canonicalize after vectorization to clean up
+    pm.addPass(mlir::createCanonicalizerPass());
+    pm.addPass(mlir::createCSEPass());
 
-  // Canonicalize after vectorization to clean up
-  pm.addPass(mlir::createCanonicalizerPass());
-  pm.addPass(mlir::createCSEPass());
+    // Step 3: Lower vector dialect operations
+    // These passes convert high-level vector ops (like vector.contract) to LLVM-compatible ops
+    pm.addNestedPass<mlir::FuncOp>(
+        mlir::createLinalgStrategyLowerVectorsPass());
 
-  // Step 3: Lower vector dialect operations
-  // These passes convert high-level vector ops (like vector.contract) to LLVM-compatible ops
-  pm.addNestedPass<mlir::FuncOp>(
-      mlir::createLinalgStrategyLowerVectorsPass());
-
-  // Apply canonicalization after vector lowering
-  pm.addPass(mlir::createCanonicalizerPass());
-  pm.addPass(mlir::createCSEPass());
+    // Apply canonicalization after vector lowering
+    pm.addPass(mlir::createCanonicalizerPass());
+    pm.addPass(mlir::createCSEPass());
+  }
 
   // Lower remaining Linalg ops (non-vectorized) to SCF loops
   // Only operations that couldn't be vectorized will go through this
@@ -397,9 +402,14 @@ void MLIRCompilationPipeline::buildPhase2_LinalgOptimization(mlir::OpPassManager
 
   // INSERT PREFETCH: Add prefetch operations to hide memory latency
   // Run after linalg-to-loops so we can find memref.load in all loops
-  llvm::outs() << "[Prefetch] Inserting prefetch operations into loops\n";
-  pm.addNestedPass<mlir::FuncOp>(mlir::simp::createInsertPrefetchPass());
-  pm.addPass(mlir::createCanonicalizerPass());
+  //
+  // NOTE: Prefetch is disabled when using LLVM vectorization path because
+  // InsertPrefetchPass can generate invalid IR with certain loop structures.
+  if (enablePrefetch && !skipMLIRVectorization) {
+    llvm::outs() << "[Prefetch] Inserting prefetch operations into loops\n";
+    pm.addNestedPass<mlir::FuncOp>(mlir::simp::createInsertPrefetchPass());
+    pm.addPass(mlir::createCanonicalizerPass());
+  }
 
   // OPTIMIZATION: Optimize loops for better performance
   // Apply loop invariant code motion to hoist invariant operations
@@ -576,3 +586,4 @@ bool MLIRCompilationPipeline::applyLLVMDialectConversion() {
 
   return true;
 }
+

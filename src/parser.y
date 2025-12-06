@@ -78,7 +78,7 @@
 %token <string> TIDENTIFIER TINTEGER TFLOAT TINTLIT TSTRING
 %token TCEQ TCNE TCLE TCGE TARROW
 %token TVAR TFUNC TIF TELSE TWHILE TRETURN TINCLUDE TIMPORT TAS
-%token TF16 TBF16 TF32 TF64 TI8 TI16 TI32 TI64 TU8 TU16 TU32 TU64 TBOOL TVOID
+%token TF16 TBF16 TF32 TF64 TI4 TI8 TI16 TI32 TI64 TU8 TU16 TU32 TU64 TBOOL TVOID
 %token TSSE TAVX    /* Vector creation tokens */
 %token TSIMD TAUTO TAVX512 TNEON TSVE
 %token TLPAREN TRPAREN TLBRACE TRBRACE
@@ -256,6 +256,7 @@ type_spec : TF16 { $$ = new TypeInfo(TypeKind::F16); }
          | TBF16 { $$ = new TypeInfo(TypeKind::BF16); }
          | TF32 { $$ = new TypeInfo(TypeKind::F32); }
          | TF64 { $$ = new TypeInfo(TypeKind::F64); }
+         | TI4 { $$ = new TypeInfo(TypeKind::I4); }
          | TI8 { $$ = new TypeInfo(TypeKind::I8); }
          | TI16 { $$ = new TypeInfo(TypeKind::I16); }
          | TI32 { $$ = new TypeInfo(TypeKind::I32); }

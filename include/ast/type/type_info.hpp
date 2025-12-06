@@ -12,7 +12,7 @@
 enum class TypeKind {
     Dynamic,    // Current 'var' behavior
     F16, BF16, F32, F64,   // Floating point (FP16, BFloat16, FP32, FP64)
-    I8, I16, I32, I64,     // Signed integers
+    I4, I8, I16, I32, I64,     // Signed integers (I4 for 4-bit quantization)
     U8, U16, U32, U64,     // Unsigned integers
     Bool,       // Boolean
     Void,       // Function returns
@@ -42,7 +42,7 @@ public:
         return kind == TypeKind::Tensor;
     }
     bool isSigned() const {
-        return kind >= TypeKind::I8 && kind <= TypeKind::I64;
+        return kind >= TypeKind::I4 && kind <= TypeKind::I64;
     }
     bool isUnsigned() const {
         return kind >= TypeKind::U8 && kind <= TypeKind::U64;

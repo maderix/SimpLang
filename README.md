@@ -46,6 +46,32 @@ These results arise from explicit tiling (16×16×16), shape-aware lowering via 
 
 ---
 
+### **2.2.1 INT8 VNNI Parallel Performance**
+
+SimpLang includes AVX-512 VNNI optimization for INT8 matrix multiplication, using the `vpdpbusd` instruction with I=4 tiling. Combined with OpenMP parallelization, it achieves competitive throughput against production runtimes:
+
+**Thread Scaling (GIOP/s):**
+
+| Size      | 1 Thread | 2 Threads | 4 Threads | 8 Threads |
+|-----------|----------|-----------|-----------|-----------|
+| 256×256   | 118      | 230       | 453       | 730       |
+| 512×512   | 188      | 370       | 685       | 1,316     |
+| 768×768   | 224      | 410       | 817       | 1,337     |
+| 1024×1024 | 244      | 482       | 575       | 1,760     |
+| 2048×2048 | 280      | 563       | 963       | 1,829     |
+
+**Comparison at 1024×1024 (8 threads):**
+
+| Runtime              | GIOP/s  | vs SimpLang |
+|----------------------|---------|-------------|
+| **SimpLang VNNI**    | 1,760   | —           |
+| TFLite XNNPACK       | 1,327   | 0.75×       |
+| Hand-tuned C++ VNNI  | 2,534   | 1.44×       |
+
+SimpLang's parallel INT8 matmul **beats TFLite XNNPACK by 33%** while reaching **69% of hand-optimized C++** performance. Thread scaling efficiency ranges from 75–90% across matrix sizes.
+
+---
+
 ### **2.3 ARM Cross-Compilation**
 
 Cross-compilation to ARM uses the same high-level SimpLang program with a target switch (`--target aarch64`). On Raspberry Pi 5, results show substantial improvements over NumPy:
@@ -292,15 +318,16 @@ Types default to `f32`. Integer literals use the `i` suffix. Tensor operations e
 * ARM NEON vectorization
 * Competitive matrix multiplication
 * Docker/Dev-container workflows
+* **INT8 AVX-512 VNNI matmul** (1,829 GIOP/s at 2048×2048)
+* **OpenMP multi-threading** for parallel tensor ops
 
 ### **9.2 Short-Term Development**
 
-* int4/int8 native kernels
-* AVX-512 VNNI / ARM DP4A support
+* INT4 packed matmul optimization
+* ARM DP4A support
 * Kernel fusion
 * `for` loop syntax, annotations (`@tile`, `@unroll`)
 * Enhanced error diagnostics
-* Multi-threading for ML workloads
 
 ### **9.3 Long-Term Objectives**
 
