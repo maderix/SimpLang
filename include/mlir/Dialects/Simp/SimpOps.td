@@ -1169,6 +1169,119 @@ def Simp_TensorMatMulOp : Simp_Op<"tensor_matmul", [NoSideEffect]> {
 }
 
 //===----------------------------------------------------------------------===//
+// TensorMatMulNTOp - Matrix multiplication with pre-transposed B (No Transpose)
+//===----------------------------------------------------------------------===//
+
+def Simp_TensorMatMulNTOp : Simp_Op<"tensor_matmul_nt", [NoSideEffect]> {
+  let summary = "Matrix multiplication with pre-transposed B matrix";
+
+  let description = [{
+    Matrix multiplication where B is already transposed: A[M,K] × B_T[N,K] → C[M,N]
+
+    This avoids runtime transpose overhead. The host should pre-transpose weights
+    once at model load time.
+
+    Usage:
+    ```simplang
+    // B_T is pre-transposed: shape [N, K] instead of [K, N]
+    i8<1, 2048> x = tensor_from_array(x_arr, 0i);
+    i8<2048, 2048> Wq_T = tensor_from_array(wq_transposed, 0i);  // [N, K]
+    var Q = tensor_matmul_nt(x, Wq_T);  // No transpose needed!
+    ```
+
+    For VNNI optimization, K-innermost loop is used directly on B_T.
+  }];
+
+  let arguments = (ins
+    Simp_SimpTensorType:$lhs,    // A: [M, K]
+    Simp_SimpTensorType:$rhs     // B_T: [N, K] (pre-transposed)
+  );
+
+  let results = (outs Simp_SimpTensorType:$result);  // C: [M, N]
+
+  let assemblyFormat = [{
+    $lhs `,` $rhs attr-dict `:` `(` type($lhs) `,` type($rhs) `)` `->` type($result)
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// TensorMatMulIntoOp - In-place matrix multiplication (no allocation)
+//===----------------------------------------------------------------------===//
+
+def Simp_TensorMatMulIntoOp : Simp_Op<"tensor_matmul_into", []> {
+  let summary = "In-place matrix multiplication for pre-allocated output";
+
+  let description = [{
+    Matrix multiplication that writes to a pre-allocated output tensor.
+    This avoids internal allocation overhead, critical for performance.
+
+    Usage:
+    ```simplang
+    i32<M, N> C = tensor_from_array(c_arr, 0i);  // Pre-allocated from host
+    tensor_matmul_into(A, B, C);  // Write directly to C
+    ```
+
+    Same semantics as tensor_matmul but output must be pre-allocated.
+  }];
+
+  let arguments = (ins
+    Simp_SimpTensorType:$lhs,    // A: input tensor
+    Simp_SimpTensorType:$rhs,    // B: weight tensor
+    Simp_SimpTensorType:$output  // C: pre-allocated output tensor
+  );
+
+  let results = (outs);  // No result - writes in-place
+
+  let assemblyFormat = [{
+    $lhs `,` $rhs `,` $output attr-dict `:` `(` type($lhs) `,` type($rhs) `,` type($output) `)`
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// TensorMatVecMulOp - Matrix × skinny matrix with i-k-j loop order
+//===----------------------------------------------------------------------===//
+
+def Simp_TensorMatVecMulOp : Simp_Op<"tensor_matvecmul", [NoSideEffect]> {
+  let summary = "Matrix × skinny matrix multiplication (optimized for N << K)";
+
+  let description = [{
+    Matrix multiplication optimized for when the second matrix has few columns (N << K).
+    Uses i-k-j loop order instead of i-j-k, which is more efficient for:
+    - Attention × V in transformers: [seq, seq] × [seq, head_dim]
+    - Matrix × vector operations
+    - Any A[M,K] × B[K,N] where N is small (e.g., N <= 128)
+
+    Why i-k-j is better for small N:
+    - i-j-k requires horizontal reduction after each K-loop (expensive)
+    - i-k-j accumulates into C[i,:] across K iterations (no reduction per element)
+    - J-innermost loop vectorizes across N columns
+
+    Usage:
+    ```simplang
+    i8<1024, 1024> Attn;  // Attention weights
+    i8<1024, 64> V;       // Value matrix (head_dim=64)
+    i32<1024, 64> out = tensor_matvecmul(Attn, V);  // Uses i-k-j order
+    ```
+
+    Mathematical Operation:
+      C[i,j] = sum_k(A[i,k] * B[k,j])
+
+    Loop order: for i, for k, for j (J innermost)
+  }];
+
+  let arguments = (ins
+    Simp_SimpTensorType:$lhs,           // A: [M, K] input tensor
+    Simp_SimpTensorType:$rhs            // B: [K, N] weight tensor (N should be small)
+  );
+
+  let results = (outs Simp_SimpTensorType:$result);  // C: [M, N] output tensor
+
+  let assemblyFormat = [{
+    $lhs `,` $rhs attr-dict `:` `(` type($lhs) `,` type($rhs) `)` `->` type($result)
+  }];
+}
+
+//===----------------------------------------------------------------------===//
 // TensorDotOp - Dot product for 1D tensors
 //===----------------------------------------------------------------------===//
 

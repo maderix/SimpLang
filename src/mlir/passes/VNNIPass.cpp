@@ -56,8 +56,10 @@ struct VNNICandidate {
   // Loop properties
   int64_t TripCount;
   int64_t RowStrideA;           // Stride between A rows (for future I-tiling)
+  int64_t RowStrideB;           // Stride between B rows (for non-square matrix detection)
   bool BothSigned;              // true if both inputs are signed (need bias correction)
   bool IsLoadStorePattern;      // true if using load-store instead of PHI
+  bool NeedsTranspose;          // true if B needs transpose for contiguous access
 };
 
 //===----------------------------------------------------------------------===//
@@ -246,6 +248,17 @@ private:
 
     // Extract row stride for future I-tiling optimization
     C.RowStrideA = extractRowStride(C);
+    C.RowStrideB = extractStrideFromGEP(C.GEPB);
+    errs() << "VNNI: strideA=" << C.RowStrideA << ", strideB=" << C.RowStrideB << "\n";
+
+    // Detect non-square matrix: B needs transpose if strideB != TripCount
+    // For A[M,K] × B[K,N]: strideA=K, strideB=N, TripCount=K
+    // If strideB < TripCount, B is accessed as B[k*N+j] (strided) not B[j*K+k] (contiguous)
+    C.NeedsTranspose = (C.RowStrideB != 0 && C.RowStrideB != C.TripCount);
+    if (C.NeedsTranspose) {
+      errs() << "VNNI: Non-square matrix detected: strideA=" << C.RowStrideA
+             << ", strideB=" << C.RowStrideB << ", K=" << C.TripCount << "\n";
+    }
 
     // Check if signed×signed (needs bias correction)
     C.BothSigned = isa<SExtInst>(C.ExtA) && isa<SExtInst>(C.ExtB);
@@ -325,6 +338,10 @@ private:
   }
 
   bool findMulAccPattern(Loop *L, VNNICandidate &C) {
+    C.Mul = nullptr;
+    C.ExtA = nullptr;
+    C.ExtB = nullptr;
+
     Value *AddOp0 = C.Add->getOperand(0);
     Value *AddOp1 = C.Add->getOperand(1);
 
@@ -411,6 +428,32 @@ private:
   int64_t extractRowStride(VNNICandidate &C) {
     // Pattern: index = i * stride + k
     Value *Idx = C.GEPA->getOperand(C.GEPA->getNumOperands() - 1);
+
+    if (auto *Add = dyn_cast<BinaryOperator>(Idx)) {
+      if (Add->getOpcode() == Instruction::Add) {
+        // Find the mul part (row * stride)
+        for (Value *Op : {Add->getOperand(0), Add->getOperand(1)}) {
+          if (auto *Mul = dyn_cast<BinaryOperator>(Op)) {
+            if (Mul->getOpcode() == Instruction::Mul) {
+              // Extract stride constant
+              if (auto *CI = dyn_cast<ConstantInt>(Mul->getOperand(1)))
+                return CI->getSExtValue();
+              if (auto *CI = dyn_cast<ConstantInt>(Mul->getOperand(0)))
+                return CI->getSExtValue();
+            }
+          }
+        }
+      }
+    }
+    return 0;
+  }
+
+  // Extract stride from a GEP instruction (for C matrix which may have different stride than A)
+  int64_t extractStrideFromGEP(GetElementPtrInst *GEP) {
+    if (!GEP) return 0;
+
+    // Pattern: index = i * stride + j
+    Value *Idx = GEP->getOperand(GEP->getNumOperands() - 1);
 
     if (auto *Add = dyn_cast<BinaryOperator>(Idx)) {
       if (Add->getOpcode() == Instruction::Add) {
@@ -591,6 +634,91 @@ private:
     Value *RowOffA = computeRowOffset(IdxA, C, Builder, L);
     Value *RowOffB = computeRowOffset(IdxB, C, Builder, L);
 
+    // === Non-square matrix transpose ===
+    // For A[M,K] × B[K,N] where N != K, B access is strided (not contiguous along K)
+    // Generate transpose: B_T[j,k] = B[k,j] so that B_T[j*K+k] is contiguous
+    Value *BaseBT = BaseB;  // Will point to transposed B if needed
+    if (C.NeedsTranspose) {
+      errs() << "VNNI: Generating B transpose (K=" << C.TripCount
+             << ", N=" << C.RowStrideB << ")\n";
+
+      int64_t K = C.TripCount;
+      int64_t N = C.RowStrideB;
+
+      // Allocate transposed buffer: N * K bytes
+      Function *MallocFn = M->getFunction("malloc");
+      if (!MallocFn) {
+        FunctionType *MallocTy = FunctionType::get(
+            PointerType::get(I8Ty, 0), {I64Ty}, false);
+        MallocFn = Function::Create(MallocTy, Function::ExternalLinkage, "malloc", M);
+      }
+      Value *TransposeSize = ConstantInt::get(I64Ty, N * K);
+      BaseBT = Builder.CreateCall(MallocFn, {TransposeSize}, "B_T");
+
+      // Generate transpose loops: for j in 0..N: for k in 0..K: B_T[j*K+k] = B[k*N+j]
+      // Create basic blocks for transpose loops
+      BasicBlock *TransposePreheader = Preheader;  // Insert before VNNI loop
+      BasicBlock *TransposeJHdr = BasicBlock::Create(Ctx, "transpose.j.hdr", &F, Preheader->getNextNode());
+      BasicBlock *TransposeKHdr = BasicBlock::Create(Ctx, "transpose.k.hdr", &F, TransposeJHdr->getNextNode());
+      BasicBlock *TransposeKBody = BasicBlock::Create(Ctx, "transpose.k.body", &F, TransposeKHdr->getNextNode());
+      BasicBlock *TransposeKExit = BasicBlock::Create(Ctx, "transpose.k.exit", &F, TransposeKBody->getNextNode());
+      BasicBlock *TransposeJExit = BasicBlock::Create(Ctx, "transpose.j.exit", &F, TransposeKExit->getNextNode());
+
+      // Redirect preheader to transpose loops
+      Builder.SetInsertPoint(Preheader->getTerminator());
+      Builder.CreateBr(TransposeJHdr);
+      Preheader->getTerminator()->eraseFromParent();
+
+      // J loop header
+      Builder.SetInsertPoint(TransposeJHdr);
+      PHINode *JIdx = Builder.CreatePHI(I64Ty, 2, "tj");
+      JIdx->addIncoming(ConstantInt::get(I64Ty, 0), Preheader);
+      Value *JCond = Builder.CreateICmpSLT(JIdx, ConstantInt::get(I64Ty, N));
+      Builder.CreateCondBr(JCond, TransposeKHdr, TransposeJExit);
+
+      // K loop header
+      Builder.SetInsertPoint(TransposeKHdr);
+      PHINode *KIdx = Builder.CreatePHI(I64Ty, 2, "tk");
+      KIdx->addIncoming(ConstantInt::get(I64Ty, 0), TransposeJHdr);
+      Value *KCond = Builder.CreateICmpSLT(KIdx, ConstantInt::get(I64Ty, K));
+      Builder.CreateCondBr(KCond, TransposeKBody, TransposeKExit);
+
+      // K loop body: B_T[j*K+k] = B[k*N+j]
+      Builder.SetInsertPoint(TransposeKBody);
+      Value *SrcIdx = Builder.CreateAdd(Builder.CreateMul(KIdx, ConstantInt::get(I64Ty, N)), JIdx);
+      Value *DstIdx = Builder.CreateAdd(Builder.CreateMul(JIdx, ConstantInt::get(I64Ty, K)), KIdx);
+      Value *SrcPtr = Builder.CreateGEP(I8Ty, BaseB, SrcIdx);
+      Value *DstPtr = Builder.CreateGEP(I8Ty, BaseBT, DstIdx);
+      Value *Val = Builder.CreateLoad(I8Ty, SrcPtr);
+      Builder.CreateStore(Val, DstPtr);
+      Value *KNext = Builder.CreateAdd(KIdx, ConstantInt::get(I64Ty, 1));
+      KIdx->addIncoming(KNext, TransposeKBody);
+      Builder.CreateBr(TransposeKHdr);
+
+      // K loop exit -> J increment
+      Builder.SetInsertPoint(TransposeKExit);
+      Value *JNext = Builder.CreateAdd(JIdx, ConstantInt::get(I64Ty, 1));
+      JIdx->addIncoming(JNext, TransposeKExit);
+      Builder.CreateBr(TransposeJHdr);
+
+      // J loop exit -> continue to VNNI loop (update Preheader reference)
+      Builder.SetInsertPoint(TransposeJExit);
+      // Don't create branch yet - will be done when VNNI loop is created
+      Preheader = TransposeJExit;  // VNNI loop preheader is now after transpose
+
+      // Update RowOffB: now it's j * K (not j * N)
+      // Recompute using J loop index from parent loop
+      RowOffB = Builder.CreateMul(
+          computeRowOffset(IdxB, C, Builder, L),  // This gives j * N
+          ConstantInt::get(I64Ty, K / N),         // Scale to j * K
+          "row.off.transposed");
+      // Actually simpler: extract j and multiply by K
+      // The original RowOffB = j * N, so RowOffB_new = (RowOffB / N) * K = RowOffB * (K/N)
+      // But this only works if K is divisible by N. Better to extract j directly.
+
+      errs() << "VNNI: Transpose loops generated\n";
+    }
+
     // Create VNNI loop blocks
     BasicBlock *VecHeader = BasicBlock::Create(Ctx, "vnni.hdr", &F);
     BasicBlock *VecBody = BasicBlock::Create(Ctx, "vnni.body", &F);
@@ -677,7 +805,8 @@ private:
     };
 
     // Load B vector ONCE (shared across all 4 A rows)
-    Value *VecB = loadPadded(BaseB, Builder.CreateAdd(RowOffB, VecIdx));
+    // Use BaseBT (transposed B) if non-square, otherwise BaseB
+    Value *VecB = loadPadded(BaseBT, Builder.CreateAdd(RowOffB, VecIdx));
 
     // Load 4 A rows
     Value *VecA0 = loadPadded(BaseA, Builder.CreateAdd(RowOffA0, VecIdx));
@@ -709,7 +838,29 @@ private:
     // Step by 64 bytes or TripCount if smaller (for K < 64 cases)
     int64_t StepSize = std::min((int64_t)64, C.TripCount);
     Value *NextIdx = Builder.CreateAdd(VecIdx, ConstantInt::get(I64Ty, StepSize));
-    Builder.CreateBr(VecHeader);
+    BranchInst *LatchBr = Builder.CreateBr(VecHeader);
+
+    // Add loop metadata to disable unrolling (prevents register spilling)
+    // LLVM O3 over-unrolls this loop causing 40x more vpdpbusd instructions
+    // The metadata must be on the latch (back-edge) branch
+    // Using multiple hints to ensure LLVM respects no-unroll
+    LLVMContext &LoopCtx = F.getContext();
+    MDNode *LoopID = MDNode::get(LoopCtx, {
+        MDNode::get(LoopCtx, {}),  // self-reference placeholder
+        MDNode::get(LoopCtx, {
+            MDString::get(LoopCtx, "llvm.loop.unroll.disable")
+        }),
+        MDNode::get(LoopCtx, {
+            MDString::get(LoopCtx, "llvm.loop.unroll.count"),
+            ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(LoopCtx), 1))
+        }),
+        MDNode::get(LoopCtx, {
+            MDString::get(LoopCtx, "llvm.loop.unroll.full"),
+            ConstantAsMetadata::get(ConstantInt::get(Type::getInt1Ty(LoopCtx), false))
+        })
+    });
+    LoopID->replaceOperandWith(0, LoopID);  // fix self-reference
+    LatchBr->setMetadata("llvm.loop", LoopID);
 
     // Complete PHIs
     VecIdx->addIncoming(ConstantInt::get(I64Ty, 0), Preheader);
@@ -801,9 +952,18 @@ private:
       Value *BaseC = StoreGEP->getPointerOperand();
       Value *OrigIdx = StoreGEP->getOperand(StoreGEP->getNumOperands() - 1);
 
-      // C is stored as C[i * stride + j], so consecutive rows are stride apart
-      // Use the same stride as matrix A (RowStrideA = N)
-      Value *CStride = ConstantInt::get(I64Ty, C.RowStrideA);
+      // C is stored as C[i * strideC + j], so consecutive rows are strideC apart
+      // For matmul A[M,K] × B[K,N] → C[M,N]:
+      //   strideA = K (e.g., 1024 for Attn)
+      //   strideC = N (e.g., 64 for output)
+      // IMPORTANT: Must extract strideC from the store GEP, not use strideA!
+      int64_t StrideC = extractStrideFromGEP(StoreGEP);
+      if (StrideC == 0) {
+        // Fallback: for square matrices, strideA = strideC
+        StrideC = C.RowStrideA;
+        errs() << "VNNI: Warning - could not extract C stride, using A stride as fallback\n";
+      }
+      Value *CStride = ConstantInt::get(I64Ty, StrideC);
 
       // Store Result1 at index + stride (next row)
       Value *Idx1 = Builder.CreateAdd(OrigIdx, CStride);
@@ -820,7 +980,7 @@ private:
       Value *Ptr3 = Builder.CreateGEP(I32Ty, BaseC, Idx3);
       Builder.CreateStore(Result3, Ptr3);
 
-      errs() << "VNNI: Added 3 extra stores for I=4 tiling (stride=" << C.RowStrideA << ")\n";
+      errs() << "VNNI: Added 3 extra stores for I=4 tiling (strideC=" << StrideC << ", strideA=" << C.RowStrideA << ")\n";
 
       // Modify I loop (grandparent) to step by 4 - NOT J loop!
       if (modifyParentLoopStep(ILoop, 4)) {

@@ -20,6 +20,9 @@
 #include <llvm/Analysis/TargetTransformInfo.h>
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/MC/TargetRegistry.h>
+#include <llvm/Passes/PassBuilder.h>
+#include <llvm/Analysis/LoopAnalysisManager.h>
+#include <llvm/Analysis/CGSCCPassManager.h>
 
 #ifdef USE_MLIR
 #include "mlir/mlir_codegen.hpp"
@@ -451,17 +454,43 @@ int main(int argc, char** argv) {
         }
 
         // RUN LLVM OPTIMIZATION PASSES (Critical for performance!)
-        // Use MLIR's optimization transformer (same as Toy tutorial Ch6)
+        // Use custom pass pipeline to respect loop unroll metadata from VNNI pass
         if (enableO3) {
             LOG_INFO("Running LLVM optimization passes (O3)...");
-            auto optPipeline = mlir::makeOptimizingTransformer(
-                /*optLevel=*/3,        // O3 optimization (enables loop vectorization!)
-                /*sizeLevel=*/0,       // Optimize for speed, not size
-                /*targetMachine=*/targetMachine);
 
-            if (auto err = optPipeline(llvmModule.get())) {
-                llvm::errs() << "Failed to optimize LLVM IR: " << err << "\n";
-                return 1;
+            // Use new pass manager for better control
+            llvm::LoopAnalysisManager LAM;
+            llvm::FunctionAnalysisManager FAM;
+            llvm::CGSCCAnalysisManager CGAM;
+            llvm::ModuleAnalysisManager MAM;
+
+            llvm::PassBuilder PB(targetMachine);
+
+            // Configure PassBuilder to skip loop unrolling (preserves VNNI loops)
+            llvm::PipelineTuningOptions PTO;
+            PTO.LoopUnrolling = false;  // CRITICAL: Disable loop unrolling to preserve VNNI structure
+            PTO.LoopVectorization = true;  // Keep SIMD vectorization
+
+            llvm::PassBuilder PB2(targetMachine, PTO);
+
+            // Register analysis passes
+            PB2.registerModuleAnalyses(MAM);
+            PB2.registerCGSCCAnalyses(CGAM);
+            PB2.registerFunctionAnalyses(FAM);
+            PB2.registerLoopAnalyses(LAM);
+            PB2.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+            // Build O3 pipeline - now with unrolling disabled
+            llvm::ModulePassManager MPM = PB2.buildPerModuleDefaultPipeline(
+                llvm::OptimizationLevel::O3);
+
+            MPM.run(*llvmModule, MAM);
+
+            // Dump IR after O3 for debugging
+            {
+                std::error_code EC;
+                llvm::raw_fd_ostream afterO3("/tmp/after_o3.ll", EC, llvm::sys::fs::OF_None);
+                llvmModule->print(afterO3, nullptr);
             }
         } else {
             LOG_INFO("Skipping LLVM O3 optimization (--no-opt)");

@@ -853,8 +853,8 @@ mlir::Value MLIRCodeGenContext::lowerCast(CastExprAST* castExpr) {
   }
 
   // Handle conversions
-  bool sourceIsInt = sourceType.isInteger(64);
-  bool targetIsInt = targetType.isInteger(64);
+  bool sourceIsInt = sourceType.isIntOrIndex();
+  bool targetIsInt = targetType.isIntOrIndex();
   bool sourceIsFloat = sourceType.isa<mlir::Float32Type>() || sourceType.isa<mlir::Float64Type>();
   bool targetIsFloat = targetType.isa<mlir::Float32Type>() || targetType.isa<mlir::Float64Type>();
 
@@ -2162,6 +2162,133 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
         builder.getContext(), resultShape, elemType);
 
     return builder.create<mlir::simp::TensorMatMulOp>(loc, resultType, lhs, rhs, /*layout=*/nullptr);
+  }
+
+  // tensor_matmul_nt: tensor_matmul_nt(lhs, rhs_transposed) - B is pre-transposed
+  // A[M,K] × B_T[N,K] → C[M,N] - no runtime transpose needed
+  if (calleeName == "tensor_matmul_nt") {
+    if (args.size() != 2) {
+      llvm::errs() << "Error: tensor_matmul_nt requires 2 arguments (lhs, rhs_transposed), got " << args.size() << "\n";
+      return nullptr;
+    }
+
+    mlir::Value lhs = args[0];
+    mlir::Value rhs = args[1];  // Already transposed: [N, K]
+    auto lhsType = lhs.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    auto rhsType = rhs.getType().dyn_cast<mlir::simp::SimpTensorType>();
+
+    if (!lhsType || !rhsType) {
+      llvm::errs() << "Error: tensor_matmul_nt requires tensor arguments\n";
+      return nullptr;
+    }
+
+    auto lhsShape = lhsType.getShape();
+    auto rhsShape = rhsType.getShape();
+
+    if (lhsShape.size() != 2 || rhsShape.size() != 2) {
+      llvm::errs() << "Error: tensor_matmul_nt requires 2D tensors\n";
+      return nullptr;
+    }
+
+    // A[M, K] × B_T[N, K] → C[M, N]
+    int64_t M = lhsShape[0];
+    int64_t K_lhs = lhsShape[1];
+    int64_t N = rhsShape[0];      // B_T has shape [N, K]
+    int64_t K_rhs = rhsShape[1];
+
+    if (K_lhs != K_rhs) {
+      llvm::errs() << "Error: tensor_matmul_nt dimension mismatch: K=" << K_lhs << " vs " << K_rhs << "\n";
+      return nullptr;
+    }
+
+    llvm::SmallVector<int64_t, 2> resultShape = {M, N};
+    mlir::Type elemType = lhsType.getElementType();
+
+    // For INT8 matmul, result is i32
+    if (elemType.isInteger(8)) {
+      elemType = builder.getI32Type();
+    }
+
+    mlir::Type resultType = mlir::simp::SimpTensorType::get(
+        builder.getContext(), resultShape, elemType);
+
+    return builder.create<mlir::simp::TensorMatMulNTOp>(loc, resultType, lhs, rhs);
+  }
+
+  // tensor_matmul_into: tensor_matmul_into(lhs, rhs, output) - in-place, no allocation
+  if (calleeName == "tensor_matmul_into") {
+    if (args.size() != 3) {
+      llvm::errs() << "Error: tensor_matmul_into requires 3 arguments (lhs, rhs, output), got " << args.size() << "\n";
+      return nullptr;
+    }
+
+    mlir::Value lhs = args[0];
+    mlir::Value rhs = args[1];
+    mlir::Value output = args[2];
+    auto lhsType = lhs.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    auto rhsType = rhs.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    auto outType = output.getType().dyn_cast<mlir::simp::SimpTensorType>();
+
+    if (!lhsType || !rhsType || !outType) {
+      llvm::errs() << "Error: tensor_matmul_into requires tensor arguments\n";
+      return nullptr;
+    }
+
+    // Create the in-place matmul op (no result, writes to output)
+    builder.create<mlir::simp::TensorMatMulIntoOp>(loc, lhs, rhs, output);
+
+    // Return the output tensor so it can be used in expressions
+    return output;
+  }
+
+  // tensor_matvecmul: tensor_matvecmul(lhs, rhs) - optimized for N << K
+  if (calleeName == "tensor_matvecmul") {
+    if (args.size() != 2) {
+      llvm::errs() << "Error: tensor_matvecmul requires 2 arguments (lhs, rhs), got " << args.size() << "\n";
+      return nullptr;
+    }
+
+    mlir::Value lhs = args[0];
+    mlir::Value rhs = args[1];
+    auto lhsType = lhs.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    auto rhsType = rhs.getType().dyn_cast<mlir::simp::SimpTensorType>();
+
+    if (!lhsType || !rhsType) {
+      llvm::errs() << "Error: tensor_matvecmul requires tensor arguments\n";
+      return nullptr;
+    }
+
+    auto lhsShape = lhsType.getShape();
+    auto rhsShape = rhsType.getShape();
+
+    if (lhsShape.size() != 2 || rhsShape.size() != 2) {
+      llvm::errs() << "Error: tensor_matvecmul requires 2D tensors\n";
+      return nullptr;
+    }
+
+    // A[M,K] × B[K,N] → C[M,N]
+    int64_t M = lhsShape[0];
+    int64_t K_lhs = lhsShape[1];
+    int64_t K_rhs = rhsShape[0];
+    int64_t N = rhsShape[1];
+
+    if (K_lhs != K_rhs) {
+      llvm::errs() << "Error: tensor_matvecmul dimension mismatch: K=" << K_lhs << " vs " << K_rhs << "\n";
+      return nullptr;
+    }
+
+    llvm::SmallVector<int64_t, 2> resultShape = {M, N};
+    mlir::Type elemType = lhsType.getElementType();
+
+    // For INT8 matmul, result is i32
+    if (elemType.isInteger(8)) {
+      elemType = builder.getI32Type();
+    }
+
+    mlir::Type resultType = mlir::simp::SimpTensorType::get(
+        builder.getContext(), resultShape, elemType);
+
+    return builder.create<mlir::simp::TensorMatVecMulOp>(loc, resultType, lhs, rhs);
   }
 
   // tensor_dot: tensor_dot(lhs, rhs)
