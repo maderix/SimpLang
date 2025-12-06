@@ -300,6 +300,38 @@ fn benchmark_int8_matmul_2048() -> i32 {
     return checksum;
 }
 
+fn benchmark_int8_matmul_4096() -> i32 {
+    i8<4096, 4096> A;
+    i8<4096, 4096> B;
+
+    var i = 0;
+    while (i < 4096) {
+        var j = 0;
+        while (j < 4096) {
+            var val = ((i * 4096 + j) % 127) - 64;
+            A[i as i64, j as i64] = val;
+            B[j as i64, i as i64] = val;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    var C = tensor_matmul(A, B);
+
+    var checksum = 0;
+    i = 0;
+    while (i < 4096) {
+        var j = 0;
+        while (j < 4096) {
+            checksum = checksum + C[i as i64, j as i64];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    return checksum;
+}
+
 // ========== Entry Point ==========
 
 fn kernel_main() -> i32 {
