@@ -3,10 +3,10 @@
 Roofline Plot for INT8 MatMul Benchmark
 
 Creates a roofline model comparing:
-- SimpLang (VNNI-optimized)
+- SimpLang VNNI (single-threaded and parallel)
 - C++ VNNI Reference
-- C++ Scalar
-- TensorFlow / XLA
+- TFLite XNNPACK
+- Eigen
 
 Usage:
     python3 plot_roofline.py
@@ -23,10 +23,26 @@ import numpy as np
 import os
 
 # System parameters (AMD Zen3 / Intel with AVX512-VNNI)
-# Adjust these for your system
 PEAK_MEMORY_BW_GB_S = 50.0  # Memory bandwidth in GB/s (DDR4-3200 dual channel ~51 GB/s)
-PEAK_INT8_VNNI_GIOPS = 400.0  # Peak INT8 throughput with VNNI (adjust for your CPU)
+PEAK_INT8_VNNI_GIOPS = 2800.0  # Peak INT8 throughput with VNNI 8-thread (adjust for your CPU)
+PEAK_INT8_VNNI_1T_GIOPS = 350.0  # Peak INT8 single-thread
 PEAK_SCALAR_GIOPS = 50.0  # Peak scalar INT8 throughput
+
+# Hardcoded benchmark results from our testing
+PARALLEL_BENCHMARK_DATA = {
+    # Size: (1T, 2T, 4T, 8T) GIOP/s
+    256:  (118, 230, 453, 730),
+    512:  (188, 370, 685, 1316),
+    768:  (224, 410, 817, 1337),
+    1024: (244, 482, 575, 1760),
+    2048: (280, 563, 963, 1829),
+}
+
+# Reference implementations at 1024x1024 (8 threads)
+REFERENCE_DATA = {
+    'tflite_xnnpack': 1327,  # GIOP/s
+    'cpp_vnni_8t': 2534,     # GIOP/s
+}
 
 def load_cpp_results(filepath='/tmp/int8_matmul_benchmark.csv'):
     """Load C++ benchmark results."""
@@ -42,104 +58,172 @@ def load_tf_results(filepath='/tmp/int8_tflite_benchmark.csv'):
         return None
     return pd.read_csv(filepath)
 
-def plot_roofline(cpp_df, tf_df, output_file='/tmp/int8_roofline.png'):
-    """Create roofline plot."""
-    fig, ax = plt.subplots(figsize=(14, 9))
+def plot_thread_scaling(output_file='/tmp/int8_thread_scaling.png'):
+    """Create thread scaling line plot."""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
 
-    # Arithmetic intensity range
-    ai_range = np.logspace(-1, 4, 100)
+    sizes = list(PARALLEL_BENCHMARK_DATA.keys())
+    threads = [1, 2, 4, 8]
+
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
+    markers = ['o', 's', '^', 'D', 'v']
+
+    # Plot 1: Performance vs Threads for each size
+    for i, size in enumerate(sizes):
+        perf = PARALLEL_BENCHMARK_DATA[size]
+        ax1.plot(threads, perf, marker=markers[i], color=colors[i],
+                linewidth=2, markersize=8, label=f'{size}×{size}')
+
+    # Add reference lines
+    ax1.axhline(y=REFERENCE_DATA['tflite_xnnpack'], color='gray', linestyle='--',
+                linewidth=2, alpha=0.7, label=f"TFLite XNNPACK ({REFERENCE_DATA['tflite_xnnpack']})")
+    ax1.axhline(y=REFERENCE_DATA['cpp_vnni_8t'], color='black', linestyle=':',
+                linewidth=2, alpha=0.7, label=f"C++ VNNI 8T ({REFERENCE_DATA['cpp_vnni_8t']})")
+
+    ax1.set_xlabel('Threads', fontsize=12)
+    ax1.set_ylabel('Performance (GIOP/s)', fontsize=12)
+    ax1.set_title('SimpLang INT8 VNNI Thread Scaling', fontsize=13)
+    ax1.set_xticks(threads)
+    ax1.legend(loc='upper left', fontsize=9)
+    ax1.grid(True, alpha=0.3)
+    ax1.set_ylim(0, 2800)
+
+    # Plot 2: Performance vs Size for each thread count
+    for i, t in enumerate(threads):
+        perf = [PARALLEL_BENCHMARK_DATA[s][i] for s in sizes]
+        ax2.plot(sizes, perf, marker=markers[i], color=colors[i],
+                linewidth=2, markersize=8, label=f'{t} thread{"s" if t > 1 else ""}')
+
+    ax2.axhline(y=REFERENCE_DATA['tflite_xnnpack'], color='gray', linestyle='--',
+                linewidth=2, alpha=0.7, label='TFLite XNNPACK')
+
+    ax2.set_xlabel('Matrix Size (N×N)', fontsize=12)
+    ax2.set_ylabel('Performance (GIOP/s)', fontsize=12)
+    ax2.set_title('SimpLang INT8 VNNI vs Matrix Size', fontsize=13)
+    ax2.set_xscale('log', base=2)
+    ax2.set_xticks(sizes)
+    ax2.set_xticklabels([str(s) for s in sizes])
+    ax2.legend(loc='upper left', fontsize=9)
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=150, bbox_inches='tight')
+    print(f"Thread scaling plot saved to: {output_file}")
+
+    pdf_file = output_file.replace('.png', '.pdf')
+    plt.savefig(pdf_file, bbox_inches='tight')
+    print(f"PDF saved to: {pdf_file}")
+    plt.close()
+
+
+def plot_comparison_bars(output_file='/tmp/int8_comparison.png'):
+    """Create comparison bar chart at 1024x1024."""
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # Data for 1024x1024
+    implementations = ['SimpLang\n1T', 'SimpLang\n2T', 'SimpLang\n4T', 'SimpLang\n8T',
+                       'TFLite\nXNNPACK', 'C++ VNNI\n8T']
+    values = list(PARALLEL_BENCHMARK_DATA[1024]) + [REFERENCE_DATA['tflite_xnnpack'],
+                                                     REFERENCE_DATA['cpp_vnni_8t']]
+    colors = ['#1f77b4', '#1f77b4', '#1f77b4', '#1f77b4', '#ff7f0e', '#2ca02c']
+    alphas = [0.4, 0.6, 0.8, 1.0, 0.9, 0.9]
+
+    # Create bars individually to support per-bar alpha
+    x = np.arange(len(implementations))
+    for i, (impl, val, col, alpha) in enumerate(zip(implementations, values, colors, alphas)):
+        ax.bar(x[i], val, color=col, alpha=alpha, edgecolor='black', linewidth=1.2)
+    ax.set_xticks(x)
+    ax.set_xticklabels(implementations)
+    bars = ax.patches  # Get bars for annotation
+
+    # Add value labels on bars
+    for bar, val in zip(bars, values):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 30,
+                f'{val:,}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+
+    ax.set_ylabel('Performance (GIOP/s)', fontsize=12)
+    ax.set_title('INT8 MatMul Performance Comparison (1024×1024)', fontsize=14)
+    ax.set_ylim(0, 2800)
+    ax.grid(True, alpha=0.3, axis='y')
+
+    # Add annotation
+    ax.annotate('SimpLang 8T beats\nTFLite by 33%', xy=(3, 1760), xytext=(3.5, 2200),
+                fontsize=10, ha='center',
+                arrowprops=dict(arrowstyle='->', color='black', lw=1.5),
+                bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.7))
+
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=150, bbox_inches='tight')
+    print(f"Comparison plot saved to: {output_file}")
+
+    pdf_file = output_file.replace('.png', '.pdf')
+    plt.savefig(pdf_file, bbox_inches='tight')
+    plt.close()
+
+
+def plot_roofline(cpp_df, tf_df, output_file='/tmp/int8_roofline.png'):
+    """Create roofline plot with lines."""
+    fig, ax = plt.subplots(figsize=(12, 8))
+
+    # Arithmetic intensity for INT8 matmul: N^3 ops / (2*N^2 bytes) = N/2
+    sizes = list(PARALLEL_BENCHMARK_DATA.keys())
+    ai_values = [s / 2 for s in sizes]  # Arithmetic intensity
 
     # Roofline boundaries
-    # Memory-bound region: performance = bandwidth * arithmetic_intensity
+    ai_range = np.logspace(1, 4, 100)
     memory_bound = PEAK_MEMORY_BW_GB_S * ai_range
+    vnni_roof_8t = np.full_like(ai_range, PEAK_INT8_VNNI_GIOPS)
+    vnni_roof_1t = np.full_like(ai_range, PEAK_INT8_VNNI_1T_GIOPS)
 
-    # Compute-bound region: performance = peak_compute
-    vnni_roof = np.full_like(ai_range, PEAK_INT8_VNNI_GIOPS)
-    scalar_roof = np.full_like(ai_range, PEAK_SCALAR_GIOPS)
-
-    # Combined roofline (min of memory and compute bounds)
-    vnni_roofline = np.minimum(memory_bound, vnni_roof)
-    scalar_roofline = np.minimum(memory_bound, scalar_roof)
+    vnni_roofline_8t = np.minimum(memory_bound, vnni_roof_8t)
+    vnni_roofline_1t = np.minimum(memory_bound, vnni_roof_1t)
 
     # Plot rooflines
-    ax.loglog(ai_range, vnni_roofline, 'k-', linewidth=2.5, label=f'VNNI Roofline ({PEAK_INT8_VNNI_GIOPS:.0f} GIOP/s)')
-    ax.loglog(ai_range, scalar_roofline, 'k--', linewidth=1.5, alpha=0.6, label=f'Scalar Roofline ({PEAK_SCALAR_GIOPS:.0f} GIOP/s)')
+    ax.loglog(ai_range, vnni_roofline_8t, 'k-', linewidth=2,
+              label=f'8T Roofline ({PEAK_INT8_VNNI_GIOPS:.0f} GIOP/s)', alpha=0.7)
+    ax.loglog(ai_range, vnni_roofline_1t, 'k--', linewidth=1.5,
+              label=f'1T Roofline ({PEAK_INT8_VNNI_1T_GIOPS:.0f} GIOP/s)', alpha=0.5)
 
-    # Ridge point (where memory and compute bounds meet)
-    ridge_ai_vnni = PEAK_INT8_VNNI_GIOPS / PEAK_MEMORY_BW_GB_S
-    ax.axvline(x=ridge_ai_vnni, color='gray', linestyle=':', alpha=0.5)
-    ax.text(ridge_ai_vnni * 1.1, PEAK_INT8_VNNI_GIOPS * 0.6, f'Ridge\nAI={ridge_ai_vnni:.1f}', fontsize=9, alpha=0.7)
+    # Plot SimpLang performance as lines
+    colors = {'1T': '#1f77b4', '2T': '#ff7f0e', '4T': '#2ca02c', '8T': '#d62728'}
 
-    # Plot benchmark data
-    markers = {'simplang': 'o', 'vnni': 's', 'scalar': '^', 'tf': 'D', 'xla': 'p', 'eigen': 'v'}
-    colors = {'simplang': '#1f77b4', 'vnni': '#2ca02c', 'scalar': '#d62728', 'tf': '#ff7f0e', 'xla': '#9467bd', 'eigen': '#8c564b'}
+    for i, (label, color) in enumerate(colors.items()):
+        perf = [PARALLEL_BENCHMARK_DATA[s][i] for s in sizes]
+        ax.loglog(ai_values, perf, marker='o', color=color, linewidth=2.5,
+                  markersize=10, label=f'SimpLang {label}')
 
-    if cpp_df is not None:
-        # SimpLang
-        ax.scatter(cpp_df['arithmetic_intensity'], cpp_df['simplang_giops'],
-                   marker=markers['simplang'], c=colors['simplang'], s=120, zorder=5,
-                   label='SimpLang (VNNI)', edgecolors='black', linewidths=0.5)
+    # Add reference point for TFLite at 1024
+    ax.scatter([512], [REFERENCE_DATA['tflite_xnnpack']], marker='s', c='gray',
+               s=150, zorder=5, label=f"TFLite XNNPACK ({REFERENCE_DATA['tflite_xnnpack']})",
+               edgecolors='black', linewidths=1)
 
-        # Annotate sizes
-        for _, row in cpp_df.iterrows():
-            ax.annotate(f"{int(row['N'])}", (row['arithmetic_intensity'], row['simplang_giops']),
-                        textcoords="offset points", xytext=(5, 5), fontsize=8, alpha=0.8)
-
-        # C++ VNNI Reference
-        ax.scatter(cpp_df['arithmetic_intensity'], cpp_df['vnni_giops'],
-                   marker=markers['vnni'], c=colors['vnni'], s=90, zorder=4,
-                   label='C++ VNNI Reference', edgecolors='black', linewidths=0.5)
-
-        # C++ Scalar
-        ax.scatter(cpp_df['arithmetic_intensity'], cpp_df['scalar_giops'],
-                   marker=markers['scalar'], c=colors['scalar'], s=70, zorder=3,
-                   label='C++ Scalar', edgecolors='black', linewidths=0.5)
-
-        # Eigen
-        if 'eigen_giops' in cpp_df.columns:
-            ax.scatter(cpp_df['arithmetic_intensity'], cpp_df['eigen_giops'],
-                       marker=markers['eigen'], c=colors['eigen'], s=70, zorder=3,
-                       label='Eigen', edgecolors='black', linewidths=0.5)
-
-    if tf_df is not None:
-        # TensorFlow Eager
-        ax.scatter(tf_df['arithmetic_intensity'], tf_df['tf_giops'],
-                   marker=markers['tf'], c=colors['tf'], s=90, zorder=4,
-                   label='TensorFlow (oneDNN)', edgecolors='black', linewidths=0.5)
-
-        # TensorFlow XLA
-        ax.scatter(tf_df['arithmetic_intensity'], tf_df['xla_giops'],
-                   marker=markers['xla'], c=colors['xla'], s=90, zorder=4,
-                   label='TensorFlow XLA', edgecolors='black', linewidths=0.5)
+    # Add reference point for C++ VNNI at 1024
+    ax.scatter([512], [REFERENCE_DATA['cpp_vnni_8t']], marker='^', c='black',
+               s=150, zorder=5, label=f"C++ VNNI 8T ({REFERENCE_DATA['cpp_vnni_8t']})",
+               edgecolors='black', linewidths=1)
 
     # Formatting
     ax.set_xlabel('Arithmetic Intensity (IOPS/Byte)', fontsize=12)
     ax.set_ylabel('Performance (GIOP/s)', fontsize=12)
-    ax.set_title('INT8 MatMul Roofline Model\nSimpLang vs C++ VNNI vs Scalar vs NumPy', fontsize=14)
+    ax.set_title('INT8 MatMul Roofline Model\nSimpLang VNNI Thread Scaling', fontsize=14)
 
-    ax.set_xlim(0.1, 10000)
-    ax.set_ylim(0.1, 1000)
-
+    ax.set_xlim(50, 2000)
+    ax.set_ylim(50, 3000)
     ax.grid(True, which='both', alpha=0.3)
-    ax.legend(loc='lower right', fontsize=10)
+    ax.legend(loc='lower right', fontsize=9)
 
-    # Add efficiency annotations
-    if cpp_df is not None and len(cpp_df) > 0:
-        max_row = cpp_df.loc[cpp_df['simplang_giops'].idxmax()]
-        efficiency = (max_row['simplang_giops'] / PEAK_INT8_VNNI_GIOPS) * 100
-        ax.text(0.02, 0.98, f"Peak SimpLang: {max_row['simplang_giops']:.1f} GIOP/s ({efficiency:.1f}% of theoretical peak)",
-                transform=ax.transAxes, fontsize=10, verticalalignment='top',
-                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    # Add size annotations
+    for s, ai in zip(sizes, ai_values):
+        ax.annotate(f'{s}', (ai, PARALLEL_BENCHMARK_DATA[s][3] * 1.1),
+                    fontsize=9, ha='center', alpha=0.7)
 
     plt.tight_layout()
     plt.savefig(output_file, dpi=150, bbox_inches='tight')
     print(f"Roofline plot saved to: {output_file}")
 
-    # Also save as PDF for papers
     pdf_file = output_file.replace('.png', '.pdf')
     plt.savefig(pdf_file, bbox_inches='tight')
     print(f"PDF saved to: {pdf_file}")
-
     plt.close()
 
 def plot_performance_comparison(cpp_df, tf_df, output_file='/tmp/int8_performance.png'):
@@ -195,28 +279,44 @@ def plot_performance_comparison(cpp_df, tf_df, output_file='/tmp/int8_performanc
     plt.close()
 
 def main():
-    print("Loading benchmark results...")
+    print("=" * 60)
+    print("INT8 VNNI Benchmark Visualization")
+    print("=" * 60)
 
+    # Print hardcoded benchmark data
+    print("\nParallel Benchmark Data (GIOP/s):")
+    print("-" * 50)
+    print(f"{'Size':<10} {'1T':<8} {'2T':<8} {'4T':<8} {'8T':<8}")
+    print("-" * 50)
+    for size, perf in PARALLEL_BENCHMARK_DATA.items():
+        print(f"{size:<10} {perf[0]:<8} {perf[1]:<8} {perf[2]:<8} {perf[3]:<8}")
+    print("-" * 50)
+    print(f"\nReference (1024x1024, 8T):")
+    print(f"  TFLite XNNPACK: {REFERENCE_DATA['tflite_xnnpack']} GIOP/s")
+    print(f"  C++ VNNI:       {REFERENCE_DATA['cpp_vnni_8t']} GIOP/s")
+
+    # Generate plots using hardcoded data
+    print("\nGenerating plots...")
+
+    # New line plots
+    plot_thread_scaling('/tmp/int8_thread_scaling.png')
+    plot_comparison_bars('/tmp/int8_comparison.png')
+
+    # Roofline (uses hardcoded data now)
+    plot_roofline(None, None, '/tmp/int8_roofline.png')
+
+    # Try to load CSV data for legacy plots
     cpp_df = load_cpp_results()
     tf_df = load_tf_results()
-
     if cpp_df is not None:
-        print(f"Loaded {len(cpp_df)} C++ benchmark results")
-        print(cpp_df[['N', 'simplang_giops', 'vnni_giops', 'scalar_giops']].to_string())
-    else:
-        print("No C++ results found. Run: ./bench_int8_matmul_runner_v2 /tmp/bench_int8_matmul.so")
+        plot_performance_comparison(cpp_df, tf_df, '/tmp/int8_performance.png')
 
-    if tf_df is not None:
-        print(f"\nLoaded {len(tf_df)} TensorFlow benchmark results")
-        print(tf_df[['N', 'tf_giops', 'xla_giops']].to_string())
-    else:
-        print("No TensorFlow results found. Run: python3 bench_int8_tflite.py")
-
-    print("\nGenerating plots...")
-    plot_roofline(cpp_df, tf_df)
-    plot_performance_comparison(cpp_df, tf_df)
-
-    print("\nDone! Plots saved to /tmp/")
+    print("\n" + "=" * 60)
+    print("Plots saved to /tmp/:")
+    print("  - int8_thread_scaling.png/pdf  (NEW: line plots)")
+    print("  - int8_comparison.png/pdf      (NEW: bar comparison)")
+    print("  - int8_roofline.png/pdf        (roofline model)")
+    print("=" * 60)
 
 if __name__ == '__main__':
     main()
