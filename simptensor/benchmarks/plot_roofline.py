@@ -44,6 +44,22 @@ REFERENCE_DATA = {
     'cpp_vnni_8t': 2534,     # GIOP/s
 }
 
+# Eigen thread scaling results (from bench_int8_matmul_runner_v2)
+# Format: Size: (1T, 2T, 4T, 8T) GIOP/s
+EIGEN_PARALLEL_DATA = {
+    1024: (81, 134, 194, 275),
+    2048: (91, 162, 274, 326),
+}
+
+# Eigen single-threaded for backward compat
+EIGEN_DATA = {
+    256: 35,
+    512: 69,
+    768: 174,
+    1024: 81,
+    2048: 91,
+}
+
 def load_cpp_results(filepath='/tmp/int8_matmul_benchmark.csv'):
     """Load C++ benchmark results."""
     if not os.path.exists(filepath):
@@ -72,7 +88,14 @@ def plot_thread_scaling(output_file='/tmp/int8_thread_scaling.png'):
     for i, size in enumerate(sizes):
         perf = PARALLEL_BENCHMARK_DATA[size]
         ax1.plot(threads, perf, marker=markers[i], color=colors[i],
-                linewidth=2, markersize=8, label=f'{size}×{size}')
+                linewidth=2, markersize=8, label=f'SimpLang {size}')
+
+    # Add Eigen thread scaling (dashed lines)
+    for size in [1024, 2048]:
+        perf = EIGEN_PARALLEL_DATA[size]
+        ax1.plot(threads, perf, marker='x', color='#8c564b',
+                linewidth=1.5, markersize=6, linestyle='--', alpha=0.7,
+                label=f'Eigen {size}' if size == 1024 else None)
 
     # Add reference lines
     ax1.axhline(y=REFERENCE_DATA['tflite_xnnpack'], color='gray', linestyle='--',
@@ -93,6 +116,12 @@ def plot_thread_scaling(output_file='/tmp/int8_thread_scaling.png'):
         perf = [PARALLEL_BENCHMARK_DATA[s][i] for s in sizes]
         ax2.plot(sizes, perf, marker=markers[i], color=colors[i],
                 linewidth=2, markersize=8, label=f'{t} thread{"s" if t > 1 else ""}')
+
+    # Add Eigen line
+    eigen_sizes = list(EIGEN_DATA.keys())
+    eigen_perf = list(EIGEN_DATA.values())
+    ax2.plot(eigen_sizes, eigen_perf, marker='x', color='#8c564b', linewidth=2,
+             markersize=8, linestyle='--', label='Eigen (1T)')
 
     ax2.axhline(y=REFERENCE_DATA['tflite_xnnpack'], color='gray', linestyle='--',
                 linewidth=2, alpha=0.7, label='TFLite XNNPACK')
@@ -118,15 +147,16 @@ def plot_thread_scaling(output_file='/tmp/int8_thread_scaling.png'):
 
 def plot_comparison_bars(output_file='/tmp/int8_comparison.png'):
     """Create comparison bar chart at 1024x1024."""
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=(12, 6))
 
     # Data for 1024x1024
     implementations = ['SimpLang\n1T', 'SimpLang\n2T', 'SimpLang\n4T', 'SimpLang\n8T',
-                       'TFLite\nXNNPACK', 'C++ VNNI\n8T']
-    values = list(PARALLEL_BENCHMARK_DATA[1024]) + [REFERENCE_DATA['tflite_xnnpack'],
+                       'Eigen\n8T', 'TFLite\nXNNPACK', 'C++ VNNI\n8T']
+    values = list(PARALLEL_BENCHMARK_DATA[1024]) + [EIGEN_PARALLEL_DATA[1024][3],  # Eigen 8T
+                                                     REFERENCE_DATA['tflite_xnnpack'],
                                                      REFERENCE_DATA['cpp_vnni_8t']]
-    colors = ['#1f77b4', '#1f77b4', '#1f77b4', '#1f77b4', '#ff7f0e', '#2ca02c']
-    alphas = [0.4, 0.6, 0.8, 1.0, 0.9, 0.9]
+    colors = ['#1f77b4', '#1f77b4', '#1f77b4', '#1f77b4', '#8c564b', '#ff7f0e', '#2ca02c']
+    alphas = [0.4, 0.6, 0.8, 1.0, 0.9, 0.9, 0.9]
 
     # Create bars individually to support per-bar alpha
     x = np.arange(len(implementations))
@@ -147,10 +177,16 @@ def plot_comparison_bars(output_file='/tmp/int8_comparison.png'):
     ax.grid(True, alpha=0.3, axis='y')
 
     # Add annotation
-    ax.annotate('SimpLang 8T beats\nTFLite by 33%', xy=(3, 1760), xytext=(3.5, 2200),
+    ax.annotate('SimpLang 8T beats\nTFLite by 33%', xy=(3, 1760), xytext=(4, 2200),
                 fontsize=10, ha='center',
                 arrowprops=dict(arrowstyle='->', color='black', lw=1.5),
                 bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.7))
+
+    # Add Eigen comparison annotation
+    ax.annotate('6.4x faster\nthan Eigen 8T', xy=(3, 1760), xytext=(2, 1400),
+                fontsize=9, ha='center',
+                arrowprops=dict(arrowstyle='->', color='#8c564b', lw=1),
+                bbox=dict(boxstyle='round', facecolor='#f0e68c', alpha=0.6))
 
     plt.tight_layout()
     plt.savefig(output_file, dpi=150, bbox_inches='tight')
@@ -191,6 +227,13 @@ def plot_roofline(cpp_df, tf_df, output_file='/tmp/int8_roofline.png'):
         perf = [PARALLEL_BENCHMARK_DATA[s][i] for s in sizes]
         ax.loglog(ai_values, perf, marker='o', color=color, linewidth=2.5,
                   markersize=10, label=f'SimpLang {label}')
+
+    # Add Eigen line
+    eigen_sizes = list(EIGEN_DATA.keys())
+    eigen_ai = [s / 2 for s in eigen_sizes]
+    eigen_perf = list(EIGEN_DATA.values())
+    ax.loglog(eigen_ai, eigen_perf, marker='x', color='#8c564b', linewidth=2,
+              markersize=10, linestyle='--', label='Eigen (1T)')
 
     # Add reference point for TFLite at 1024
     ax.scatter([512], [REFERENCE_DATA['tflite_xnnpack']], marker='s', c='gray',
