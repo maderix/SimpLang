@@ -21,6 +21,12 @@ set(RUNTIME_SOURCES
     src/kernel_runtime.cpp
 )
 
+# Add GPU runtime if CUDA is enabled
+if(USE_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    list(APPEND RUNTIME_SOURCES src/gpu_runtime.cpp)
+endif()
+
 # Add debugger sources only if enabled
 if(ENABLE_DEBUGGER)
     list(APPEND RUNTIME_SOURCES
@@ -74,6 +80,7 @@ target_compile_definitions(simplang_runtime
         $<$<CONFIG:Debug>:SIMD_DEBUG=1>
         $<$<BOOL:${ENABLE_DEBUGGER}>:ENABLE_DEBUGGER=1>
         $<$<BOOL:${ENABLE_PROFILING}>:ENABLE_PROFILING=1>
+        $<$<BOOL:${USE_CUDA}>:USE_CUDA=1>
 )
 
 # Compiler options
@@ -107,6 +114,11 @@ target_link_libraries(simplang_runtime
         Threads::Threads
         ${CMAKE_DL_LIBS}
 )
+
+# Link CUDA libraries if enabled
+if(USE_CUDA)
+    target_link_libraries(simplang_runtime PRIVATE CUDA::cudart CUDA::cublas)
+endif()
 
 # Add readline libraries only if not cross-compiling
 if(NOT CMAKE_CROSSCOMPILING)

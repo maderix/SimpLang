@@ -1,0 +1,54 @@
+# CUDA-enabled Dockerfile for SimpLang GPU Backend Development
+# Based on NVIDIA CUDA 12.4 with Ubuntu 22.04
+
+FROM nvidia/cuda:12.4.0-devel-ubuntu22.04
+
+# Avoid interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    # LLVM/MLIR dependencies
+    llvm-14-dev \
+    llvm-14-tools \
+    mlir-14-tools \
+    libmlir-14-dev \
+    clang-14 \
+    # Build tools
+    cmake \
+    ninja-build \
+    pkg-config \
+    git \
+    # Libraries
+    libboost-all-dev \
+    libreadline-dev \
+    libgtest-dev \
+    flex \
+    bison \
+    # Utilities
+    vim \
+    wget \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set up LLVM alternatives
+RUN update-alternatives --install /usr/bin/llvm-config llvm-config /usr/bin/llvm-config-14 100 && \
+    update-alternatives --install /usr/bin/clang clang /usr/bin/clang-14 100 && \
+    update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-14 100
+
+# Set CUDA environment variables
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=${CUDA_HOME}/bin:${PATH}
+ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
+
+# Verify CUDA installation
+RUN nvcc --version
+
+# Set working directory
+WORKDIR /app
+
+# Copy source code (for initial build, volumes will override in dev)
+COPY . .
+
+# Default command - interactive shell
+CMD ["/bin/bash"]
