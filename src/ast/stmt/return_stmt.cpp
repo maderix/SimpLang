@@ -8,6 +8,11 @@
 llvm::Value* ReturnAST::codeGen(CodeGenContext& context) {
     LOG_TRACE("Generating return statement");
 
+    // Set debug location for return statement
+    if (getLine() > 0) {
+        context.setCurrentDebugLocation(getLine());
+    }
+
     llvm::Value* returnValue = nullptr;
     if (expression) {
         returnValue = expression->codeGen(context);

@@ -10,9 +10,16 @@
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/GlobalVariable.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/DIBuilder.h>
+#include <llvm/IR/DebugInfoMetadata.h>
 
 llvm::Value* VariableDeclarationAST::codeGen(CodeGenContext& context) {
     LOG_DEBUG("Generating variable declaration for ", name);
+
+    // Set debug location for this statement
+    if (getLine() > 0) {
+        context.setCurrentDebugLocation(getLine());
+    }
 
     // Get initial value if it exists
     llvm::Value* initVal = nullptr;
@@ -145,6 +152,47 @@ llvm::Value* VariableDeclarationAST::codeGen(CodeGenContext& context) {
         }
 
         context.getBuilder().CreateStore(storeValue, alloc);
+    }
+
+    // Create debug info for local variable
+    if (alloc && context.getDebugBuilder() && context.getCurrentDebugScope()) {
+        llvm::DIBuilder* debugBuilder = context.getDebugBuilder();
+        llvm::DIScope* scope = context.getCurrentDebugScope();
+        llvm::DIFile* file = context.getDebugFile();
+        unsigned lineNum = getLine() > 0 ? getLine() : 1;
+
+        // Create debug type based on variable type
+        llvm::DIType* diType = nullptr;
+        if (varType->isFloatTy()) {
+            diType = debugBuilder->createBasicType("float", 32, llvm::dwarf::DW_ATE_float);
+        } else if (varType->isDoubleTy()) {
+            diType = debugBuilder->createBasicType("double", 64, llvm::dwarf::DW_ATE_float);
+        } else if (varType->isIntegerTy(32)) {
+            diType = debugBuilder->createBasicType("int", 32, llvm::dwarf::DW_ATE_signed);
+        } else if (varType->isIntegerTy(64)) {
+            diType = debugBuilder->createBasicType("long", 64, llvm::dwarf::DW_ATE_signed);
+        } else {
+            // Default to int for unknown types
+            diType = debugBuilder->createBasicType("int", 32, llvm::dwarf::DW_ATE_signed);
+        }
+
+        // Create DILocalVariable
+        llvm::DILocalVariable* debugVar = debugBuilder->createAutoVariable(
+            scope,
+            name,
+            file,
+            lineNum,
+            diType
+        );
+
+        // Insert declare intrinsic
+        debugBuilder->insertDeclare(
+            alloc,
+            debugVar,
+            debugBuilder->createExpression(),
+            llvm::DILocation::get(context.getContext(), lineNum, 0, scope),
+            context.getBuilder().GetInsertBlock()
+        );
     }
 
     // Add to symbol table (only for local variables - global variables already added)

@@ -218,8 +218,30 @@ public:
   /// Get a location for debugging (file:line:col)
   mlir::Location getLocation(int line, int col);
 
+  /// Get a location with variable name for debug info
+  /// Uses NameLoc to embed variable name for later extraction
+  mlir::Location getVariableLocation(int line, int col, const std::string& varName);
+
   /// Get an unknown location (fallback)
   mlir::Location getUnknownLocation() { return builder.getUnknownLoc(); }
+
+  //===--------------------------------------------------------------------===//
+  // Debug Info Support
+  //===--------------------------------------------------------------------===//
+
+  /// Variable debug info structure (public for use by pipeline)
+  struct VarDebugInfo {
+    std::string name;
+    unsigned line;
+    unsigned col;
+    bool isArg;
+    unsigned argNo;  // 1-indexed if isArg
+  };
+
+  /// Get variable debug info for all functions
+  const std::map<std::string, std::vector<VarDebugInfo>>& getFunctionVariables() const {
+    return functionVariables;
+  }
 
 private:
   //===--------------------------------------------------------------------===//
@@ -238,6 +260,10 @@ private:
   /// Symbol table: maps variable names to MLIR SSA values
   /// Uses vector of maps for nested scopes
   std::vector<std::map<std::string, mlir::Value>> symbolTable;
+
+  /// Variable debug info: tracks variable declarations for debug info generation
+  /// Maps function name -> vector of VarDebugInfo
+  std::map<std::string, std::vector<VarDebugInfo>> functionVariables;
 
   /// Dimension tracking: maps variable names to their runtime dimension values
   /// Used for computing flattened indices in multi-dimensional array access

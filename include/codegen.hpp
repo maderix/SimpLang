@@ -48,6 +48,7 @@ private:
 
     // SIMD support
     bool simd_enabled = false;
+    bool debugBuildMode = false;  // When true, skip FPM optimizations
     void initializeMallocFree();
     void initializeSimpBLASFunctions();
     void initializeSIMDFunctions();
@@ -113,6 +114,10 @@ public:
     CodeGenContext();
     ~CodeGenContext();
 
+    // Debug build mode - disables FPM optimizations
+    void setDebugBuild(bool enable) { debugBuildMode = enable; }
+    bool isDebugBuild() const { return debugBuildMode; }
+
     // SIMD control methods
     void enableSIMD() { simd_enabled = true; }
     bool isSIMDEnabled() const { return simd_enabled; }
@@ -150,6 +155,10 @@ public:
     llvm::Module* getModule() { return module.get(); }
     llvm::IRBuilder<>& getBuilder() { return builder; }
     llvm::DIBuilder* getDebugBuilder() { return debugBuilder.get(); }
+    llvm::DIFile* getDebugFile() { return debugFile; }
+    llvm::DICompileUnit* getDebugCompileUnit() { return debugCompileUnit; }
+    llvm::DIScope* getCurrentDebugScope() { return currentDebugScope; }
+    void setCurrentDebugScope(llvm::DIScope* scope) { currentDebugScope = scope; }
     MemoryTracker* getMemoryTracker() { return memoryTracker.get(); }
     llvm::legacy::FunctionPassManager* getFPM() { return fpm.get(); }
     

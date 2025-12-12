@@ -16,6 +16,9 @@
         fprintf(stderr, "Error: %s at symbol \"%s\" on line %d\n", s, yytext, yylineno);
     }
 
+    // NOTE: SET_LOC uses @$ which must be referenced within the grammar rule actions
+    // We'll set locations directly in rules using @$.first_line
+
     // Add helper function to convert raw pointers to unique_ptr
     std::unique_ptr<ExprAST> makeUnique(ExprAST* ptr) {
         return std::unique_ptr<ExprAST>(ptr);
@@ -55,10 +58,27 @@
 %}
 
 %define parse.trace
+%locations
 
 %code requires {
     #include "ast.hpp"
 }
+
+%{
+    // Access to yylloc from lexer
+    #define YYLLOC_DEFAULT(Cur, Rhs, N) \
+        do { \
+            if (N) { \
+                (Cur).first_line = YYRHSLOC(Rhs, 1).first_line; \
+                (Cur).first_column = YYRHSLOC(Rhs, 1).first_column; \
+                (Cur).last_line = YYRHSLOC(Rhs, N).last_line; \
+                (Cur).last_column = YYRHSLOC(Rhs, N).last_column; \
+            } else { \
+                (Cur).first_line = (Cur).last_line = YYRHSLOC(Rhs, 0).last_line; \
+                (Cur).first_column = (Cur).last_column = YYRHSLOC(Rhs, 0).last_column; \
+            } \
+        } while (0)
+%}
 
 %union {
     BlockAST *block;
@@ -203,22 +223,26 @@ block : TLBRACE stmts TRBRACE { $$ = $2; }
       | TLBRACE TRBRACE { $$ = new BlockAST(); }
       ;
 
-var_decl : TVAR TIDENTIFIER { $$ = new VariableDeclarationAST(*$2, nullptr); }
-         | TVAR TIDENTIFIER '=' expr { $$ = new VariableDeclarationAST(*$2, $4); }
-         | TVAR TIDENTIFIER slice_type { $$ = new VariableDeclarationAST(*$2, nullptr, nullptr, $3); }
+var_decl : TVAR TIDENTIFIER { $$ = new VariableDeclarationAST(*$2, nullptr); $$->setLocation(@1.first_line); }
+         | TVAR TIDENTIFIER '=' expr { $$ = new VariableDeclarationAST(*$2, $4); $$->setLocation(@1.first_line); }
+         | TVAR TIDENTIFIER slice_type { $$ = new VariableDeclarationAST(*$2, nullptr, nullptr, $3); $$->setLocation(@$.first_line); }
          | TVAR TIDENTIFIER slice_type '=' slice_expr
-           { $$ = new VariableDeclarationAST(*$2, $5, nullptr, $3); }
+           { $$ = new VariableDeclarationAST(*$2, $5, nullptr, $3); $$->setLocation(@$.first_line); }
          | type_spec TIDENTIFIER {
              $$ = new VariableDeclarationAST(*$2, nullptr, std::unique_ptr<TypeInfo>($1));
+             $$->setLocation(@$.first_line);
            }
          | type_spec TIDENTIFIER '=' expr {
              $$ = new VariableDeclarationAST(*$2, $4, std::unique_ptr<TypeInfo>($1));
+             $$->setLocation(@$.first_line);
            }
          | array_type TIDENTIFIER {
              $$ = new VariableDeclarationAST(*$2, nullptr, std::unique_ptr<TypeInfo>($1));
+             $$->setLocation(@$.first_line);
            }
          | array_type TIDENTIFIER '=' expr {
              $$ = new VariableDeclarationAST(*$2, $4, std::unique_ptr<TypeInfo>($1));
+             $$->setLocation(@$.first_line);
            }
          | array_type TIDENTIFIER '=' TLBRACE expr_list TRBRACE {
              ArrayTypeInfo* arrType = static_cast<ArrayTypeInfo*>($1);
@@ -228,13 +252,16 @@ var_decl : TVAR TIDENTIFIER { $$ = new VariableDeclarationAST(*$2, nullptr); }
                  true  // isInitializerList = true
              );
              $$ = new VariableDeclarationAST(*$2, initExpr, std::unique_ptr<TypeInfo>($1));
+             $$->setLocation(@$.first_line);
              delete $5;
            }
          | tensor_type TIDENTIFIER {
              $$ = new VariableDeclarationAST(*$2, nullptr, std::unique_ptr<TypeInfo>($1));
+             $$->setLocation(@$.first_line);
            }
          | tensor_type TIDENTIFIER '=' expr {
              $$ = new VariableDeclarationAST(*$2, $4, std::unique_ptr<TypeInfo>($1));
+             $$->setLocation(@$.first_line);
            }
          | tensor_type TIDENTIFIER '=' TLBRACE expr_list TRBRACE {
              TensorTypeInfo* tensorType = static_cast<TensorTypeInfo*>($1);
@@ -244,6 +271,7 @@ var_decl : TVAR TIDENTIFIER { $$ = new VariableDeclarationAST(*$2, nullptr); }
                  true  // isInitializerList = true
              );
              $$ = new VariableDeclarationAST(*$2, initExpr, std::unique_ptr<TypeInfo>($1));
+             $$->setLocation(@$.first_line);
              delete $5;
            }
          ;
@@ -396,10 +424,10 @@ param_decl : TVAR TIDENTIFIER { $$ = new VariableDeclarationAST(*$2, nullptr); }
              }
            ;
 
-func_decl : TFUNC TIDENTIFIER TLPAREN func_decl_args TRPAREN block 
-            { $$ = new FunctionAST(*$2, $4, $6); }
-          | TFUNC TIDENTIFIER TLPAREN func_decl_args TRPAREN TARROW type_spec block 
-            { $$ = new FunctionAST(*$2, $4, $8, std::unique_ptr<TypeInfo>($7)); }
+func_decl : TFUNC TIDENTIFIER TLPAREN func_decl_args TRPAREN block
+            { $$ = new FunctionAST(*$2, $4, $6); $$->setLocation(@$.first_line); }
+          | TFUNC TIDENTIFIER TLPAREN func_decl_args TRPAREN TARROW type_spec block
+            { $$ = new FunctionAST(*$2, $4, $8, std::unique_ptr<TypeInfo>($7)); $$->setLocation(@$.first_line); }
           ;
 
 func_decl_args : /* empty */ { $$ = new std::vector<VariableDeclarationAST*>(); }
@@ -407,14 +435,14 @@ func_decl_args : /* empty */ { $$ = new std::vector<VariableDeclarationAST*>(); 
                | func_decl_args TCOMMA param_decl { $1->push_back($3); $$ = $1; }
                ;
 
-if_stmt : TIF TLPAREN expr TRPAREN block { $$ = new IfAST($3, $5, nullptr); }
-        | TIF TLPAREN expr TRPAREN block TELSE block { $$ = new IfAST($3, $5, $7); }
+if_stmt : TIF TLPAREN expr TRPAREN block { $$ = new IfAST($3, $5, nullptr); $$->setLocation(@$.first_line); }
+        | TIF TLPAREN expr TRPAREN block TELSE block { $$ = new IfAST($3, $5, $7); $$->setLocation(@$.first_line); }
         ;
 
-while_stmt : TWHILE TLPAREN expr TRPAREN block { $$ = new WhileAST($3, $5); }
+while_stmt : TWHILE TLPAREN expr TRPAREN block { $$ = new WhileAST($3, $5); $$->setLocation(@$.first_line); }
            ;
 
-return_stmt : TRETURN expr TSEMICOLON { $$ = new ReturnAST($2); }
+return_stmt : TRETURN expr TSEMICOLON { $$ = new ReturnAST($2); $$->setLocation(@$.first_line); }
             ;
 
 include_stmt : TINCLUDE TSTRING TSEMICOLON { $$ = new IncludeStmtAST(*$2); }

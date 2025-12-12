@@ -11,7 +11,10 @@
 #define MLIR_PIPELINE_HPP
 
 #include "mlir/IR/BuiltinOps.h"
+#include <map>
 #include <memory>
+#include <string>
+#include <vector>
 
 // Forward declarations
 namespace llvm {
@@ -99,6 +102,26 @@ public:
   /// Set output path for intermediate IR dumps
   void setOutputPath(const std::string& path) { outputPath = path; }
 
+  /// Enable/disable debug info generation
+  void setEnableDebugInfo(bool enable) { enableDebugInfo = enable; }
+
+  /// Set source filename for debug info
+  void setSourceFileName(const std::string& name) { sourceFileName = name; }
+
+  /// Variable debug info structure
+  struct VarDebugInfo {
+    std::string name;
+    unsigned line;
+    unsigned col;
+    bool isArg;
+    unsigned argNo;  // 1-indexed if isArg
+  };
+
+  /// Set variable debug info for functions (from codegen)
+  void setFunctionVariables(const std::map<std::string, std::vector<VarDebugInfo>>& vars) {
+    functionVariables = vars;
+  }
+
 private:
   //===--------------------------------------------------------------------===//
   // Private Members
@@ -128,6 +151,15 @@ private:
   /// Output path for intermediate IR dumps
   std::string outputPath;
 
+  /// Enable debug info generation (default: false)
+  bool enableDebugInfo = false;
+
+  /// Source filename for debug info
+  std::string sourceFileName;
+
+  /// Variable debug info for functions (from codegen)
+  std::map<std::string, std::vector<VarDebugInfo>> functionVariables;
+
   //===--------------------------------------------------------------------===//
   // Private Helpers: Pipeline Builders
   //===--------------------------------------------------------------------===//
@@ -147,6 +179,10 @@ private:
   /// Apply vector lowering patterns and LLVM dialect conversion
   /// Must be called after the pass pipeline runs (requires direct module access)
   bool applyLLVMDialectConversion();
+
+  /// Add debug information to the LLVM module
+  /// Creates DICompileUnit, DISubprograms for functions with source locations
+  void addDebugInfoToModule(llvm::Module* module);
 };
 
 } // namespace simp

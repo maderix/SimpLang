@@ -5,11 +5,29 @@
 
 #define SAVE_TOKEN  yylval.string = new std::string(yytext, yyleng)
 extern "C" int yywrap() { return 1; }
+
+// Track column for location info
+static int yycolumn = 1;
+
+// Update location at each token - note: yylineno is auto-updated by flex
+#define YY_USER_ACTION \
+    yylloc.first_line = yylineno; \
+    yylloc.last_line = yylineno; \
+    yylloc.first_column = yycolumn; \
+    yylloc.last_column = yycolumn + yyleng - 1; \
+    for (int i = 0; i < yyleng; i++) { \
+        if (yytext[i] == '\n') { \
+            yycolumn = 1; \
+        } else { \
+            yycolumn++; \
+        } \
+    }
 %}
 
 %%
 
-[ \t\r\n]             ;  /* Skip whitespace */
+[ \t\r]+              ;  /* Skip whitespace (except newline) */
+\n                    ;  /* Newlines - yylineno auto-incremented by flex */
 "//".*                ;  /* Single-line comments */
 "/*"([^*]|\*+[^*/])*\*+"/" ; /* Multi-line comments */
 

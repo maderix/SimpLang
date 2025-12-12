@@ -38,12 +38,30 @@ enum class ASTKind {
     IncludeStmt
 };
 
+// Source location tracking for debug info
+struct SourceLocation {
+    unsigned line = 0;
+    unsigned column = 0;
+
+    SourceLocation() = default;
+    SourceLocation(unsigned l, unsigned c = 0) : line(l), column(c) {}
+};
+
 // Base AST classes
 class AST {
+protected:
+    SourceLocation loc;
 public:
     virtual ~AST() {}
     virtual llvm::Value* codeGen(CodeGenContext& context) = 0;
     virtual ASTKind getKind() const = 0;
+
+    // Source location accessors
+    void setLocation(unsigned line, unsigned col = 0) { loc = SourceLocation(line, col); }
+    void setLocation(const SourceLocation& l) { loc = l; }
+    unsigned getLine() const { return loc.line; }
+    unsigned getColumn() const { return loc.column; }
+    const SourceLocation& getLocation() const { return loc; }
 };
 
 class ExprAST : public AST {

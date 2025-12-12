@@ -12,7 +12,6 @@ class VariableDeclarationAST : public StmtAST {
     ExprAST* assignmentExpr;
     SliceTypeAST* sliceType;
     std::unique_ptr<TypeInfo> staticType;  // Optional static type
-    unsigned lineNo;
     bool isGlobal;
     std::string typeName;  // For debug info
 
@@ -25,8 +24,10 @@ public:
                           unsigned line = 0,
                           bool global = false)
         : name(name), assignmentExpr(expr), sliceType(slice),
-          staticType(std::move(type)), lineNo(line), isGlobal(global),
-          typeName(staticType ? staticType->toString() : "double") {}
+          staticType(std::move(type)), isGlobal(global),
+          typeName(staticType ? staticType->toString() : "double") {
+        setLocation(line);  // Use base class location tracking
+    }
 
     // Legacy constructor for backward compatibility
     VariableDeclarationAST(const std::string& name,
@@ -36,7 +37,9 @@ public:
                           bool global,
                           const std::string& type)
         : name(name), assignmentExpr(expr), sliceType(slice),
-          staticType(nullptr), lineNo(line), isGlobal(global), typeName(type) {}
+          staticType(nullptr), isGlobal(global), typeName(type) {
+        setLocation(line);  // Use base class location tracking
+    }
 
     virtual ~VariableDeclarationAST() {
         delete assignmentExpr;
@@ -48,7 +51,7 @@ public:
     SliceType getSliceType() const {
         return sliceType ? sliceType->getType() : SliceType::SSE_SLICE;
     }
-    unsigned getLine() const { return lineNo; }
+    // getLine() is now inherited from AST base class
     bool isGlobalVariable() const { return isGlobal; }
     const std::string& getTypeName() const { return typeName; }
     ExprAST* getAssignmentExpr() const { return assignmentExpr; }

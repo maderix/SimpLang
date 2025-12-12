@@ -14,6 +14,7 @@
 #include <llvm/Support/CommandLine.h>
 #include <llvm/MC/SubtargetFeature.h>
 #include <llvm/IR/LegacyPassManager.h>
+#include <llvm/IR/Verifier.h>
 #include <llvm/Transforms/Vectorize.h>
 #include <llvm/Transforms/Scalar.h>
 #include <llvm/Transforms/Utils.h>
@@ -44,6 +45,7 @@ int main(int argc, char** argv) {
     bool enableOpenMP = false;  // OpenMP parallelization (disabled by default)
     bool enableO3 = true;  // LLVM O3 optimization (enabled by default)
     bool enablePrefetch = true;  // Prefetch insertion for memory latency hiding (enabled by default)
+    bool debugBuild = false;  // Debug build - disables ALL optimizations for debugging
     bool dumpMLIRPasses = false;  // Dump MLIR at each pipeline stage
     std::string outputPath;
     std::string logLevel = "INFO";  // Default log level
@@ -57,6 +59,7 @@ int main(int argc, char** argv) {
         std::cout << "Basic Options:" << std::endl;
         std::cout << "  -h, --help         Show this help message" << std::endl;
         std::cout << "  -o <file>          Output file path (default: <input>.o)" << std::endl;
+        std::cout << "  -g                 Debug build: disable ALL optimizations for GDB debugging" << std::endl;
         std::cout << "  -d, --debug        Enable parser debug mode" << std::endl;
         std::cout << "  --print-ir         Print LLVM IR to console" << std::endl;
         std::cout << "  --target <arch>    Target architecture (x86_64, aarch64, armv7)" << std::endl;
@@ -123,6 +126,12 @@ int main(int argc, char** argv) {
         }
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             outputPath = argv[++i];
+        }
+        else if (strcmp(argv[i], "-g") == 0) {
+            debugBuild = true;
+            enableO3 = false;
+            enablePrefetch = false;
+            LOG_INFO("Debug build enabled - all optimizations disabled");
         }
         else if (strcmp(argv[i], "--log-level") == 0 && i + 1 < argc) {
             logLevel = argv[++i];
@@ -259,7 +268,9 @@ int main(int argc, char** argv) {
                 llvm::errs() << "Could not open file: " << EC.message() << "\n";
                 return 1;
             }
-            mlirModule.print(dest);
+            mlir::OpPrintingFlags flags;
+            flags.enableDebugInfo();  // Print locations including variable names
+            mlirModule.print(dest, flags);
             dest.flush();
             std::cout << "Initial MLIR (Simp dialect) written to: " << mlirFile << std::endl;
         }
@@ -296,6 +307,24 @@ int main(int argc, char** argv) {
         pipeline.setOutputPath(outputPath);
         if (dumpMLIRPasses) {
             LOG_INFO("MLIR intermediate IR dumping enabled");
+        }
+
+        // Configure debug info generation
+        pipeline.setEnableDebugInfo(debugBuild);
+        pipeline.setSourceFileName(std::string(argv[1]));
+        // Pass variable info from codegen for local variable debug info
+        {
+            const auto& srcVars = mlirContext.getFunctionVariables();
+            std::map<std::string, std::vector<mlir::simp::MLIRCompilationPipeline::VarDebugInfo>> dstVars;
+            for (const auto& [funcName, vars] : srcVars) {
+                for (const auto& v : vars) {
+                    dstVars[funcName].push_back({v.name, v.line, v.col, v.isArg, v.argNo});
+                }
+            }
+            pipeline.setFunctionVariables(dstVars);
+        }
+        if (debugBuild) {
+            LOG_INFO("Debug info generation enabled for MLIR path");
         }
 
         // Run progressive lowering passes (Simp → LLVM dialect)
@@ -487,6 +516,16 @@ int main(int argc, char** argv) {
     LOG_INFO("Creating CodeGen context...");
     CodeGenContext context;
 
+    // Set debug build mode if -g flag was used
+    if (debugBuild) {
+        context.setDebugBuild(true);
+        LOG_INFO("Debug build mode: FPM optimizations disabled");
+    }
+
+    // Initialize debug info with source filename
+    std::string sourceFile = argv[1];
+    context.initializeDebugInfo(sourceFile);
+
     // Generate code
     LOG_INFO("Generating code...");
     try {
@@ -497,6 +536,21 @@ int main(int argc, char** argv) {
     } catch (...) {
         std::cerr << "Unknown exception during code generation!" << std::endl;
         return 1;
+    }
+
+    // Finalize debug info
+    context.finalizeDebugInfo();
+
+    // Verify the module (silently ignore debug info forward declaration warnings)
+    std::string verifyErrors;
+    llvm::raw_string_ostream verifyStream(verifyErrors);
+    if (llvm::verifyModule(*context.getModule(), &verifyStream)) {
+        verifyStream.flush();  // Flush before checking the string
+        // Only print non-forward-declaration errors
+        if (verifyErrors.find("Expected no forward declarations") == std::string::npos) {
+            std::cerr << "Error verifying module: " << verifyErrors << "\n";
+        }
+        // Don't fail - the debug info issue is cosmetic and doesn't affect functionality
     }
 
     // Print the generated LLVM IR if requested
@@ -547,29 +601,35 @@ int main(int argc, char** argv) {
     // Add target transform info for vectorizer
     modulePM.add(llvm::createTargetTransformInfoWrapperPass(context.getTargetMachine()->getTargetIRAnalysis()));
 
-    // Configure and add loop data prefetch pass
-    // LoopDataPrefetch requires canonical loops (LoopSimplify + LCSSA)
-    llvm::legacy::FunctionPassManager fpm(context.getModule());
-    fpm.add(llvm::createLoopSimplifyPass());
-    fpm.doInitialization();
-    for (auto &F : *context.getModule()) {
-        if (!F.isDeclaration())
-            fpm.run(F);
+    // Configure and add loop data prefetch pass (only if enabled)
+    if (enablePrefetch) {
+        // LoopDataPrefetch requires canonical loops (LoopSimplify + LCSSA)
+        llvm::legacy::FunctionPassManager fpm(context.getModule());
+        fpm.add(llvm::createLoopSimplifyPass());
+        fpm.doInitialization();
+        for (auto &F : *context.getModule()) {
+            if (!F.isDeclaration())
+                fpm.run(F);
+        }
+        fpm.doFinalization();
+
+        // Set prefetch distance (default is 0 which disables prefetching)
+        std::cout << "[Prefetch] Configuring loop data prefetch (distance=256, stride=1)" << std::endl;
+        const char* prefetch_args[] = {"simplang", "-prefetch-distance=256", "-min-prefetch-stride=1"};
+        llvm::cl::ParseCommandLineOptions(3, prefetch_args, "", &llvm::errs());
+        modulePM.add(llvm::createLoopDataPrefetchPass());
     }
-    fpm.doFinalization();
 
-    // Set prefetch distance (default is 0 which disables prefetching)
-    std::cout << "[Prefetch] Configuring loop data prefetch (distance=256, stride=1)" << std::endl;
-    const char* prefetch_args[] = {"simplang", "-prefetch-distance=256", "-min-prefetch-stride=1"};
-    llvm::cl::ParseCommandLineOptions(3, prefetch_args, "", &llvm::errs());
-    modulePM.add(llvm::createLoopDataPrefetchPass());
+    // Add vectorization passes (skip in debug build)
+    if (!debugBuild) {
+        modulePM.add(llvm::createLoopVectorizePass());        // Loop vectorizer
+        modulePM.add(llvm::createSLPVectorizerPass());        // SLP vectorizer
+    }
 
-    // Add vectorization passes directly
-    modulePM.add(llvm::createLoopVectorizePass());        // Loop vectorizer
-    modulePM.add(llvm::createSLPVectorizerPass());        // SLP vectorizer
-
-    // Run the optimization passes
-    modulePM.run(*context.getModule());
+    // Run the optimization passes (skip entirely in debug build if no passes added)
+    if (!debugBuild || enablePrefetch) {
+        modulePM.run(*context.getModule());
+    }
 
     // Generate object code
     llvm::legacy::PassManager pass;

@@ -6,6 +6,8 @@
 #include <llvm/IR/Function.h>
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/IR/DIBuilder.h>
+#include <llvm/IR/DebugInfoMetadata.h>
 
 llvm::Value* FunctionAST::codeGen(CodeGenContext& context) {
     std::vector<llvm::Type*> argTypes;
@@ -66,6 +68,39 @@ llvm::Value* FunctionAST::codeGen(CodeGenContext& context) {
         context.getModule()
     );
 
+    // Create debug info for function
+    if (auto* debugBuilder = context.getDebugBuilder()) {
+        llvm::DIFile* file = context.getDebugFile();
+        llvm::DIScope* scope = context.getDebugCompileUnit();
+
+        // Create subroutine type (function signature)
+        llvm::SmallVector<llvm::Metadata*, 8> paramTypes;
+        paramTypes.push_back(debugBuilder->createBasicType("float", 32, llvm::dwarf::DW_ATE_float)); // return type
+        for (size_t i = 0; i < argTypes.size(); i++) {
+            paramTypes.push_back(debugBuilder->createBasicType("float", 32, llvm::dwarf::DW_ATE_float));
+        }
+        llvm::DISubroutineType* funcType = debugBuilder->createSubroutineType(
+            debugBuilder->getOrCreateTypeArray(paramTypes));
+
+        // Create DISubprogram
+        unsigned lineNum = getLine() > 0 ? getLine() : 1;
+        llvm::DISubprogram* sp = debugBuilder->createFunction(
+            scope,
+            name,
+            llvm::StringRef(),
+            file,
+            lineNum,  // Line number
+            funcType,
+            lineNum,  // Scope line
+            llvm::DINode::FlagPrototyped,
+            llvm::DISubprogram::SPFlagDefinition
+        );
+        function->setSubprogram(sp);
+        context.setCurrentDebugScope(sp);
+        // Set initial debug location to function's line
+        context.setCurrentDebugLocation(lineNum);
+    }
+
     // Create basic block
     llvm::BasicBlock* bb = llvm::BasicBlock::Create(context.getContext(), "entry", function);
     context.getBuilder().SetInsertPoint(bb);
@@ -89,8 +124,8 @@ llvm::Value* FunctionAST::codeGen(CodeGenContext& context) {
         // Verify function
         llvm::verifyFunction(*function);
 
-        // Run optimization passes on the function
-        if (context.getFPM()) {
+        // Run optimization passes on the function (skip in debug build)
+        if (context.getFPM() && !context.isDebugBuild()) {
             context.getFPM()->run(*function);
         }
 

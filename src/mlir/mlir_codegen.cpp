@@ -61,7 +61,8 @@ void MLIRCodeGenContext::initializeMLIRContext() {
 void MLIRCodeGenContext::createModule(const std::string& moduleName) {
   // Create the MLIR module
   // ModuleOp::create expects Optional<StringRef>
-  module = mlir::ModuleOp::create(builder.getUnknownLoc(), llvm::StringRef(moduleName));
+  // Use line 0 for module-level location
+  module = mlir::ModuleOp::create(getLocation(0, 0), llvm::StringRef(moduleName));
 }
 
 //===----------------------------------------------------------------------===//
@@ -498,6 +499,15 @@ mlir::Location MLIRCodeGenContext::getLocation(int line, int col) {
   return mlir::FileLineColLoc::get(&mlirContext, sourceFileName, line, col);
 }
 
+mlir::Location MLIRCodeGenContext::getVariableLocation(int line, int col, const std::string& varName) {
+  // Create a FusedLoc that combines file location with variable name
+  // This allows us to track variable names through MLIR lowering for debug info
+  auto fileLoc = mlir::FileLineColLoc::get(&mlirContext, sourceFileName, line, col);
+  auto nameLoc = mlir::NameLoc::get(
+      mlir::StringAttr::get(&mlirContext, "var:" + varName), fileLoc);
+  return nameLoc;
+}
+
 //===----------------------------------------------------------------------===//
 // AST Lowering - Main Entry Point
 //===----------------------------------------------------------------------===//
@@ -604,7 +614,7 @@ mlir::Value MLIRCodeGenContext::lowerExpression(ExprAST* expr) {
 }
 
 mlir::Value MLIRCodeGenContext::lowerLiteral(NumberExprAST* literal) {
-  auto loc = getUnknownLocation();
+  auto loc = getLocation(literal->getLine(), literal->getColumn());
 
   // Determine type based on the literal value using accessor
   double val = literal->getValue();
@@ -653,7 +663,7 @@ mlir::Value MLIRCodeGenContext::lowerAssignment(AssignmentExprAST* assignment) {
 }
 
 mlir::Value MLIRCodeGenContext::lowerBinaryOp(BinaryExprAST* binOp) {
-  auto loc = getUnknownLocation();
+  auto loc = getLocation(binOp->getLine(), binOp->getColumn());
 
   // Lower left and right operands using accessors
   mlir::Value lhs = lowerExpression(binOp->getLeft());
@@ -808,7 +818,7 @@ mlir::Value MLIRCodeGenContext::lowerBinaryOp(BinaryExprAST* binOp) {
 }
 
 mlir::Value MLIRCodeGenContext::lowerUnaryOp(UnaryExprAST* unaryOp) {
-  auto loc = getUnknownLocation();
+  auto loc = getLocation(unaryOp->getLine(), unaryOp->getColumn());
 
   // Lower the operand
   mlir::Value operand = lowerExpression(unaryOp->getOperand());
@@ -832,7 +842,7 @@ mlir::Value MLIRCodeGenContext::lowerUnaryOp(UnaryExprAST* unaryOp) {
 }
 
 mlir::Value MLIRCodeGenContext::lowerCast(CastExprAST* castExpr) {
-  auto loc = getUnknownLocation();
+  auto loc = getLocation(castExpr->getLine(), castExpr->getColumn());
 
   // Lower the expression being cast
   mlir::Value value = lowerExpression(castExpr->getExpr());
@@ -893,7 +903,7 @@ mlir::Value MLIRCodeGenContext::lowerCast(CastExprAST* castExpr) {
 }
 
 mlir::Value MLIRCodeGenContext::lowerArrayCreate(ArrayCreateExprAST* arrayCreate) {
-  auto loc = getUnknownLocation();
+  auto loc = getLocation(arrayCreate->getLine(), arrayCreate->getColumn());
 
   const auto& expressions = arrayCreate->getDimensions();
   if (expressions.empty()) {
@@ -953,7 +963,7 @@ mlir::Value MLIRCodeGenContext::lowerArrayCreate(ArrayCreateExprAST* arrayCreate
 
 mlir::Value MLIRCodeGenContext::lowerArrayAccess(ArrayAccessExprAST* arrayAccess,
                                                   mlir::Value newValue) {
-  auto loc = getUnknownLocation();
+  auto loc = getLocation(arrayAccess->getLine(), arrayAccess->getColumn());
 
   // Lower the array expression
   mlir::Value array = lowerExpression(arrayAccess->getArray());
@@ -1106,7 +1116,7 @@ mlir::Value MLIRCodeGenContext::lowerArrayAccess(ArrayAccessExprAST* arrayAccess
 }
 
 mlir::Value MLIRCodeGenContext::lowerArrayStore(ArrayStoreExprAST* arrayStore) {
-  auto loc = getUnknownLocation();
+  auto loc = getLocation(arrayStore->getLine(), arrayStore->getColumn());
 
   // Check if we're storing to a variable (need to update symbol table)
   std::string varName;
@@ -1251,7 +1261,7 @@ mlir::Value MLIRCodeGenContext::lowerArrayStore(ArrayStoreExprAST* arrayStore) {
 }
 
 mlir::Value MLIRCodeGenContext::lowerMatMul(MatMulExprAST* matmul) {
-  auto loc = getUnknownLocation();
+  auto loc = getLocation(matmul->getLine(), matmul->getColumn());
 
   // Lower the left-hand side matrix (A: MxK)
   mlir::Value lhs = lowerExpression(matmul->getLHS());
@@ -1326,7 +1336,7 @@ mlir::Value MLIRCodeGenContext::lowerMatMul(MatMulExprAST* matmul) {
 }
 
 mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
-  auto loc = getUnknownLocation();
+  auto loc = getLocation(call->getLine(), call->getColumn());
 
   // Get the callee name
   const std::string& calleeName = call->getCallee();
@@ -2280,15 +2290,17 @@ mlir::LogicalResult MLIRCodeGenContext::lowerDeclaration(VariableDeclarationAST*
 
   mlir::Value initValue;
 
+  // Use variable location to embed variable name for debug info
+  auto varLoc = getVariableLocation(decl->getLine(), decl->getColumn(), decl->getName());
+
   // Handle uninitialized tensor declarations (auto-create tensor)
   if (!initExpr && decl->isStaticallyTyped() && decl->getStaticType()->isTensor()) {
-    auto loc = getUnknownLocation();
     auto tensorType = getMLIRType(const_cast<TypeInfo*>(decl->getStaticType()));
-    initValue = builder.create<mlir::simp::TensorCreateOp>(loc, tensorType);
+    initValue = builder.create<mlir::simp::TensorCreateOp>(varLoc, tensorType);
   }
   // Handle tensor declarations with initializer lists (e.g., f32<2,3> a = {1.0, 2.0, ...})
   else if (arrayCreate && decl->isStaticallyTyped() && decl->getStaticType()->isTensor()) {
-    auto loc = getUnknownLocation();
+    auto loc = varLoc;
     // Get the full tensor type from the declaration
     auto tensorType = getMLIRType(const_cast<TypeInfo*>(decl->getStaticType()));
     auto simpTensorType = tensorType.dyn_cast<mlir::simp::SimpTensorType>();
@@ -2359,7 +2371,7 @@ mlir::LogicalResult MLIRCodeGenContext::lowerDeclaration(VariableDeclarationAST*
     if (funcCall->getCallee() == "tensor_from_array") {
       LOG_DEBUG("Processing tensor_from_array for variable: ", decl->getName());
 
-      auto loc = getUnknownLocation();
+      auto loc = varLoc;
       auto tensorType = getMLIRType(const_cast<TypeInfo*>(decl->getStaticType()));
 
       // Get arguments: tensor_from_array(array) or tensor_from_array(array, offset)
@@ -2407,11 +2419,15 @@ mlir::LogicalResult MLIRCodeGenContext::lowerDeclaration(VariableDeclarationAST*
       LOG_ERROR("Failed to lower init expression for: ", decl->getName());
       return mlir::failure();
     }
+    // Update the defining operation's location to include variable name for debug info
+    if (auto* defOp = initValue.getDefiningOp()) {
+      defOp->setLoc(varLoc);
+    }
   }
   // Handle uninitialized arrays (allocate memory)
   else if (decl->isStaticallyTyped() && decl->getStaticType()->isArray()) {
     LOG_DEBUG("Creating uninitialized array for: ", decl->getName());
-    auto loc = getUnknownLocation();
+    auto loc = varLoc;
     auto arrayType = getMLIRType(const_cast<TypeInfo*>(decl->getStaticType()));
 
     // Cast to ArrayTypeInfo to get size
@@ -2438,6 +2454,14 @@ mlir::LogicalResult MLIRCodeGenContext::lowerDeclaration(VariableDeclarationAST*
   // Declare the variable in the symbol table
   declareVariable(decl->getName(), initValue);
 
+  // Record variable for debug info generation
+  if (currentFunction) {
+    std::string funcName = currentFunction.getName().str();
+    VarDebugInfo varInfo{decl->getName(), (unsigned)decl->getLine(),
+                         (unsigned)decl->getColumn(), false, 0};
+    functionVariables[funcName].push_back(varInfo);
+  }
+
   // If this was an array creation with multiple dimensions, store the dimensions
   if (arrayCreate && arrayCreate->getDimensions().size() > 1) {
     llvm::SmallVector<mlir::Value, 4> dimValues;
@@ -2458,7 +2482,7 @@ mlir::LogicalResult MLIRCodeGenContext::lowerDeclaration(VariableDeclarationAST*
     auto shape = tensorType.getShape();
     if (shape.size() > 1) {
       llvm::SmallVector<mlir::Value, 4> dimValues;
-      auto loc = getUnknownLocation();
+      auto loc = getLocation(decl->getLine(), decl->getColumn());
       for (int64_t dim : shape) {
         dimValues.push_back(builder.create<mlir::arith::ConstantIndexOp>(loc, dim));
       }
@@ -2470,7 +2494,7 @@ mlir::LogicalResult MLIRCodeGenContext::lowerDeclaration(VariableDeclarationAST*
 }
 
 mlir::LogicalResult MLIRCodeGenContext::lowerReturn(ReturnAST* ret) {
-  auto loc = getUnknownLocation();
+  auto loc = getLocation(ret->getLine(), ret->getColumn());
 
   // Lower the return value expression
   mlir::Value returnValue = lowerExpression(ret->getExpression());
@@ -2527,7 +2551,7 @@ mlir::LogicalResult MLIRCodeGenContext::lowerExpressionStmt(ExpressionStmtAST* e
 }
 
 mlir::LogicalResult MLIRCodeGenContext::lowerIf(IfAST* ifStmt) {
-  auto loc = getUnknownLocation();
+  auto loc = getLocation(ifStmt->getLine(), ifStmt->getColumn());
 
   // Lower the condition expression
   mlir::Value condition = lowerExpression(ifStmt->getCondition());
@@ -2657,7 +2681,7 @@ mlir::LogicalResult MLIRCodeGenContext::lowerIf(IfAST* ifStmt) {
 }
 
 mlir::LogicalResult MLIRCodeGenContext::lowerWhile(WhileAST* whileLoop) {
-  auto loc = getUnknownLocation();
+  auto loc = getLocation(whileLoop->getLine(), whileLoop->getColumn());
 
   // Get the set of variables that exist before the while loop
   auto existingVars = getCurrentVariableNames();
@@ -3029,7 +3053,7 @@ void MLIRCodeGenContext::updateSymbolTableWithResults(
 //===----------------------------------------------------------------------===//
 
 mlir::FuncOp MLIRCodeGenContext::lowerFunction(FunctionAST* funcAst) {
-  auto loc = getUnknownLocation();
+  auto loc = getLocation(funcAst->getLine(), funcAst->getColumn());
 
   // Save the current insertion point (should be at module level)
   auto savedInsertionPoint = builder.saveInsertionPoint();
@@ -3067,10 +3091,15 @@ mlir::FuncOp MLIRCodeGenContext::lowerFunction(FunctionAST* funcAst) {
   // Push new scope for function body
   pushScope();
 
-  // Declare function arguments
+  // Declare function arguments and record for debug info
   const auto& args = funcAst->getArguments();
+  std::string funcName = func.getName().str();
   for (size_t i = 0; i < args.size(); ++i) {
     declareVariable(args[i]->getName(), entryBlock->getArgument(i));
+    // Record argument for debug info (arguments come first, indexed 1-based)
+    VarDebugInfo argInfo{args[i]->getName(), (unsigned)funcAst->getLine(),
+                         (unsigned)funcAst->getColumn(), true, (unsigned)(i + 1)};
+    functionVariables[funcName].push_back(argInfo);
   }
 
   // Lower function body
@@ -3104,7 +3133,8 @@ mlir::FuncOp MLIRCodeGenContext::getOrCreateFunction(const std::string& name,
 
   // Create new function declaration (Standard dialect in MLIR 14)
   // Note: builder.create() automatically inserts at the current insertion point
-  auto loc = getUnknownLocation();
+  // Use module-level location for external function declarations
+  auto loc = getLocation(0, 0);
   auto func = builder.create<mlir::FuncOp>(loc, name, funcType);
 
   return func;

@@ -67,6 +67,12 @@
 
 // LLVM
 #include "llvm/IR/Module.h"
+#include "llvm/IR/DIBuilder.h"
+#include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/IR/DebugLoc.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace mlir;
@@ -241,6 +247,11 @@ std::unique_ptr<llvm::Module> MLIRCompilationPipeline::translateToLLVMIR(
     return nullptr;
   }
 
+  // Add debug information if enabled
+  if (enableDebugInfo) {
+    addDebugInfoToModule(llvmModule.get());
+  }
+
   return llvmModule;
 }
 
@@ -336,14 +347,14 @@ void MLIRCompilationPipeline::buildPhase2_LinalgOptimization(mlir::OpPassManager
       llvm::SmallVector<int64_t, 3> outerTileSizes = {outer_tile, outer_tile, outer_tile};
       pm.addNestedPass<mlir::FuncOp>(
           mlir::createLinalgTilingPass(outerTileSizes, loopType));
-      pm.addPass(mlir::createCanonicalizerPass());
+      if (!enableDebugInfo) pm.addPass(mlir::createCanonicalizerPass());
 
       // Level 2: Inner tiling (L1 cache + vectorization)
       // Inner loops should be sequential for vectorization
       llvm::SmallVector<int64_t, 3> innerTileSizes = {inner_tile, inner_tile, inner_tile};
       pm.addNestedPass<mlir::FuncOp>(
           mlir::createLinalgTilingPass(innerTileSizes, linalg::LinalgTilingLoopType::Loops));
-      pm.addPass(mlir::createCanonicalizerPass());
+      if (!enableDebugInfo) pm.addPass(mlir::createCanonicalizerPass());
     } else {
       // SINGLE-LEVEL TILING: Use configured tile size
       // For matmul(MxK, KxN, MxN), we tile all 3 dimensions
@@ -351,8 +362,8 @@ void MLIRCompilationPipeline::buildPhase2_LinalgOptimization(mlir::OpPassManager
       pm.addNestedPass<mlir::FuncOp>(
           mlir::createLinalgTilingPass(tileSizes, loopType));
 
-      // Canonicalize after tiling
-      pm.addPass(mlir::createCanonicalizerPass());
+      // Canonicalize after tiling (skip in debug mode to preserve operations)
+      if (!enableDebugInfo) pm.addPass(mlir::createCanonicalizerPass());
     }
   }
 
@@ -360,7 +371,7 @@ void MLIRCompilationPipeline::buildPhase2_LinalgOptimization(mlir::OpPassManager
   if (enableOpenMP) {
     llvm::outs() << "[OpenMP] Converting scf.parallel to omp.parallel\n";
     pm.addPass(mlir::createConvertSCFToOpenMPPass());
-    pm.addPass(mlir::createCanonicalizerPass());
+    if (!enableDebugInfo) pm.addPass(mlir::createCanonicalizerPass());
   }
 
   // VECTORIZATION: Convert linalg operations to vector dialect
@@ -374,41 +385,48 @@ void MLIRCompilationPipeline::buildPhase2_LinalgOptimization(mlir::OpPassManager
   pm.addNestedPass<mlir::FuncOp>(
       mlir::createLinalgStrategyVectorizePass(""));
 
-  // Canonicalize after vectorization to clean up
-  pm.addPass(mlir::createCanonicalizerPass());
-  pm.addPass(mlir::createCSEPass());
+  // Canonicalize after vectorization (skip in debug mode)
+  if (!enableDebugInfo) {
+    pm.addPass(mlir::createCanonicalizerPass());
+    pm.addPass(mlir::createCSEPass());
+  }
 
   // Step 3: Lower vector dialect operations
   // These passes convert high-level vector ops (like vector.contract) to LLVM-compatible ops
   pm.addNestedPass<mlir::FuncOp>(
       mlir::createLinalgStrategyLowerVectorsPass());
 
-  // Apply canonicalization after vector lowering
-  pm.addPass(mlir::createCanonicalizerPass());
-  pm.addPass(mlir::createCSEPass());
+  // Apply canonicalization after vector lowering (skip in debug mode)
+  if (!enableDebugInfo) {
+    pm.addPass(mlir::createCanonicalizerPass());
+    pm.addPass(mlir::createCSEPass());
+  }
 
   // Lower remaining Linalg ops (non-vectorized) to SCF loops
   // Only operations that couldn't be vectorized will go through this
   pm.addNestedPass<mlir::FuncOp>(mlir::createConvertLinalgToLoopsPass());
 
-  // Apply general canonicalization and CSE to clean up generated code
-  pm.addPass(mlir::createCanonicalizerPass());
-  pm.addPass(mlir::createCSEPass());
+  // Apply general canonicalization and CSE (skip in debug mode)
+  if (!enableDebugInfo) {
+    pm.addPass(mlir::createCanonicalizerPass());
+    pm.addPass(mlir::createCSEPass());
+  }
 
-  // INSERT PREFETCH: Add prefetch operations to hide memory latency
-  // Run after linalg-to-loops so we can find memref.load in all loops
-  if (enablePrefetch) {
+  // INSERT PREFETCH: Add prefetch operations to hide memory latency (skip in debug mode)
+  if (enablePrefetch && !enableDebugInfo) {
     llvm::outs() << "[Prefetch] Inserting prefetch operations into loops\n";
     pm.addNestedPass<mlir::FuncOp>(mlir::simp::createInsertPrefetchPass());
     pm.addPass(mlir::createCanonicalizerPass());
   }
 
-  // OPTIMIZATION: Optimize loops for better performance
-  // Apply loop invariant code motion to hoist invariant operations
-  pm.addNestedPass<mlir::FuncOp>(mlir::createLoopInvariantCodeMotionPass());
+  // OPTIMIZATION: Skip optimizations in debug mode
+  if (!enableDebugInfo) {
+    // Apply loop invariant code motion to hoist invariant operations
+    pm.addNestedPass<mlir::FuncOp>(mlir::createLoopInvariantCodeMotionPass());
 
-  // Apply loop unrolling for better ILP
-  pm.addNestedPass<mlir::FuncOp>(mlir::createLoopUnrollPass(4));
+    // Apply loop unrolling for better ILP
+    pm.addNestedPass<mlir::FuncOp>(mlir::createLoopUnrollPass(4));
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -461,10 +479,12 @@ void MLIRCompilationPipeline::buildPhase3_LLVMDialectLowering(mlir::OpPassManage
   //      MaxFOp/MinFOp don't have direct LLVM lowering - they must be expanded to CmpF + Select
   pm.addNestedPass<mlir::FuncOp>(mlir::arith::createArithmeticExpandOpsPass());
 
-  // 3. Add canonicalization and CSE passes for cleanup
+  // 3. Add canonicalization and CSE passes for cleanup (skip in debug mode)
   // Pattern-based conversions will be applied after running the pipeline
-  pm.addPass(mlir::createCanonicalizerPass());
-  pm.addPass(mlir::createCSEPass());
+  if (!enableDebugInfo) {
+    pm.addPass(mlir::createCanonicalizerPass());
+    pm.addPass(mlir::createCSEPass());
+  }
 
   // 4. Final reconciliation of unrealized casts
   // Skip when OpenMP is enabled - casts inside omp regions can't be reconciled until LLVM IR translation
@@ -481,45 +501,48 @@ bool MLIRCompilationPipeline::applyLLVMDialectConversion() {
   // This method applies pattern-based conversions that require direct module access
   // It must be called AFTER the main pass pipeline has run
 
-  // Step 1: Lower vector operations to simpler forms BEFORE LLVM conversion
-  {
-    mlir::RewritePatternSet patterns(module.getContext());
+  // Skip vector optimization patterns in debug mode to preserve variable mappings
+  if (!enableDebugInfo) {
+    // Step 1: Lower vector operations to simpler forms BEFORE LLVM conversion
+    {
+      mlir::RewritePatternSet patterns(module.getContext());
 
-    // Lower vector.contract to outer products and vector.transpose to shuffles
-    mlir::vector::VectorTransformsOptions vectorOptions;
-    vectorOptions.setVectorTransformsOptions(mlir::vector::VectorContractLowering::OuterProduct);
-    vectorOptions.setVectorTransposeLowering(mlir::vector::VectorTransposeLowering::Shuffle);
-    mlir::vector::populateVectorContractLoweringPatterns(patterns, vectorOptions);
-    mlir::vector::populateVectorTransposeLoweringPatterns(patterns, vectorOptions);
+      // Lower vector.contract to outer products and vector.transpose to shuffles
+      mlir::vector::VectorTransformsOptions vectorOptions;
+      vectorOptions.setVectorTransformsOptions(mlir::vector::VectorContractLowering::OuterProduct);
+      vectorOptions.setVectorTransposeLowering(mlir::vector::VectorTransposeLowering::Shuffle);
+      mlir::vector::populateVectorContractLoweringPatterns(patterns, vectorOptions);
+      mlir::vector::populateVectorTransposeLoweringPatterns(patterns, vectorOptions);
 
-    // Lower vector.transpose, vector.broadcast, vector.shape_cast, etc.
-    mlir::vector::populateVectorToVectorCanonicalizationPatterns(patterns);
-    mlir::vector::populateVectorBroadcastLoweringPatterns(patterns);
-    mlir::vector::populateVectorMaskOpLoweringPatterns(patterns);
-    mlir::vector::populateVectorShapeCastLoweringPatterns(patterns);
+      // Lower vector.transpose, vector.broadcast, vector.shape_cast, etc.
+      mlir::vector::populateVectorToVectorCanonicalizationPatterns(patterns);
+      mlir::vector::populateVectorBroadcastLoweringPatterns(patterns);
+      mlir::vector::populateVectorMaskOpLoweringPatterns(patterns);
+      mlir::vector::populateVectorShapeCastLoweringPatterns(patterns);
 
-    if (failed(mlir::applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
-      llvm::errs() << "Warning: Vector lowering patterns failed\n";
+      if (failed(mlir::applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
+        llvm::errs() << "Warning: Vector lowering patterns failed\n";
+      }
     }
-  }
 
-  // Progressive lowering of vector operations (matches LLVM's ConvertVectorToLLVMPass line 64-75)
-  // Run iteratively to handle nested broadcasts (e.g., 1D->2D broadcasts in 1x1 matmul)
-  for (int iteration = 0; iteration < 5; ++iteration) {
-    mlir::RewritePatternSet patterns(module.getContext());
-    mlir::vector::populateVectorToVectorCanonicalizationPatterns(patterns);
-    mlir::vector::populateVectorBroadcastLoweringPatterns(patterns);
-    mlir::vector::populateVectorContractLoweringPatterns(patterns);
-    mlir::vector::populateVectorMaskOpLoweringPatterns(patterns);
-    mlir::vector::populateVectorShapeCastLoweringPatterns(patterns);
-    mlir::vector::populateVectorTransposeLoweringPatterns(patterns);
-    // Vector transfer ops with rank > 1 should be lowered with VectorToSCF
-    mlir::vector::populateVectorTransferLoweringPatterns(patterns, /*maxTransferRank=*/1);
+    // Progressive lowering of vector operations (matches LLVM's ConvertVectorToLLVMPass line 64-75)
+    // Run iteratively to handle nested broadcasts (e.g., 1D->2D broadcasts in 1x1 matmul)
+    for (int iteration = 0; iteration < 5; ++iteration) {
+      mlir::RewritePatternSet patterns(module.getContext());
+      mlir::vector::populateVectorToVectorCanonicalizationPatterns(patterns);
+      mlir::vector::populateVectorBroadcastLoweringPatterns(patterns);
+      mlir::vector::populateVectorContractLoweringPatterns(patterns);
+      mlir::vector::populateVectorMaskOpLoweringPatterns(patterns);
+      mlir::vector::populateVectorShapeCastLoweringPatterns(patterns);
+      mlir::vector::populateVectorTransposeLoweringPatterns(patterns);
+      // Vector transfer ops with rank > 1 should be lowered with VectorToSCF
+      mlir::vector::populateVectorTransferLoweringPatterns(patterns, /*maxTransferRank=*/1);
 
-    if (failed(mlir::applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
-      llvm::errs() << "Warning: Vector lowering iteration " << iteration << " had issues\n";
+      if (failed(mlir::applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
+        llvm::errs() << "Warning: Vector lowering iteration " << iteration << " had issues\n";
+      }
     }
-  }
+  } // end if (!enableDebugInfo)
 
   // Step 2: Define the conversion target - only LLVM dialect operations are legal
   // DON'T run createConvertVectorToLLVMPass as a separate pass
@@ -577,4 +600,355 @@ bool MLIRCompilationPipeline::applyLLVMDialectConversion() {
   // and will run after the main pipeline completes
 
   return true;
+}
+
+//===----------------------------------------------------------------------===//
+// Debug Info Generation
+//===----------------------------------------------------------------------===//
+
+void MLIRCompilationPipeline::addDebugInfoToModule(llvm::Module* llvmModule) {
+  if (!llvmModule || sourceFileName.empty()) {
+    return;
+  }
+
+  // Check if the module already has debug info from MLIR translation
+  // MLIR's translation creates debug info from FileLineColLoc locations
+  bool hasExistingDebugInfo = false;
+  for (llvm::Function& func : *llvmModule) {
+    if (func.getSubprogram()) {
+      hasExistingDebugInfo = true;
+      break;
+    }
+  }
+
+  // Helper lambda to ensure module flags are set
+  auto ensureModuleFlags = [&llvmModule]() {
+    bool hasDwarfVersion = false;
+    bool hasDebugInfoVersion = false;
+
+    if (auto* flags = llvmModule->getModuleFlagsMetadata()) {
+      for (const auto& flag : flags->operands()) {
+        if (auto* md = dyn_cast<llvm::MDNode>(flag)) {
+          if (md->getNumOperands() >= 2) {
+            if (auto* str = dyn_cast<llvm::MDString>(md->getOperand(1))) {
+              if (str->getString() == "Dwarf Version") hasDwarfVersion = true;
+              if (str->getString() == "Debug Info Version") hasDebugInfoVersion = true;
+            }
+          }
+        }
+      }
+    }
+
+    if (!hasDwarfVersion) {
+      llvmModule->addModuleFlag(llvm::Module::Warning, "Dwarf Version", 4);
+    }
+    if (!hasDebugInfoVersion) {
+      llvmModule->addModuleFlag(llvm::Module::Warning, "Debug Info Version",
+                                llvm::DEBUG_METADATA_VERSION);
+    }
+  };
+
+  // If MLIR already generated debug info from our source locations,
+  // enhance it with argument/variable debug info
+  if (hasExistingDebugInfo) {
+    // The MLIR translation already added DICompileUnit and DISubprograms.
+    // We need to get the existing compile unit to add variable debug info.
+    llvm::DICompileUnit* existingCU = nullptr;
+    if (llvm::NamedMDNode* cuMD = llvmModule->getNamedMetadata("llvm.dbg.cu")) {
+      if (cuMD->getNumOperands() > 0) {
+        existingCU = llvm::dyn_cast<llvm::DICompileUnit>(cuMD->getOperand(0));
+      }
+    }
+
+    if (!existingCU) {
+      // No compile unit found, just ensure flags are set
+      ensureModuleFlags();
+      return;
+    }
+
+    // Create DIBuilder with the existing compile unit
+    // Use AllowUnresolved=false since CU is already fully resolved
+    llvm::DIBuilder dbuilder(*llvmModule, /*AllowUnresolved=*/false, existingCU);
+
+    // Add debug info for function arguments in each function
+    for (llvm::Function& func : *llvmModule) {
+      if (func.isDeclaration()) continue;
+
+      llvm::DISubprogram* sp = func.getSubprogram();
+      if (!sp) continue;
+
+      // Get the file from the subprogram
+      llvm::DIFile* file = sp->getFile();
+      unsigned line = sp->getLine();
+      if (!file) continue;
+
+      // Add debug info for function arguments
+      unsigned argNo = 0;
+      for (llvm::Argument& arg : func.args()) {
+        argNo++;
+
+        // Get or create type for the argument
+        llvm::DIType* argDIType = nullptr;
+        llvm::Type* argType = arg.getType();
+
+        if (argType->isFloatTy()) {
+          argDIType = dbuilder.createBasicType("float", 32, llvm::dwarf::DW_ATE_float);
+        } else if (argType->isDoubleTy()) {
+          argDIType = dbuilder.createBasicType("double", 64, llvm::dwarf::DW_ATE_float);
+        } else if (argType->isIntegerTy(32)) {
+          argDIType = dbuilder.createBasicType("int", 32, llvm::dwarf::DW_ATE_signed);
+        } else if (argType->isIntegerTy(64)) {
+          argDIType = dbuilder.createBasicType("long", 64, llvm::dwarf::DW_ATE_signed);
+        } else if (argType->isPointerTy()) {
+          llvm::DIType* elementType = dbuilder.createBasicType("float", 32, llvm::dwarf::DW_ATE_float);
+          argDIType = dbuilder.createPointerType(elementType, 64);
+        } else {
+          argDIType = dbuilder.createBasicType("unknown", 64, llvm::dwarf::DW_ATE_unsigned);
+        }
+
+        // Create argument name
+        std::string argName = "arg" + std::to_string(argNo - 1);
+        if (arg.hasName()) {
+          argName = arg.getName().str();
+        }
+
+        // Create DILocalVariable for the argument
+        llvm::DILocalVariable* argVar = dbuilder.createParameterVariable(
+            sp, argName, argNo, file, line, argDIType, true);
+
+        // Insert dbg.value intrinsic at function entry
+        if (!func.empty()) {
+          llvm::BasicBlock& entryBB = func.getEntryBlock();
+          llvm::Instruction* firstInst = &*entryBB.getFirstInsertionPt();
+          llvm::DILocation* debugLoc = llvm::DILocation::get(
+              llvmModule->getContext(), line, 0, sp);
+          dbuilder.insertDbgValueIntrinsic(
+              &arg, argVar, dbuilder.createExpression(), debugLoc, firstInst);
+        }
+      }
+
+      // Add debug info for local variables
+      // Look up variable info for this function
+      std::string funcName = func.getName().str();
+      auto varIt = functionVariables.find(funcName);
+      if (varIt != functionVariables.end()) {
+        // Collect non-argument variables in declaration order
+        std::vector<VarDebugInfo> localVars;
+        for (const auto& varInfo : varIt->second) {
+          if (!varInfo.isArg) {
+            localVars.push_back(varInfo);
+          }
+        }
+
+        // Collect value-producing instructions (excluding debug intrinsics and MLIR artifacts)
+        std::vector<std::pair<llvm::Instruction*, llvm::Instruction*>> valueInsts;
+        for (llvm::BasicBlock& bb : func) {
+          for (llvm::Instruction& inst : bb) {
+            // Skip debug intrinsics and void-returning instructions
+            if (llvm::isa<llvm::DbgInfoIntrinsic>(&inst)) continue;
+            if (inst.getType()->isVoidTy()) continue;
+            // Skip branch/phi as they're control flow, not variable defs
+            if (llvm::isa<llvm::BranchInst>(&inst)) continue;
+            if (llvm::isa<llvm::PHINode>(&inst)) continue;
+            // Skip insertvalue/extractvalue - these are MLIR memref artifacts
+            if (llvm::isa<llvm::InsertValueInst>(&inst)) continue;
+            if (llvm::isa<llvm::ExtractValueInst>(&inst)) continue;
+            // Skip struct types - these are memref descriptors, not source vars
+            if (inst.getType()->isStructTy()) continue;
+
+            llvm::Instruction* insertPoint = inst.getNextNode();
+            valueInsts.push_back({&inst, insertPoint});
+          }
+        }
+
+        // Match local variables to instructions by order
+        // This assumes variables are declared in the same order as their values appear
+        size_t numToMatch = std::min(localVars.size(), valueInsts.size());
+        for (size_t i = 0; i < numToMatch; ++i) {
+          const auto& varInfo = localVars[i];
+          llvm::Instruction* inst = valueInsts[i].first;
+          llvm::Instruction* insertPoint = valueInsts[i].second;
+
+          // Create DIType for the variable
+          llvm::DIType* varDIType = nullptr;
+          llvm::Type* valType = inst->getType();
+          if (valType->isFloatTy()) {
+            varDIType = dbuilder.createBasicType("float", 32, llvm::dwarf::DW_ATE_float);
+          } else if (valType->isDoubleTy()) {
+            varDIType = dbuilder.createBasicType("double", 64, llvm::dwarf::DW_ATE_float);
+          } else if (valType->isIntegerTy(32)) {
+            varDIType = dbuilder.createBasicType("int", 32, llvm::dwarf::DW_ATE_signed);
+          } else if (valType->isIntegerTy(64)) {
+            varDIType = dbuilder.createBasicType("long", 64, llvm::dwarf::DW_ATE_signed);
+          } else if (valType->isPointerTy()) {
+            llvm::DIType* elemType = dbuilder.createBasicType("float", 32, llvm::dwarf::DW_ATE_float);
+            varDIType = dbuilder.createPointerType(elemType, 64);
+          } else {
+            varDIType = dbuilder.createBasicType("unknown", 64, llvm::dwarf::DW_ATE_unsigned);
+          }
+
+          // Create DILocalVariable
+          llvm::DILocalVariable* localVar = dbuilder.createAutoVariable(
+              sp, varInfo.name, file, varInfo.line, varDIType, true);
+
+          // Insert dbg.value intrinsic after the instruction
+          llvm::DILocation* varDebugLoc = llvm::DILocation::get(
+              llvmModule->getContext(), varInfo.line, varInfo.col, sp);
+          if (insertPoint) {
+            dbuilder.insertDbgValueIntrinsic(
+                inst, localVar, dbuilder.createExpression(), varDebugLoc, insertPoint);
+          }
+        }
+      }
+    }
+
+    dbuilder.finalize();
+    ensureModuleFlags();
+    return;
+  }
+
+  // If no existing debug info, create it from scratch
+  llvm::DIBuilder dbuilder(*llvmModule);
+
+  // Extract directory and filename
+  std::string directory = ".";
+  std::string filename = sourceFileName;
+  size_t lastSlash = sourceFileName.find_last_of("/\\");
+  if (lastSlash != std::string::npos) {
+    directory = sourceFileName.substr(0, lastSlash);
+    filename = sourceFileName.substr(lastSlash + 1);
+  }
+
+  // Create file descriptor
+  llvm::DIFile* file = dbuilder.createFile(filename, directory);
+
+  // Create compile unit
+  dbuilder.createCompileUnit(
+      llvm::dwarf::DW_LANG_C,           // Language (closest to SimpleLang)
+      file,                              // File
+      "SimpleLang MLIR Compiler",        // Producer
+      false,                             // isOptimized
+      "",                                // Flags
+      0,                                 // RuntimeVersion
+      "",                                // SplitName
+      llvm::DICompileUnit::FullDebug,    // DebugEmissionKind
+      0                                  // DWOId
+  );
+
+  // Create a basic subroutine type (void function type for simplicity)
+  llvm::SmallVector<llvm::Metadata*, 1> types;
+  types.push_back(nullptr); // Return type (void)
+  llvm::DISubroutineType* funcType = dbuilder.createSubroutineType(
+      dbuilder.getOrCreateTypeArray(types));
+
+  // For each function in the module, create a DISubprogram
+  for (llvm::Function& func : *llvmModule) {
+    if (func.isDeclaration()) {
+      continue; // Skip external declarations
+    }
+
+    // Skip if function already has debug info
+    if (func.getSubprogram()) {
+      continue;
+    }
+
+    // Try to get line number from first instruction's debug location
+    unsigned line = 1; // Default to line 1 if no debug info available
+    for (llvm::BasicBlock& bb : func) {
+      for (llvm::Instruction& inst : bb) {
+        if (const llvm::DebugLoc& dl = inst.getDebugLoc()) {
+          line = dl.getLine();
+          if (line > 0) break;
+        }
+      }
+      if (line > 1) break;
+    }
+
+    // Create DISubprogram for this function
+    llvm::DISubprogram* sp = dbuilder.createFunction(
+        file,                              // Scope (file)
+        func.getName(),                    // Name
+        func.getName(),                    // Linkage name
+        file,                              // File
+        line,                              // Line number
+        funcType,                          // Type
+        line,                              // ScopeLine
+        llvm::DINode::FlagPrototyped,      // Flags
+        llvm::DISubprogram::SPFlagDefinition // SPFlags
+    );
+
+    // Attach the subprogram to the function
+    func.setSubprogram(sp);
+
+    // Add debug info for function arguments
+    unsigned argNo = 0;
+    for (llvm::Argument& arg : func.args()) {
+      argNo++;
+
+      // Get or create type for the argument
+      llvm::DIType* argDIType = nullptr;
+      llvm::Type* argType = arg.getType();
+
+      if (argType->isFloatTy()) {
+        argDIType = dbuilder.createBasicType("float", 32, llvm::dwarf::DW_ATE_float);
+      } else if (argType->isDoubleTy()) {
+        argDIType = dbuilder.createBasicType("double", 64, llvm::dwarf::DW_ATE_float);
+      } else if (argType->isIntegerTy(32)) {
+        argDIType = dbuilder.createBasicType("int", 32, llvm::dwarf::DW_ATE_signed);
+      } else if (argType->isIntegerTy(64)) {
+        argDIType = dbuilder.createBasicType("long", 64, llvm::dwarf::DW_ATE_signed);
+      } else if (argType->isPointerTy()) {
+        // For pointers (arrays, tensors), create a pointer type
+        llvm::DIType* elementType = dbuilder.createBasicType("float", 32, llvm::dwarf::DW_ATE_float);
+        argDIType = dbuilder.createPointerType(elementType, 64);
+      } else {
+        // Default to a generic type
+        argDIType = dbuilder.createBasicType("unknown", 64, llvm::dwarf::DW_ATE_unsigned);
+      }
+
+      // Create argument name (use "arg0", "arg1", etc. since original names are lost)
+      std::string argName = "arg" + std::to_string(argNo - 1);
+      if (arg.hasName()) {
+        argName = arg.getName().str();
+      }
+
+      // Create DILocalVariable for the argument
+      llvm::DILocalVariable* argVar = dbuilder.createParameterVariable(
+          sp,                    // Scope
+          argName,               // Name
+          argNo,                 // ArgNo (1-indexed)
+          file,                  // File
+          line,                  // Line
+          argDIType,             // Type
+          true                   // AlwaysPreserve
+      );
+
+      // Insert dbg.value intrinsic at the function entry
+      if (!func.empty()) {
+        llvm::BasicBlock& entryBB = func.getEntryBlock();
+        llvm::Instruction* firstInst = &*entryBB.getFirstInsertionPt();
+
+        // Create a debug location for the intrinsic
+        llvm::DILocation* debugLoc = llvm::DILocation::get(
+            llvmModule->getContext(), line, 0, sp);
+
+        // Insert dbg.value intrinsic
+        dbuilder.insertDbgValueIntrinsic(
+            &arg,                                // Value
+            argVar,                              // Variable
+            dbuilder.createExpression(),         // Expression
+            debugLoc,                            // DebugLoc
+            firstInst                            // InsertBefore
+        );
+      }
+    }
+  }
+
+  // Add DWARF version and debug info version module flags
+  llvmModule->addModuleFlag(llvm::Module::Warning, "Dwarf Version", 4);
+  llvmModule->addModuleFlag(llvm::Module::Warning, "Debug Info Version",
+                            llvm::DEBUG_METADATA_VERSION);
+
+  // Finalize the debug info
+  dbuilder.finalize();
 }
