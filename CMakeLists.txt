@@ -20,6 +20,8 @@ option(USE_TCMALLOC "Use tcmalloc as default allocator" ON)
 # LLVM setup
 # LLVM_DIR should be set via -DLLVM_DIR=... when running cmake
 # build.sh will set this to the correct location
+# Force static linking to avoid command-line option conflicts with MLIR static libs
+set(LLVM_LINK_LLVM_DYLIB OFF CACHE BOOL "Link against shared LLVM library" FORCE)
 find_package(LLVM REQUIRED CONFIG)
 find_package(BISON REQUIRED)
 find_package(FLEX REQUIRED)
@@ -94,6 +96,44 @@ if(USE_MLIR)
     endif()
 else()
     message(STATUS "MLIR integration DISABLED (use -DUSE_MLIR=ON to enable)")
+endif()
+
+# CUDA GPU backend setup (optional, requires USE_MLIR=ON)
+option(USE_CUDA "Enable CUDA GPU backend" OFF)
+set(CUDA_ARCH "80" CACHE STRING "CUDA compute capability (e.g., 70 for V100, 80 for A100, 90 for H100)")
+
+if(USE_CUDA)
+    if(NOT USE_MLIR)
+        message(FATAL_ERROR "USE_CUDA requires USE_MLIR=ON. CUDA backend uses MLIR GPU dialect.")
+    endif()
+
+    # Find CUDA Toolkit
+    find_package(CUDAToolkit REQUIRED)
+
+    message(STATUS "CUDA GPU backend ENABLED")
+    message(STATUS "CUDA Toolkit version: ${CUDAToolkit_VERSION}")
+    message(STATUS "CUDA Toolkit path: ${CUDAToolkit_LIBRARY_DIR}")
+    message(STATUS "Target CUDA architecture: sm_${CUDA_ARCH}")
+
+    # Add CUDA include directories
+    include_directories(${CUDAToolkit_INCLUDE_DIRS})
+
+    # Define CUDA-related macros
+    add_definitions(-DUSE_CUDA)
+    add_definitions(-DCUDA_ARCH=${CUDA_ARCH})
+
+    # MLIR GPU dialect libraries (will be linked in src/mlir/CMakeLists.txt)
+    set(MLIR_GPU_LIBS
+        MLIRGPUDialect
+        MLIRGPUTransforms
+        MLIRGPUToNVVMTransforms
+        MLIRGPUToGPURuntimeTransforms
+        MLIRNVVMIR
+        MLIRNVVMToLLVMIRTranslation
+        CACHE INTERNAL "MLIR GPU libraries"
+    )
+else()
+    message(STATUS "CUDA GPU backend DISABLED (use -DUSE_CUDA=ON to enable)")
 endif()
 
 include_directories(

@@ -1238,6 +1238,36 @@ def Simp_TensorMatMulIntoOp : Simp_Op<"tensor_matmul_into", []> {
 }
 
 //===----------------------------------------------------------------------===//
+// TensorFillOp - Fill tensor with constant value
+//===----------------------------------------------------------------------===//
+
+def Simp_TensorFillOp : Simp_Op<"tensor_fill", []> {
+  let summary = "Fill tensor with a constant value";
+
+  let description = [{
+    Fills all elements of a tensor with a constant value.
+    Lowers to linalg.fill for efficient GPU/vectorized execution.
+
+    Usage:
+    ```simplang
+    f32<4096, 4096> A;
+    tensor_fill(A, 1.0);  // Fill with 1.0
+    ```
+  }];
+
+  let arguments = (ins
+    Simp_SimpTensorType:$tensor,
+    AnyType:$value
+  );
+
+  let results = (outs);
+
+  let assemblyFormat = [{
+    $tensor `,` $value attr-dict `:` `(` type($tensor) `,` type($value) `)`
+  }];
+}
+
+//===----------------------------------------------------------------------===//
 // TensorMatVecMulOp - Matrix × skinny matrix with i-k-j loop order
 //===----------------------------------------------------------------------===//
 

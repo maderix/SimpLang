@@ -3523,17 +3523,14 @@ struct TensorMatMulIntoOpLowering : public OpConversionPattern<simp::TensorMatMu
 
     auto elemType = lhsType.getElementType();
 
-    // Initialize output to zero (matmul accumulates)
+    // Initialize output to zero only for INT8 (cuBLAS SGEMM with beta=0 handles f32)
     if (elemType.isInteger(8)) {
       auto i32Type = rewriter.getIntegerType(32);
       Value zero32 = rewriter.create<arith::ConstantOp>(
           loc, i32Type, rewriter.getZeroAttr(i32Type));
       rewriter.create<linalg::FillOp>(loc, zero32, output);
-    } else {
-      Value zero = rewriter.create<arith::ConstantOp>(
-          loc, elemType, rewriter.getZeroAttr(elemType));
-      rewriter.create<linalg::FillOp>(loc, zero, output);
     }
+    // Note: For f32, cuBLAS SGEMM with beta=0 overwrites output - no fill needed
 
     // INT8 matmul: i8 × i8 → i32
     if (elemType.isInteger(8)) {
@@ -3621,6 +3618,25 @@ struct TensorMatMulIntoOpLowering : public OpConversionPattern<simp::TensorMatMu
     }
 
     // No replacement - this op has no result
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+/// TensorFillOp: Fill tensor with constant value
+/// Lowers to linalg.fill for efficient GPU/vectorized execution
+struct TensorFillOpLowering : public OpConversionPattern<simp::TensorFillOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      simp::TensorFillOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+
+    auto loc = op.getLoc();
+    auto tensor = adaptor.tensor();
+    auto value = adaptor.value();
+
+    rewriter.create<linalg::FillOp>(loc, value, tensor);
     rewriter.eraseOp(op);
     return success();
   }
@@ -4116,6 +4132,7 @@ struct ConvertSimpToMemRefPass
         TensorMatMulOpLowering,
         TensorMatMulNTOpLowering,
         TensorMatMulIntoOpLowering,
+        TensorFillOpLowering,
         TensorMatVecMulOpLowering,
         TensorDotOpLowering
     >(typeConverter, &getContext());

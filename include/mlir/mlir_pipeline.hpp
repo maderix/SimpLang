@@ -102,6 +102,25 @@ public:
   /// Set output path for intermediate IR dumps
   void setOutputPath(const std::string& path) { outputPath = path; }
 
+  //===--------------------------------------------------------------------===//
+  // GPU Backend Configuration (requires USE_CUDA)
+  //===--------------------------------------------------------------------===//
+
+  /// Enable/disable GPU code generation (requires CUDA)
+  void setEnableGPU(bool enable) { enableGPU = enable; }
+
+  /// Set target CUDA architecture (e.g., "sm_80" for A100, "sm_90" for H100)
+  void setCudaArch(const std::string& arch) { cudaArch = arch; }
+
+  /// Set GPU matmul strategy: "cublas" (default), "mlir", or "auto"
+  /// - cublas: Use cuBLAS for large matrices (M,N,K >= 128)
+  /// - mlir: Use MLIR-generated GPU kernels
+  /// - auto: Automatically choose based on matrix size
+  void setGPUMatMulStrategy(const std::string& strategy) { gpuMatMulStrategy = strategy; }
+
+  /// Check if GPU code generation is enabled
+  bool isGPUEnabled() const { return enableGPU; }
+
 private:
   //===--------------------------------------------------------------------===//
   // Private Members
@@ -136,6 +155,19 @@ private:
   bool skipMLIRVectorization = false;
 
   //===--------------------------------------------------------------------===//
+  // GPU Configuration Members (requires USE_CUDA)
+  //===--------------------------------------------------------------------===//
+
+  /// Enable GPU code generation (default: false)
+  bool enableGPU = false;
+
+  /// Target CUDA architecture (default: sm_80 for A100)
+  std::string cudaArch = "sm_80";
+
+  /// GPU matmul strategy: "cublas", "mlir", or "auto" (default: cublas)
+  std::string gpuMatMulStrategy = "cublas";
+
+  //===--------------------------------------------------------------------===//
   // Private Helpers: Pipeline Builders
   //===--------------------------------------------------------------------===//
 
@@ -154,6 +186,20 @@ private:
   /// Apply vector lowering patterns and LLVM dialect conversion
   /// Must be called after the pass pipeline runs (requires direct module access)
   bool applyLLVMDialectConversion();
+
+  //===--------------------------------------------------------------------===//
+  // GPU Pipeline Builders (requires USE_CUDA)
+  //===--------------------------------------------------------------------===//
+
+#ifdef USE_CUDA
+  /// Build Phase 2.7 passes: GPU lowering (parallel loops → GPU kernels)
+  /// Maps parallel loops to GPU thread hierarchy and outlines GPU kernels
+  void buildPhase2_7_GPULowering(mlir::OpPassManager& pm);
+
+  /// Build Phase 4 passes: NVVM lowering (GPU → NVVM → PTX/CUBIN)
+  /// Converts GPU dialect to NVVM dialect and serializes to PTX/CUBIN
+  void buildPhase4_NVVMLowering(mlir::OpPassManager& pm);
+#endif
 };
 
 } // namespace simp

@@ -62,37 +62,48 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    printf("╔══════════════════════════════════════════════════════════════════╗\n");
-    printf("║         GPU f32 MatMul Benchmark (cuBLAS on RTX 4090)            ║\n");
-    printf("╠══════════════════════════════════════════════════════════════════╣\n");
-    printf("║  Size      │  Avg Time  │   GFLOPS   │  Result   │    Status    ║\n");
-    printf("╠════════════╪════════════╪════════════╪═══════════╪══════════════╣\n");
+    printf("╔═══════════════════════════════════════════════════════════════════════╗\n");
+    printf("║          GPU f32 MatMul Benchmark (cuBLAS on RTX 4090)               ║\n");
+    printf("╠═══════════════════════════════════════════════════════════════════════╣\n");
+    printf("║  Size       │  Avg Time   │   TFLOPS   │   Result   │    Status      ║\n");
+    printf("╠═════════════╪═════════════╪════════════╪════════════╪════════════════╣\n");
 
     // 256x256
     BenchResult r256 = run_benchmark(handle, "bench_256", 256, 100);
-    printf("║  256x256   │ %7.3f ms │ %8.2f   │ %7.1f   │     %s      ║\n",
-           r256.avg_ms, r256.gflops, r256.result, r256.correct ? "✓" : "✗");
+    printf("║  256x256    │ %8.3f ms │ %8.3f   │ %8.1f   │      %s        ║\n",
+           r256.avg_ms, r256.gflops/1000.0, r256.result, r256.correct ? "✓" : "✗");
 
     // 512x512
     BenchResult r512 = run_benchmark(handle, "bench_512", 512, 50);
-    printf("║  512x512   │ %7.3f ms │ %8.2f   │ %7.1f   │     %s      ║\n",
-           r512.avg_ms, r512.gflops, r512.result, r512.correct ? "✓" : "✗");
+    printf("║  512x512    │ %8.3f ms │ %8.3f   │ %8.1f   │      %s        ║\n",
+           r512.avg_ms, r512.gflops/1000.0, r512.result, r512.correct ? "✓" : "✗");
 
     // 1024x1024
     BenchResult r1024 = run_benchmark(handle, "bench_1024", 1024, 20);
-    printf("║ 1024x1024  │ %7.3f ms │ %8.2f   │ %7.1f   │     %s      ║\n",
-           r1024.avg_ms, r1024.gflops, r1024.result, r1024.correct ? "✓" : "✗");
+    printf("║ 1024x1024   │ %8.3f ms │ %8.3f   │ %8.1f   │      %s        ║\n",
+           r1024.avg_ms, r1024.gflops/1000.0, r1024.result, r1024.correct ? "✓" : "✗");
 
     // 2048x2048
     BenchResult r2048 = run_benchmark(handle, "bench_2048", 2048, 10);
-    printf("║ 2048x2048  │ %7.3f ms │ %8.2f   │ %7.1f   │     %s      ║\n",
-           r2048.avg_ms, r2048.gflops, r2048.result, r2048.correct ? "✓" : "✗");
+    printf("║ 2048x2048   │ %8.3f ms │ %8.3f   │ %8.1f   │      %s        ║\n",
+           r2048.avg_ms, r2048.gflops/1000.0, r2048.result, r2048.correct ? "✓" : "✗");
 
-    printf("╚══════════════════════════════════════════════════════════════════╝\n");
+    // 4096x4096
+    BenchResult r4096 = run_benchmark(handle, "bench_4096", 4096, 5);
+    printf("║ 4096x4096   │ %8.3f ms │ %8.3f   │ %8.1f   │      %s        ║\n",
+           r4096.avg_ms, r4096.gflops/1000.0, r4096.result, r4096.correct ? "✓" : "✗");
+
+    // 6144x6144
+    BenchResult r6144 = run_benchmark(handle, "bench_6144", 6144, 3);
+    printf("║ 6144x6144   │ %8.3f ms │ %8.3f   │ %8.1f   │      %s        ║\n",
+           r6144.avg_ms, r6144.gflops/1000.0, r6144.result, r6144.correct ? "✓" : "✗");
+
+    printf("╚═══════════════════════════════════════════════════════════════════════╝\n");
     printf("\nNotes:\n");
-    printf("  - GFLOPS = 2*N³ / time (higher is better)\n");
+    printf("  - TFLOPS = 2*N³ / time (higher is better)\n");
     printf("  - RTX 4090 FP32 peak: ~83 TFLOPS\n");
     printf("  - cuBLAS efficiency improves with larger matrices\n");
+    printf("  - Memory: 4096x4096 = 64MB per matrix, 6144x6144 = 144MB per matrix\n");
 
     dlclose(handle);
     return 0;

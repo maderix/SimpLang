@@ -243,6 +243,83 @@ struct LinalgGenericToGPUPattern : public OpRewritePattern<linalg::GenericOp> {
 };
 
 //===----------------------------------------------------------------------===//
+// Linalg.fill to GPU Kernel Pattern
+// Fast tensor initialization using GPU parallel fill
+//===----------------------------------------------------------------------===//
+
+struct FillToGPUKernelPattern : public OpRewritePattern<linalg::FillOp> {
+    using OpRewritePattern<linalg::FillOp>::OpRewritePattern;
+
+    LogicalResult matchAndRewrite(linalg::FillOp op,
+                                  PatternRewriter& rewriter) const override {
+        Location loc = op.getLoc();
+
+        Value fillValue = op.value();
+        Value output = op.output();
+
+        auto memRefType = output.getType().dyn_cast<MemRefType>();
+        if (!memRefType || !isGPUCompatibleMemRef(memRefType)) {
+            return failure();
+        }
+
+        // Only optimize large tensors (>4KB = 1024 f32 elements)
+        int64_t numElements = getNumElements(memRefType);
+        if (numElements < 1024) {
+            return failure();  // Let scalar loop handle small tensors
+        }
+
+        // Create external GPU fill function call
+        ModuleOp module = op->getParentOfType<ModuleOp>();
+
+        auto gpuFill = module.lookupSymbol<FuncOp>("simp_gpu_fill_f32");
+        if (!gpuFill) {
+            // Create function declaration:
+            // void simp_gpu_fill_f32(float* data, int64_t num_elements, float value)
+            auto funcType = rewriter.getFunctionType(
+                {MemRefType::get({-1}, rewriter.getF32Type()),
+                 rewriter.getI64Type(),
+                 rewriter.getF32Type()},
+                {}
+            );
+
+            OpBuilder::InsertionGuard guard(rewriter);
+            rewriter.setInsertionPointToStart(module.getBody());
+            gpuFill = rewriter.create<FuncOp>(loc, "simp_gpu_fill_f32", funcType);
+            gpuFill.setPrivate();
+        }
+
+        // Collapse multi-dimensional memref to 1D for the fill call
+        auto elemType = memRefType.getElementType();
+        auto flatType = MemRefType::get({numElements}, elemType);
+
+        // Create reassociation indices for collapse
+        SmallVector<ReassociationIndices, 1> reassoc;
+        ReassociationIndices dims;
+        for (int64_t i = 0; i < memRefType.getRank(); i++) {
+            dims.push_back(i);
+        }
+        reassoc.push_back(dims);
+
+        Value flatMemRef = rewriter.create<memref::CollapseShapeOp>(
+            loc, flatType, output, reassoc);
+
+        // Cast to dynamic memref for external call
+        auto dynamicFlatType = MemRefType::get({-1}, elemType);
+        Value flatCast = rewriter.create<memref::CastOp>(loc, dynamicFlatType, flatMemRef);
+
+        // Create constants
+        Value numElemsVal = rewriter.create<arith::ConstantIntOp>(loc, numElements, 64);
+
+        // Call GPU fill
+        rewriter.create<CallOp>(loc, gpuFill,
+            ValueRange{flatCast, numElemsVal, fillValue});
+
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
+//===----------------------------------------------------------------------===//
 // Linalg.matmul to cuBLAS Call Pattern
 // For large matrices, use cuBLAS SGEMM instead of custom kernels
 //===----------------------------------------------------------------------===//
@@ -376,6 +453,9 @@ struct ConvertSimpToGPUPass
 
         // MatMul pattern for cuBLAS calls (large matrices)
         patterns.add<MatmulToCublasPattern>(ctx);
+
+        // patterns.add<FillToGPUKernelPattern>(ctx);
+
         // patterns.add<LinalgGenericToGPUPattern>(ctx);  // TODO: Complete implementation
 
         if (failed(applyPatternsAndFoldGreedily(module, std::move(patterns)))) {

@@ -50,6 +50,9 @@ int main(int argc, char** argv) {
     bool enablePrefetch = true;  // Prefetch insertion for memory latency hiding (enabled by default)
     bool llvmVectorize = false;  // Skip MLIR vectorization, let LLVM handle it (better for INT8/INT4)
     bool dumpMLIRPasses = false;  // Dump MLIR at each pipeline stage
+    bool emitGPU = false;  // Enable GPU code generation (requires USE_CUDA)
+    std::string cudaArch = "sm_80";  // CUDA compute capability (default: A100)
+    std::string gpuMatMulStrategy = "cublas";  // GPU matmul strategy
     std::string outputPath;
     std::string logLevel = "INFO";  // Default log level
     std::string targetArch = "";  // Target architecture (empty = native)
@@ -90,6 +93,15 @@ int main(int argc, char** argv) {
         std::cout << "  --llvm-vectorize   Use LLVM vectorization instead of MLIR (better for INT8/INT4)" << std::endl;
         std::cout << "  --no-opt           Disable LLVM O3 optimization (faster compilation)" << std::endl;
         std::cout << std::endl;
+
+#ifdef USE_CUDA
+        std::cout << "GPU Backend Options (requires CUDA):" << std::endl;
+        std::cout << "  --emit-gpu         Enable GPU code generation (CUDA)" << std::endl;
+        std::cout << "  --cuda-arch ARCH   Target CUDA architecture (default: sm_80 for A100)" << std::endl;
+        std::cout << "                     sm_70 = V100, sm_80 = A100, sm_90 = H100" << std::endl;
+        std::cout << "  --gpu-matmul STRAT GPU matmul strategy: cublas (default), mlir, auto" << std::endl;
+        std::cout << std::endl;
+#endif
 #endif
 
         std::cout << "Examples:" << std::endl;
@@ -183,6 +195,29 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "--dump-mlir-passes") == 0) {
             dumpMLIRPasses = true;
         }
+#ifdef USE_CUDA
+        else if (strcmp(argv[i], "--emit-gpu") == 0) {
+            emitGPU = true;
+            emitMLIR = true;  // GPU backend requires MLIR
+        }
+        else if (strcmp(argv[i], "--cuda-arch") == 0 && i + 1 < argc) {
+            cudaArch = argv[++i];
+            // Validate architecture format (sm_XX)
+            if (cudaArch.substr(0, 3) != "sm_" || cudaArch.length() < 5) {
+                std::cerr << "Error: Invalid CUDA architecture '" << cudaArch
+                          << "'. Expected format: sm_XX (e.g., sm_80)" << std::endl;
+                return 1;
+            }
+        }
+        else if (strcmp(argv[i], "--gpu-matmul") == 0 && i + 1 < argc) {
+            gpuMatMulStrategy = argv[++i];
+            if (gpuMatMulStrategy != "cublas" && gpuMatMulStrategy != "mlir" && gpuMatMulStrategy != "auto") {
+                std::cerr << "Error: Invalid GPU matmul strategy '" << gpuMatMulStrategy
+                          << "'. Valid options: cublas, mlir, auto" << std::endl;
+                return 1;
+            }
+        }
+#endif
 #endif
     }
     
@@ -199,7 +234,11 @@ int main(int argc, char** argv) {
 
 #ifdef USE_MLIR
     // Initialize LLVM optimization passes (required for makeOptimizingTransformer)
+    // Note: For CUDA builds with shared libMLIR.so, this symbol isn't exported,
+    // so we skip it. GPU codegen doesn't use JIT-style optimization anyway.
+#ifndef USE_CUDA
     mlir::initializeLLVMPasses();
+#endif
 #endif
 
     // Set input file
@@ -310,6 +349,18 @@ int main(int argc, char** argv) {
         if (dumpMLIRPasses) {
             LOG_INFO("MLIR intermediate IR dumping enabled");
         }
+
+#ifdef USE_CUDA
+        // Configure GPU backend options
+        if (emitGPU) {
+            pipeline.setEnableGPU(true);
+            pipeline.setCudaArch(cudaArch);
+            pipeline.setGPUMatMulStrategy(gpuMatMulStrategy);
+            LOG_INFO("GPU code generation enabled");
+            LOG_INFO("  Target CUDA architecture: " + cudaArch);
+            LOG_INFO("  GPU MatMul strategy: " + gpuMatMulStrategy);
+        }
+#endif
 
         // Run progressive lowering passes (Simp → LLVM dialect)
         if (!pipeline.runPasses()) {

@@ -40,6 +40,58 @@ add_public_tablegen_target(MLIRSimpDialectIncGen)
 # Simp Dialect Library
 #===----------------------------------------------------------------------===//
 
+# Build the list of MLIR libraries to link based on USE_CUDA
+# For CUDA: Use shared libMLIR.so (linked later) to avoid symbol conflicts
+# For non-CUDA: Use static MLIR libraries
+if(USE_CUDA)
+    # Empty for CUDA - we'll link libMLIR.so separately after the target is created
+    set(SIMP_DIALECT_LINK_LIBS)
+else()
+    # Static MLIR libraries for non-CUDA builds
+    set(SIMP_DIALECT_LINK_LIBS
+        MLIRIR
+        MLIRStandard
+        MLIRSCF
+        MLIRAffine
+        MLIRAffineTransforms
+        MLIRArithmetic
+        MLIRMath
+        MLIRMemRef
+        MLIRLinalg
+        MLIRLinalgTransforms
+        MLIRBufferizationTransforms
+        MLIRBufferizationToMemRef
+        MLIRTransforms
+        MLIRLLVMIR
+        MLIRLLVMCommonConversion
+        MLIRArithmeticToLLVM
+        MLIRMathToLLVM
+        MLIRLinalgToLLVM
+        MLIRMemRefToLLVM
+        MLIRSCFToStandard
+        MLIRStandardToLLVM
+        MLIROpenMP
+        MLIRSCFToOpenMP
+        MLIROpenMPToLLVM
+        MLIROpenMPToLLVMIRTranslation
+        MLIRReconcileUnrealizedCasts
+        MLIRTargetLLVMIRExport
+        MLIRLLVMToLLVMIRTranslation
+        mlir_c_runner_utils
+        mlir_runner_utils
+    )
+endif()
+
+# Collect GPU-specific sources when CUDA is enabled
+if(USE_CUDA)
+    set(GPU_SOURCES
+        gpu/GPUMemoryManager.cpp
+        lowering/ConvertSimpToGPU.cpp
+    )
+else()
+    set(GPU_SOURCES)
+endif()
+
 add_mlir_dialect_library(simp_dialect
   simp_dialect.cpp
   simp_types.cpp
@@ -57,6 +109,7 @@ add_mlir_dialect_library(simp_dialect
   passes/EmulateNarrowType.cpp
   passes/VNNIPass.cpp
   PromoteLargeAllocaToHeap.cpp
+  ${GPU_SOURCES}
 
   ADDITIONAL_HEADER_DIRS
   ${CMAKE_SOURCE_DIR}/include/mlir
@@ -67,37 +120,88 @@ add_mlir_dialect_library(simp_dialect
   MLIRSimpDialectIncGen
 
   LINK_LIBS PUBLIC
-  MLIRIR
-  MLIRStandard
-  MLIRSCF
-  MLIRAffine
-  MLIRAffineTransforms
-  MLIRArithmetic
-  MLIRMath
-  MLIRMemRef
-  MLIRLinalg
-  MLIRLinalgTransforms
-  MLIRBufferizationTransforms
-  MLIRBufferizationToMemRef
-  MLIRTransforms
-  MLIRLLVMIR
-  MLIRLLVMCommonConversion
-  MLIRArithmeticToLLVM
-  MLIRMathToLLVM
-  MLIRLinalgToLLVM
-  MLIRMemRefToLLVM
-  MLIRSCFToStandard
-  MLIRStandardToLLVM
-  MLIROpenMP                      # OpenMP dialect
-  MLIRSCFToOpenMP                 # SCF to OpenMP conversion
-  MLIROpenMPToLLVM                # OpenMP to LLVM conversion
-  MLIROpenMPToLLVMIRTranslation   # OpenMP LLVM IR translation
-  MLIRReconcileUnrealizedCasts
-  MLIRTargetLLVMIRExport
-  MLIRLLVMToLLVMIRTranslation
-  mlir_c_runner_utils
-  mlir_runner_utils
+  ${SIMP_DIALECT_LINK_LIBS}
 )
+
+# Link GPU/CUDA libraries when CUDA is enabled
+if(USE_CUDA)
+  # Find nvptxcompiler static library
+  find_library(NVPTXCOMPILER_LIBRARY
+    NAMES nvptxcompiler_static
+    PATHS ${CUDAToolkit_LIBRARY_DIR}
+    NO_DEFAULT_PATH
+  )
+
+  # Use shared MLIR library to avoid command-line option conflicts
+  # The shared libMLIR.so includes all dialects including GPU/NVVM
+  find_library(MLIR_SHARED_LIBRARY
+    NAMES MLIR
+    PATHS ${LLVM_LIBRARY_DIR}
+    NO_DEFAULT_PATH
+  )
+
+  if(MLIR_SHARED_LIBRARY)
+    message(STATUS "Using shared MLIR library: ${MLIR_SHARED_LIBRARY}")
+    target_link_libraries(simp_dialect
+      PUBLIC
+        ${MLIR_SHARED_LIBRARY}
+        CUDA::cudart
+        CUDA::cublas
+        ${NVPTXCOMPILER_LIBRARY}
+    )
+  else()
+    message(STATUS "Shared MLIR not found, using static GPU libraries")
+    # Fall back to static libs + individual GPU libraries
+    target_link_libraries(simp_dialect
+      PUBLIC
+        # Core MLIR static libs
+        MLIRIR
+        MLIRStandard
+        MLIRSCF
+        MLIRAffine
+        MLIRAffineTransforms
+        MLIRArithmetic
+        MLIRMath
+        MLIRMemRef
+        MLIRLinalg
+        MLIRLinalgTransforms
+        MLIRBufferizationTransforms
+        MLIRBufferizationToMemRef
+        MLIRTransforms
+        MLIRLLVMIR
+        MLIRLLVMCommonConversion
+        MLIRArithmeticToLLVM
+        MLIRMathToLLVM
+        MLIRLinalgToLLVM
+        MLIRMemRefToLLVM
+        MLIRSCFToStandard
+        MLIRStandardToLLVM
+        MLIROpenMP
+        MLIRSCFToOpenMP
+        MLIROpenMPToLLVM
+        MLIROpenMPToLLVMIRTranslation
+        MLIRReconcileUnrealizedCasts
+        MLIRTargetLLVMIRExport
+        MLIRLLVMToLLVMIRTranslation
+        mlir_c_runner_utils
+        mlir_runner_utils
+        # MLIR GPU dialect libraries (Ubuntu LLVM 14 naming)
+        MLIRGPUOps
+        MLIRGPUTransforms
+        MLIRGPUToNVVMTransforms
+        MLIRGPUToGPURuntimeTransforms
+        MLIRNVVMIR
+        MLIRNVVMToLLVMIRTranslation
+        # CUDA runtime libraries
+        CUDA::cudart
+        CUDA::cublas
+        ${NVPTXCOMPILER_LIBRARY}
+    )
+  endif()
+
+  message(STATUS "MLIR GPU dialect libraries linked for CUDA backend")
+  message(STATUS "Using nvptxcompiler: ${NVPTXCOMPILER_LIBRARY}")
+endif()
 
 # Disable RTTI and exceptions to match LLVM/MLIR build
 target_compile_options(simp_dialect PRIVATE -fno-rtti -fno-exceptions)

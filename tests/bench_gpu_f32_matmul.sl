@@ -77,6 +77,44 @@ fn bench_2048() -> f32 {
     return C[0i, 0i];
 }
 
+fn bench_4096() -> f32 {
+    f32<4096, 4096> A;
+    f32<4096, 4096> B;
+
+    var i = 0.0;
+    while (i < 4096.0) {
+        var j = 0.0;
+        while (j < 4096.0) {
+            A[i as i64, j as i64] = 1.0;
+            B[i as i64, j as i64] = 2.0;
+            j = j + 1.0;
+        }
+        i = i + 1.0;
+    }
+
+    var C = tensor_matmul(A, B);
+    return C[0i, 0i];
+}
+
+fn bench_6144() -> f32 {
+    f32<6144, 6144> A;
+    f32<6144, 6144> B;
+
+    var i = 0.0;
+    while (i < 6144.0) {
+        var j = 0.0;
+        while (j < 6144.0) {
+            A[i as i64, j as i64] = 1.0;
+            B[i as i64, j as i64] = 2.0;
+            j = j + 1.0;
+        }
+        i = i + 1.0;
+    }
+
+    var C = tensor_matmul(A, B);
+    return C[0i, 0i];
+}
+
 fn kernel_main() -> f32 {
     return bench_256();
 }

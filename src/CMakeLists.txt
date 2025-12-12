@@ -84,7 +84,16 @@ if(TCMALLOC_FOUND)
     target_link_libraries(simplang ${TCMALLOC_LIBRARY})
 endif()
 
-target_link_libraries(simplang ${llvm_libs} simplang_runtime)
+# When USE_CUDA is enabled, libMLIR.so provides all LLVM symbols
+# So we must NOT link LLVM directly to avoid duplicate symbol registration
+if(USE_CUDA)
+    # Only link simplang_runtime - LLVM comes through libMLIR.so
+    target_link_libraries(simplang simplang_runtime)
+    message(STATUS "CUDA mode: Skipping direct LLVM linking (provided by libMLIR.so)")
+else()
+    # Standard linking: direct LLVM libs
+    target_link_libraries(simplang ${llvm_libs} simplang_runtime)
+endif()
 
 # Add MLIR support if enabled
 if(USE_MLIR)
@@ -94,8 +103,16 @@ if(USE_MLIR)
         ${CMAKE_BINARY_DIR}/src/mlir  # For generated .inc files
         ${MLIR_INCLUDE_DIRS}
     )
-    target_link_libraries(simplang
-        simp_dialect
-        MLIRExecutionEngine  # For makeOptimizingTransformer and initializeLLVMPasses
-    )
+    if(USE_CUDA)
+        # Add CUDA compile definition so code can detect CUDA builds
+        target_compile_definitions(simplang PRIVATE USE_CUDA)
+        # For CUDA builds, only link simp_dialect which brings in libMLIR.so
+        # MLIRExecutionEngine is part of libMLIR.so already
+        target_link_libraries(simplang simp_dialect)
+    else()
+        target_link_libraries(simplang
+            simp_dialect
+            MLIRExecutionEngine  # For makeOptimizingTransformer and initializeLLVMPasses
+        )
+    endif()
 endif()

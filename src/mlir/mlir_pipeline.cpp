@@ -65,6 +65,18 @@
 // MLIR Verification
 #include "mlir/IR/Verifier.h"
 
+// GPU Dialect Support (conditional)
+#ifdef USE_CUDA
+#include "mlir/Dialect/GPU/GPUDialect.h"
+#include "mlir/Dialect/GPU/Passes.h"
+#include "mlir/Dialect/GPU/ParallelLoopMapper.h"
+#include "mlir/Dialect/LLVMIR/NVVMDialect.h"
+#include "mlir/Conversion/GPUToNVVM/GPUToNVVMPass.h"
+#include "mlir/Conversion/GPUCommon/GPUCommonPass.h"
+#include "mlir/Conversion/SCFToGPU/SCFToGPU.h"
+#include "mlir/gpu/GPUPasses.h"
+#endif
+
 // LLVM
 #include "llvm/IR/Module.h"
 #include "llvm/Support/raw_ostream.h"
@@ -121,6 +133,35 @@ bool MLIRCompilationPipeline::runPasses() {
     }
   }
 
+#ifdef USE_CUDA
+  // Phase 1.5: GPU MatMul Interception (MUST run before Phase 2!)
+  // Intercepts large linalg.matmul ops and converts to cuBLAS calls
+  // before Phase 2 expands them to loops
+  if (enableGPU) {
+    mlir::PassManager pm(module.getContext());
+    if (dumpIntermediateIR) pm.enableIRPrinting();
+
+    // Only add the cuBLAS pattern here - intercept large matmuls
+    pm.addPass(createConvertSimpToGPUPass());
+
+    if (failed(pm.run(module))) {
+      llvm::errs() << "Error: Phase 1.5 (GPU matmul interception) failed\n";
+      module.dump();
+      return false;
+    }
+
+    if (dumpIntermediateIR && !outputPath.empty()) {
+      std::string dumpPath = outputPath + "_phase1_5_gpu_matmul.mlir";
+      std::error_code EC;
+      llvm::raw_fd_ostream out(dumpPath, EC);
+      if (!EC) {
+        module.print(out);
+        llvm::outs() << "Phase 1.5 dump (GPU matmul interception): " << dumpPath << "\n";
+      }
+    }
+  }
+#endif
+
   // Phase 2: Linalg optimization (tiling, vectorization, loop lowering)
   // This phase should create scf.for loops and insert memref.prefetch
   {
@@ -167,6 +208,56 @@ bool MLIRCompilationPipeline::runPasses() {
       }
     }
   }
+
+#ifdef USE_CUDA
+  // Phase 2.7: GPU Lowering (optional, when enableGPU is set)
+  // Converts parallel loops to GPU kernels, maps memory to device
+  if (enableGPU) {
+    mlir::PassManager pm(module.getContext());
+    if (dumpIntermediateIR) pm.enableIRPrinting();
+    buildPhase2_7_GPULowering(pm);
+
+    if (failed(pm.run(module))) {
+      llvm::errs() << "Error: Phase 2.7 (GPU lowering) failed\n";
+      module.dump();
+      return false;
+    }
+
+    if (dumpIntermediateIR && !outputPath.empty()) {
+      std::string dumpPath = outputPath + "_phase2_7_gpu_lowering.mlir";
+      std::error_code EC;
+      llvm::raw_fd_ostream out(dumpPath, EC);
+      if (!EC) {
+        module.print(out);
+        llvm::outs() << "Phase 2.7 dump (GPU lowering): " << dumpPath << "\n";
+      }
+    }
+
+    // Phase 4: NVVM Lowering (GPU -> NVVM -> LLVM)
+    // Must run before Phase 3 to lower GPU ops
+    {
+      mlir::PassManager pm(module.getContext());
+      if (dumpIntermediateIR) pm.enableIRPrinting();
+      buildPhase4_NVVMLowering(pm);
+
+      if (failed(pm.run(module))) {
+        llvm::errs() << "Error: Phase 4 (NVVM lowering) failed\n";
+        module.dump();
+        return false;
+      }
+
+      if (dumpIntermediateIR && !outputPath.empty()) {
+        std::string dumpPath = outputPath + "_phase4_nvvm_lowering.mlir";
+        std::error_code EC;
+        llvm::raw_fd_ostream out(dumpPath, EC);
+        if (!EC) {
+          module.print(out);
+          llvm::outs() << "Phase 4 dump (NVVM lowering): " << dumpPath << "\n";
+        }
+      }
+    }
+  }
+#endif
 
   // Phase 3: Lower to LLVM dialect (vector, control flow, arithmetic)
   {
@@ -239,6 +330,15 @@ std::unique_ptr<llvm::Module> MLIRCompilationPipeline::translateToLLVMIR(
   if (!llvmModule) {
     llvm::errs() << "Error: Failed to translate MLIR to LLVM IR\n";
     return nullptr;
+  }
+
+  // Add stack alignment for AVX512 (64-byte alignment required)
+  // This ensures proper alignment for vectorized operations
+  for (auto& F : *llvmModule) {
+    if (!F.isDeclaration()) {
+      // Add alignstack(64) attribute for AVX512 compatibility
+      F.addFnAttr(llvm::Attribute::getWithStackAlignment(llvmContext, llvm::Align(64)));
+    }
   }
 
   return llvmModule;
@@ -586,4 +686,127 @@ bool MLIRCompilationPipeline::applyLLVMDialectConversion() {
 
   return true;
 }
+
+//===----------------------------------------------------------------------===//
+// GPU Pipeline Phases (USE_CUDA)
+//===----------------------------------------------------------------------===//
+
+#ifdef USE_CUDA
+
+/// Custom pass to map scf.parallel loops to GPU using MLIR 14 API
+/// MLIR 14 uses greedilyMapParallelSCFToGPU() instead of createGpuMapParallelLoopsPass()
+struct MapParallelToGPUPass
+    : public PassWrapper<MapParallelToGPUPass, OperationPass<FuncOp>> {
+  StringRef getArgument() const override { return "map-parallel-to-gpu"; }
+  StringRef getDescription() const override {
+    return "Map scf.parallel loops to GPU dimensions";
+  }
+
+  void getDependentDialects(DialectRegistry& registry) const override {
+    registry.insert<gpu::GPUDialect>();
+    registry.insert<scf::SCFDialect>();
+  }
+
+  void runOnOperation() override {
+    FuncOp funcOp = getOperation();
+    // MLIR 14 API: greedily annotate parallel loops with GPU mapping attributes
+    greedilyMapParallelSCFToGPU(funcOp.getBody());
+    llvm::outs() << "[GPU] Mapped parallel loops to GPU for function: "
+                 << funcOp.getName() << "\n";
+  }
+};
+
+/// Custom pass to convert mapped scf.parallel to gpu.launch using MLIR 14 API
+/// MLIR 14 uses populateParallelLoopToGPUPatterns() instead of createParallelLoopToGpuPass()
+struct ConvertParallelToGPULaunchPass
+    : public PassWrapper<ConvertParallelToGPULaunchPass, OperationPass<ModuleOp>> {
+  StringRef getArgument() const override { return "convert-parallel-to-gpu-launch"; }
+  StringRef getDescription() const override {
+    return "Convert scf.parallel loops to gpu.launch operations";
+  }
+
+  void getDependentDialects(DialectRegistry& registry) const override {
+    registry.insert<gpu::GPUDialect>();
+    registry.insert<scf::SCFDialect>();
+    registry.insert<AffineDialect>();
+  }
+
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+    MLIRContext* ctx = &getContext();
+
+    // Set up conversion target
+    ConversionTarget target(*ctx);
+    target.addLegalDialect<gpu::GPUDialect, arith::ArithmeticDialect,
+                           memref::MemRefDialect, AffineDialect>();
+    // Configure legality for scf.parallel conversion
+    configureParallelLoopToGPULegality(target);
+
+    // Populate patterns for scf.parallel -> gpu.launch conversion
+    RewritePatternSet patterns(ctx);
+    populateParallelLoopToGPUPatterns(patterns);
+
+    // Apply conversion
+    if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
+      llvm::errs() << "[GPU] Warning: Some parallel loops could not be converted to GPU\n";
+      // Don't fail - some loops may not be suitable for GPU
+    }
+
+    // Finalize the conversion (cleanup)
+    finalizeParallelLoopToGPUConversion(module);
+
+    llvm::outs() << "[GPU] Parallel loop to GPU launch conversion completed\n";
+  }
+};
+
+std::unique_ptr<Pass> createMapParallelToGPUPass() {
+  return std::make_unique<MapParallelToGPUPass>();
+}
+
+std::unique_ptr<Pass> createConvertParallelToGPULaunchPass() {
+  return std::make_unique<ConvertParallelToGPULaunchPass>();
+}
+
+void MLIRCompilationPipeline::buildPhase2_7_GPULowering(mlir::OpPassManager& pm) {
+  llvm::outs() << "[GPU] Building Phase 2.7: GPU Kernel Lowering\n";
+  llvm::outs() << "  Target architecture: " << cudaArch << "\n";
+
+  // NOTE: cuBLAS matmul interception now happens in Phase 1.5
+  // This phase handles parallel loop -> GPU kernel conversion
+
+  // Step 1: Map parallel loops to GPU dimensions (nested on FuncOp)
+  // Uses greedilyMapParallelSCFToGPU() which is available in MLIR 14
+  pm.addNestedPass<FuncOp>(createMapParallelToGPUPass());
+
+  // Step 2: Convert mapped parallel loops to gpu.launch operations
+  // Uses populateParallelLoopToGPUPatterns() which is available in MLIR 14
+  pm.addPass(createConvertParallelToGPULaunchPass());
+
+  // Step 3: Outline GPU kernels
+  // This extracts gpu.launch regions into separate gpu.func operations
+  pm.addPass(mlir::createGpuKernelOutliningPass());
+
+  // Step 4: Insert GPU runtime calls for async execution (optional)
+  // pm.addNestedPass<gpu::GPUModuleOp>(mlir::createGpuAsyncRegionPass());
+
+  llvm::outs() << "[GPU] Phase 2.7 passes configured\n";
+}
+
+void MLIRCompilationPipeline::buildPhase4_NVVMLowering(mlir::OpPassManager& pm) {
+  llvm::outs() << "[GPU] Building Phase 4: NVVM Lowering\n";
+
+  // Step 1: Lower GPU dialect to NVVM dialect
+  pm.addNestedPass<gpu::GPUModuleOp>(mlir::createLowerGpuOpsToNVVMOpsPass());
+
+  // Step 2: Lower NVVM dialect to LLVM dialect
+  // pm.addNestedPass<gpu::GPUModuleOp>(mlir::createConvertNVVMToLLVMPass());
+
+  // Step 3: Serialize to PTX/CUBIN
+  // This would use mlir::createGpuSerializeToCubinPass() or similar
+  // For now, we'll rely on runtime compilation
+
+  llvm::outs() << "[GPU] Phase 4 passes configured\n";
+}
+
+#endif // USE_CUDA
 

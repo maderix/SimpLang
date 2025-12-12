@@ -26,6 +26,12 @@
 #include "logger.hpp"
 #include <cmath>
 
+// GPU dialect includes (conditionally compiled when CUDA is enabled)
+#ifdef USE_CUDA
+#include "mlir/Dialect/GPU/GPUDialect.h"
+#include "mlir/Dialect/LLVMIR/NVVMDialect.h"
+#endif
+
 // Include full AST definitions here in the .cpp file
 // This way the header doesn't pull in exception-throwing code
 #include "ast/ast.hpp"
@@ -56,6 +62,13 @@ void MLIRCodeGenContext::initializeMLIRContext() {
   mlirContext.getOrLoadDialect<mlir::vector::VectorDialect>();  // For vectorization
   mlirContext.getOrLoadDialect<mlir::memref::MemRefDialect>();  // For memref ops
   mlirContext.getOrLoadDialect<mlir::linalg::LinalgDialect>();  // For linalg ops
+
+  // GPU dialects (conditionally loaded when CUDA is enabled)
+#ifdef USE_CUDA
+  mlirContext.getOrLoadDialect<mlir::gpu::GPUDialect>();    // GPU operations
+  mlirContext.getOrLoadDialect<mlir::NVVM::NVVMDialect>();  // NVIDIA PTX ops
+  llvm::outs() << "GPU dialects registered for CUDA backend\n";
+#endif
 }
 
 void MLIRCodeGenContext::createModule(const std::string& moduleName) {
@@ -2239,6 +2252,26 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
 
     // Return the output tensor so it can be used in expressions
     return output;
+  }
+
+  // tensor_fill: tensor_fill(tensor, value) - fill tensor with constant
+  if (calleeName == "tensor_fill") {
+    if (args.size() != 2) {
+      llvm::errs() << "Error: tensor_fill requires 2 arguments (tensor, value)\n";
+      return nullptr;
+    }
+
+    mlir::Value tensor = args[0];
+    mlir::Value value = args[1];
+    auto tensorType = tensor.getType().dyn_cast<mlir::simp::SimpTensorType>();
+
+    if (!tensorType) {
+      llvm::errs() << "Error: tensor_fill requires tensor argument\n";
+      return nullptr;
+    }
+
+    builder.create<mlir::simp::TensorFillOp>(loc, tensor, value);
+    return tensor;
   }
 
   // tensor_matvecmul: tensor_matvecmul(lhs, rhs) - optimized for N << K

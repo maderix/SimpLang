@@ -132,31 +132,51 @@ struct PromoteLargeAllocaToHeap : public FunctionPass {
         }
       }
 
-      Value *TotalSize = Builder.getInt64(TypeSize * ArrayCount);
-      errs() << "  Total size to allocate: " << (TypeSize * ArrayCount) << " bytes\n";
+      uint64_t TotalSizeBytes = TypeSize * ArrayCount;
+      Value *TotalSize = Builder.getInt64(TotalSizeBytes);
+      errs() << "  Total size to allocate: " << TotalSizeBytes << " bytes\n";
 
-      // Insert malloc call
-      FunctionCallee MallocFunc = M->getOrInsertFunction(
-          "malloc",
-          PointerType::get(Builder.getInt8Ty(), 0),
-          Builder.getInt64Ty()
-      );
+      // Get alloca alignment - use aligned_alloc if > 16 bytes (AVX512 needs 64)
+      unsigned AllocaAlign = AI->getAlign().value();
+      errs() << "  Required alignment: " << AllocaAlign << " bytes\n";
 
-      CallInst *MallocCall = Builder.CreateCall(MallocFunc, {TotalSize});
-      MallocCall->setName(AI->getName() + ".heap");
+      CallInst *AllocCall;
+      if (AllocaAlign > 16) {
+        // Use aligned_alloc for AVX512 and other large alignments
+        FunctionCallee AlignedAllocFunc = M->getOrInsertFunction(
+            "aligned_alloc",
+            PointerType::get(Builder.getInt8Ty(), 0),
+            Builder.getInt64Ty(),  // alignment
+            Builder.getInt64Ty()   // size
+        );
+        // aligned_alloc requires size to be multiple of alignment
+        uint64_t AlignedSize = ((TotalSizeBytes + AllocaAlign - 1) / AllocaAlign) * AllocaAlign;
+        Value *AlignmentVal = Builder.getInt64(AllocaAlign);
+        Value *AlignedSizeVal = Builder.getInt64(AlignedSize);
+        AllocCall = Builder.CreateCall(AlignedAllocFunc, {AlignmentVal, AlignedSizeVal});
+        errs() << "  Created aligned_alloc(" << AllocaAlign << ", " << AlignedSize << ") call\n";
+      } else {
+        // Use regular malloc for standard alignments
+        FunctionCallee MallocFunc = M->getOrInsertFunction(
+            "malloc",
+            PointerType::get(Builder.getInt8Ty(), 0),
+            Builder.getInt64Ty()
+        );
+        AllocCall = Builder.CreateCall(MallocFunc, {TotalSize});
+        errs() << "  Created malloc call\n";
+      }
+      AllocCall->setName(AI->getName() + ".heap");
 
-      errs() << "  Created malloc call\n";
-
-      // Bitcast malloc result to correct type
+      // Bitcast alloc result to correct type
       Value *BitCast = Builder.CreateBitCast(
-          MallocCall,
+          AllocCall,
           AI->getType(),
           AI->getName() + ".cast"
       );
 
       errs() << "  Created bitcast\n";
 
-      // Replace alloca uses with malloc
+      // Replace alloca uses with heap allocation
       AI->replaceAllUsesWith(BitCast);
       errs() << "  Replaced all uses\n";
 
@@ -170,7 +190,7 @@ struct PromoteLargeAllocaToHeap : public FunctionPass {
       for (BasicBlock &BB : F) {
         if (ReturnInst *RI = dyn_cast<ReturnInst>(BB.getTerminator())) {
           Builder.SetInsertPoint(RI);
-          Builder.CreateCall(FreeFunc, {MallocCall});
+          Builder.CreateCall(FreeFunc, {AllocCall});
         }
       }
 
