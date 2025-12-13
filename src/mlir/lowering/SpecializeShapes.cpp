@@ -8,13 +8,14 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-#include "llvm/ADT/Optional.h"
+#include <optional>
 
 using namespace mlir;
 
@@ -30,7 +31,7 @@ struct SpecializeReinterpretCastPattern
     Location loc = op.getLoc();
 
     // Get the result type
-    auto resultType = op.getType().dyn_cast<MemRefType>();
+    auto resultType = mlir::dyn_cast<MemRefType>(op.getType());
     if (!resultType || !resultType.hasRank())
       return failure();
 
@@ -40,10 +41,12 @@ struct SpecializeReinterpretCastPattern
 
     // Try to extract constant sizes from the size operands
     SmallVector<int64_t, 4> staticSizes;
-    for (Value sizeOp : op.sizes()) {
+    for (Value sizeOp : op.getSizes()) {
       // Try to get constant value
       if (auto constOp = sizeOp.getDefiningOp<arith::ConstantIndexOp>()) {
-        staticSizes.push_back(constOp.value());
+        // getValue() returns TypedAttr in LLVM 21, cast to IntegerAttr to get int
+        auto intAttr = mlir::cast<IntegerAttr>(constOp.getValue());
+        staticSizes.push_back(intAttr.getInt());
       } else if (auto castOp = sizeOp.getDefiningOp<arith::IndexCastOp>()) {
         // Check if it's a cast from a constant
         Value castInput = castOp->getOperand(0);
@@ -70,13 +73,13 @@ struct SpecializeReinterpretCastPattern
     auto newOp = rewriter.create<memref::ReinterpretCastOp>(
         loc,
         staticType,
-        op.source(),
-        op.offsets(),
-        op.sizes(),
-        op.strides(),
-        op.static_offsets(),
-        op.static_sizes(),
-        op.static_strides());
+        op.getSource(),
+        op.getOffsets(),
+        op.getSizes(),
+        op.getStrides(),
+        op.getStaticOffsets(),
+        op.getStaticSizes(),
+        op.getStaticStrides());
 
     rewriter.replaceOp(op, newOp.getResult());
     return success();
@@ -85,7 +88,7 @@ struct SpecializeReinterpretCastPattern
 
 /// Pass that specializes dynamic memref shapes to static shapes
 struct SpecializeShapesPass
-    : public PassWrapper<SpecializeShapesPass, OperationPass<FuncOp>> {
+    : public PassWrapper<SpecializeShapesPass, OperationPass<func::FuncOp>> {
 
 
   StringRef getArgument() const override {
@@ -97,7 +100,7 @@ struct SpecializeShapesPass
   }
 
   void runOnOperation() override {
-    FuncOp func = getOperation();
+    func::FuncOp func = getOperation();
     MLIRContext *context = &getContext();
 
     RewritePatternSet patterns(context);

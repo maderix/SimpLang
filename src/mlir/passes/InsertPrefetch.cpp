@@ -8,9 +8,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/SCF/SCF.h"
-#include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/Pass/Pass.h"
@@ -26,7 +26,7 @@ namespace {
 /// This pass walks scf.for loops and inserts memref.prefetch operations
 /// for next-iteration loads to overlap memory access with computation.
 ///
-class InsertPrefetchPass : public PassWrapper<InsertPrefetchPass, OperationPass<mlir::FuncOp>> {
+class InsertPrefetchPass : public PassWrapper<InsertPrefetchPass, OperationPass<func::FuncOp>> {
 public:
   StringRef getArgument() const override {
     return "simp-insert-prefetch";
@@ -37,7 +37,7 @@ public:
   }
 
   void runOnOperation() override {
-    mlir::FuncOp func = getOperation();
+    func::FuncOp func = getOperation();
     OpBuilder builder(func.getContext());
 
     // Walk all scf.for loops
@@ -66,17 +66,43 @@ public:
       // Inner loop: normal prefetch for next iteration
       unsigned localityHint = hasNestedLoop ? 3 : 2;  // L3 for outer, L2 for inner
 
-      // Find memref.load operations (scalar loads)
+      // Find memref.load operations (scalar loads) - only in immediate loop body
+      // Skip loads inside nested loops to avoid using values that don't dominate
       SmallVector<memref::LoadOp, 4> loads;
-      body->walk([&](memref::LoadOp loadOp) {
-        loads.push_back(loadOp);
-      });
+      for (Operation &op : *body) {
+        if (auto loadOp = dyn_cast<memref::LoadOp>(&op)) {
+          loads.push_back(loadOp);
+        }
+      }
 
       for (auto loadOp : loads) {
         auto indices = loadOp.getIndices();
         if (indices.empty()) continue;
 
         // If first index is the loop IV, prefetch next iteration
+        // Also verify all indices dominate the insertion point
+        bool allIndicesDominate = true;
+        for (auto idx : indices) {
+          // Check if idx is defined in this loop body or outside
+          if (auto defOp = idx.getDefiningOp()) {
+            // If defined inside a nested loop, skip this load
+            if (defOp->getParentRegion() != &forOp.getBodyRegion()) {
+              // It's fine if defined outside
+            }
+          } else {
+            // Block argument - check if it's from a nested loop
+            if (auto blockArg = mlir::dyn_cast<BlockArgument>(idx)) {
+              if (blockArg.getOwner() != body) {
+                // Not our block - might be inner loop, skip
+                allIndicesDominate = false;
+                break;
+              }
+            }
+          }
+        }
+
+        if (!allIndicesDominate) continue;
+
         if (indices[0] == iv) {
           SmallVector<Value, 4> prefetchIndices(indices.begin(), indices.end());
           Value nextIV = builder.create<AddIOp>(loc, iv, step);
@@ -88,25 +114,27 @@ public:
         }
       }
 
-      // Find vector.transfer_read operations (vectorized loads)
+      // Find vector.transfer_read operations (vectorized loads) - only in immediate loop body
       SmallVector<vector::TransferReadOp, 4> vectorReads;
-      body->walk([&](vector::TransferReadOp readOp) {
-        vectorReads.push_back(readOp);
-      });
+      for (Operation &op : *body) {
+        if (auto readOp = dyn_cast<vector::TransferReadOp>(&op)) {
+          vectorReads.push_back(readOp);
+        }
+      }
 
       for (auto readOp : vectorReads) {
         // Check if any index uses the loop IV - prefetch subview memref
         // For matmul: vector.transfer_read reads from memref.subview results
         // We prefetch the base memref using the outer loop IV
-        Value source = readOp.source();
+        Value source = readOp.getBase();
 
         // If source is a subview, get its indices
         if (auto subviewOp = source.getDefiningOp<memref::SubViewOp>()) {
           auto subviewOffsets = subviewOp.getMixedOffsets();
           if (subviewOffsets.size() >= 2) {
             // Get the base memref type to check dimensionality
-            auto baseMemref = subviewOp.source();
-            auto baseType = baseMemref.getType().dyn_cast<MemRefType>();
+            auto baseMemref = subviewOp.getSource();
+            auto baseType = mlir::dyn_cast<MemRefType>(baseMemref.getType());
 
             // Only apply row prefetching to 2D matrices (NxM), not vectors (Nx1)
             // Check: rank == 2 AND second dimension > 16 (not a column vector)
@@ -121,21 +149,21 @@ public:
 
             // Check if FIRST offset uses this loop's IV
             OpFoldResult firstOffset = subviewOffsets[0];
-            if (auto firstOffsetVal = firstOffset.dyn_cast<Value>()) {
+            if (auto firstOffsetVal = mlir::dyn_cast<Value>(firstOffset)) {
               if (firstOffsetVal == iv) {
                 // Deep prefetch: prefetch 2 iterations ahead for better latency hiding
                 // Iteration i+1
                 Value nextIV1 = builder.create<AddIOp>(loc, iv, step);
                 SmallVector<Value, 2> prefetchIdx1 = {nextIV1, builder.create<arith::ConstantIndexOp>(loc, 0)};
                 builder.create<memref::PrefetchOp>(
-                    loc, subviewOp.source(), prefetchIdx1,
+                    loc, subviewOp.getSource(), prefetchIdx1,
                     /*isWrite=*/false, /*localityHint=*/localityHint, /*isDataCache=*/true);
 
                 // Iteration i+2
                 Value nextIV2 = builder.create<AddIOp>(loc, nextIV1, step);
                 SmallVector<Value, 2> prefetchIdx2 = {nextIV2, builder.create<arith::ConstantIndexOp>(loc, 0)};
                 builder.create<memref::PrefetchOp>(
-                    loc, subviewOp.source(), prefetchIdx2,
+                    loc, subviewOp.getSource(), prefetchIdx2,
                     /*isWrite=*/false, /*localityHint=*/localityHint, /*isDataCache=*/true);
               }
             }
@@ -143,14 +171,14 @@ public:
             // Check if SECOND offset uses this loop's IV (inner loop accessing weights)
             if (subviewOffsets.size() >= 2) {
               OpFoldResult secondOffset = subviewOffsets[1];
-              if (auto secondOffsetVal = secondOffset.dyn_cast<Value>()) {
+              if (auto secondOffsetVal = mlir::dyn_cast<Value>(secondOffset)) {
                 if (secondOffsetVal == iv && !hasNestedLoop) {
                   // Inner loop: prefetch next column tile
                   Value nextIV = builder.create<AddIOp>(loc, iv, step);
                   SmallVector<Value, 2> prefetchIdx = {builder.create<arith::ConstantIndexOp>(loc, 0), nextIV};
 
                   builder.create<memref::PrefetchOp>(
-                      loc, subviewOp.source(), prefetchIdx,
+                      loc, subviewOp.getSource(), prefetchIdx,
                       /*isWrite=*/false, /*localityHint=*/2, /*isDataCache=*/true);
                 }
               }

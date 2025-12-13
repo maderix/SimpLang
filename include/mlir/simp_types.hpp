@@ -60,6 +60,9 @@ class ArrayType : public mlir::Type::TypeBase<ArrayType, mlir::Type,
 public:
   using Base::Base;
 
+  /// Type name for MLIR type registration (required in LLVM 15+)
+  static constexpr llvm::StringLiteral name = "simp.array";
+
   /// Get or create an instance of ArrayType.
   static ArrayType get(mlir::MLIRContext *context, mlir::Type elementType);
 
@@ -118,6 +121,9 @@ class SimpTensorType : public mlir::Type::TypeBase<SimpTensorType, mlir::Type,
                                                     detail::SimpTensorTypeStorage> {
 public:
   using Base::Base;
+
+  /// Type name for MLIR type registration (required in LLVM 15+)
+  static constexpr llvm::StringLiteral name = "simp.tensor";
 
   /// Get or create an instance of SimpTensorType.
   /// @param context MLIR context

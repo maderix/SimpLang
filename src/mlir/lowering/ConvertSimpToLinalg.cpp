@@ -8,10 +8,10 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -52,14 +52,14 @@ struct MatMulOpLowering : public OpRewritePattern<simp::MatMulOp> {
     Location loc = op.getLoc();
 
     // Get operands (now memrefs after SimpToMemRef pass)
-    Value lhs = op.lhs();     // A: MxK matrix as memref<?xT>
-    Value rhs = op.rhs();     // B: KxN matrix as memref<?xT>
-    Value m = op.m();         // Rows of A
-    Value k = op.k();         // Cols of A / Rows of B
-    Value n = op.n();         // Cols of B
+    Value lhs = op.getLhs();     // A: MxK matrix as memref<?xT>
+    Value rhs = op.getRhs();     // B: KxN matrix as memref<?xT>
+    Value m = op.getM();         // Rows of A
+    Value k = op.getK();         // Cols of A / Rows of B
+    Value n = op.getN();         // Cols of B
 
     // Get the element type from the memref
-    auto lhsMemRefType = lhs.getType().dyn_cast<MemRefType>();
+    auto lhsMemRefType = mlir::dyn_cast<MemRefType>(lhs.getType());
     if (!lhsMemRefType) {
       return failure();
     }
@@ -76,10 +76,10 @@ struct MatMulOpLowering : public OpRewritePattern<simp::MatMulOp> {
       n = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), n);
     }
 
-    // Create 2D memref types for matrices
-    auto matrixAType = MemRefType::get({-1, -1}, elemType);  // MxK
-    auto matrixBType = MemRefType::get({-1, -1}, elemType);  // KxN
-    auto matrixCType = MemRefType::get({-1, -1}, elemType);  // MxN
+    // LLVM 21: Create 2D memref types for matrices using ShapedType::kDynamic
+    auto matrixAType = MemRefType::get({ShapedType::kDynamic, ShapedType::kDynamic}, elemType);  // MxK
+    auto matrixBType = MemRefType::get({ShapedType::kDynamic, ShapedType::kDynamic}, elemType);  // KxN
+    auto matrixCType = MemRefType::get({ShapedType::kDynamic, ShapedType::kDynamic}, elemType);  // MxN
 
     // Reinterpret 1D arrays as 2D matrices
     // A: memref<?xT> -> memref<?x?xT> with shape [m, k]
@@ -102,7 +102,7 @@ struct MatMulOpLowering : public OpRewritePattern<simp::MatMulOp> {
 
     // Allocate result matrix C (MxN as 1D array)
     Value resultSize = rewriter.create<arith::MulIOp>(loc, m, n);
-    auto result1DType = MemRefType::get({-1}, elemType);
+    auto result1DType = MemRefType::get({ShapedType::kDynamic}, elemType);
     Value result = rewriter.create<memref::AllocOp>(loc, result1DType, ValueRange{resultSize});
 
     // Reinterpret result as 2D matrix
@@ -115,13 +115,15 @@ struct MatMulOpLowering : public OpRewritePattern<simp::MatMulOp> {
 
     // Initialize result matrix to zero using linalg.fill
     Value zero;
-    if (elemType.isa<FloatType>()) {
-      // Create a properly typed float attribute
-      auto floatType = elemType.cast<FloatType>();
-      Attribute zeroAttr = rewriter.getFloatAttr(floatType, 0.0);
-      zero = rewriter.create<arith::ConstantOp>(loc, floatType, zeroAttr);
-    } else if (elemType.isa<IntegerType>()) {
-      zero = rewriter.create<arith::ConstantIntOp>(loc, 0, elemType);
+    if (mlir::isa<FloatType>(elemType)) {
+      // Create a properly typed float attribute (TypedAttr required in MLIR 15+)
+      auto floatType = mlir::cast<FloatType>(elemType);
+      auto zeroAttr = rewriter.getFloatAttr(floatType, 0.0);
+      zero = rewriter.create<arith::ConstantOp>(loc, zeroAttr);
+    } else if (mlir::isa<IntegerType>(elemType)) {
+      auto intType = mlir::cast<IntegerType>(elemType);
+      auto zeroAttr = rewriter.getIntegerAttr(intType, 0);
+      zero = rewriter.create<arith::ConstantOp>(loc, zeroAttr);
     } else {
       return failure();
     }
@@ -162,7 +164,7 @@ struct ConvertSimpToLinalgPass
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<linalg::LinalgDialect>();
     registry.insert<memref::MemRefDialect>();
-    registry.insert<arith::ArithmeticDialect>();
+    registry.insert<arith::ArithDialect>();
   }
 
   void runOnOperation() override {
@@ -172,10 +174,10 @@ struct ConvertSimpToLinalgPass
     ConversionTarget target(getContext());
     target.addLegalDialect<linalg::LinalgDialect>();
     target.addLegalDialect<memref::MemRefDialect>();
-    target.addLegalDialect<arith::ArithmeticDialect>();
-    target.addLegalDialect<StandardOpsDialect>();
+    target.addLegalDialect<arith::ArithDialect>();
+    target.addLegalDialect<func::FuncDialect>();
     target.addLegalDialect<SimpDialect>();
-    target.addLegalOp<ModuleOp, FuncOp>();
+    target.addLegalOp<ModuleOp, func::FuncOp>();
 
     // Only mark simp.matmul as illegal
     target.addIllegalOp<simp::MatMulOp>();

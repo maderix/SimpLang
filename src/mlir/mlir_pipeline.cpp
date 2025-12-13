@@ -21,36 +21,42 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/Passes.h"
 #include "mlir/Dialect/Affine/LoopUtils.h"
-#include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
-#include "mlir/Dialect/Arithmetic/Transforms/Passes.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"  // For LinalgTilingLoopType
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/MemRef/Transforms/Passes.h"
 #include "mlir/Dialect/OpenMP/OpenMPDialect.h"  // OpenMP dialect
-#include "mlir/Dialect/SCF/SCF.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vector/Transforms/VectorTransforms.h"
 #include "mlir/Dialect/Vector/Transforms/VectorRewritePatterns.h"
+#include "mlir/Dialect/Vector/Transforms/Passes.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 // MLIR Conversion Passes
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
-#include "mlir/Conversion/ArithmeticToLLVM/ArithmeticToLLVM.h"
+#include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/BufferizationToMemRef/BufferizationToMemRef.h"
-#include "mlir/Conversion/LinalgToLLVM/LinalgToLLVM.h"
+#include "mlir/Conversion/LinalgToStandard/LinalgToStandard.h"
 #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Conversion/OpenMPToLLVM/ConvertOpenMPToLLVM.h"  // OpenMP to LLVM conversion
 #include "mlir/Conversion/SCFToOpenMP/SCFToOpenMP.h"  // SCF to OpenMP conversion
-#include "mlir/Conversion/SCFToStandard/SCFToStandard.h"
-#include "mlir/Conversion/StandardToLLVM/ConvertStandardToLLVM.h"
+#include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
+#include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
+#include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
+#include "mlir/Conversion/IndexToLLVM/IndexToLLVM.h"
 #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
+#include "mlir/Conversion/Passes.h"   // For createConvertFuncToLLVMPass, createConvertArithToLLVMPass, etc.
 #include "mlir/Conversion/VectorToSCF/VectorToSCF.h"
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
 #include "mlir/Dialect/Linalg/Passes.h"
@@ -58,8 +64,9 @@
 #include "mlir/Transforms/DialectConversion.h"
 
 // MLIR to LLVM IR Translation
+#include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
-#include "mlir/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.h"  // OpenMP IR translation
+#include "mlir/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Export.h"
 
 // MLIR Verification
@@ -232,13 +239,14 @@ std::unique_ptr<llvm::Module> MLIRCompilationPipeline::translateToLLVMIR(
     return nullptr;
   }
 
-  // Register LLVM dialect translation
-  mlir::registerLLVMDialectTranslation(*module.getContext());
-
-  // Register OpenMP dialect translation (if OpenMP is enabled)
+  // LLVM 21: Register dialect translations for LLVM IR generation
+  mlir::DialectRegistry registry;
+  mlir::registerBuiltinDialectTranslation(registry);
+  mlir::registerLLVMDialectTranslation(registry);
   if (enableOpenMP) {
-    mlir::registerOpenMPDialectTranslation(*module.getContext());
+    mlir::registerOpenMPDialectTranslation(registry);
   }
+  module.getContext()->appendDialectRegistry(registry);
 
   // Translate MLIR LLVM dialect to LLVM IR
   auto llvmModule = mlir::translateModuleToLLVMIR(module, llvmContext);
@@ -344,23 +352,18 @@ void MLIRCompilationPipeline::buildPhase2_LinalgOptimization(mlir::OpPassManager
       }
 
       // Level 1: Outer tiling (L2/L3 cache aware)
-      llvm::SmallVector<int64_t, 3> outerTileSizes = {outer_tile, outer_tile, outer_tile};
-      pm.addNestedPass<mlir::FuncOp>(
-          mlir::createLinalgTilingPass(outerTileSizes, loopType));
+      // In LLVM 21+, use custom SimpLinalgTilingPass
+      pm.addNestedPass<mlir::func::FuncOp>(
+          mlir::simp::createSimpLinalgTilingPass(outer_tile, true, enableOpenMP));
       if (!enableDebugInfo) pm.addPass(mlir::createCanonicalizerPass());
 
-      // Level 2: Inner tiling (L1 cache + vectorization)
-      // Inner loops should be sequential for vectorization
-      llvm::SmallVector<int64_t, 3> innerTileSizes = {inner_tile, inner_tile, inner_tile};
-      pm.addNestedPass<mlir::FuncOp>(
-          mlir::createLinalgTilingPass(innerTileSizes, linalg::LinalgTilingLoopType::Loops));
+      // Level 2: Inner tiling is handled by hierarchical flag in custom pass
       if (!enableDebugInfo) pm.addPass(mlir::createCanonicalizerPass());
     } else {
       // SINGLE-LEVEL TILING: Use configured tile size
       // For matmul(MxK, KxN, MxN), we tile all 3 dimensions
-      llvm::SmallVector<int64_t, 3> tileSizes = {tileSize, tileSize, tileSize};
-      pm.addNestedPass<mlir::FuncOp>(
-          mlir::createLinalgTilingPass(tileSizes, loopType));
+      pm.addNestedPass<mlir::func::FuncOp>(
+          mlir::simp::createSimpLinalgTilingPass(tileSize, false, enableOpenMP));
 
       // Canonicalize after tiling (skip in debug mode to preserve operations)
       if (!enableDebugInfo) pm.addPass(mlir::createCanonicalizerPass());
@@ -374,16 +377,12 @@ void MLIRCompilationPipeline::buildPhase2_LinalgOptimization(mlir::OpPassManager
     if (!enableDebugInfo) pm.addPass(mlir::createCanonicalizerPass());
   }
 
-  // VECTORIZATION: Convert linalg operations to vector dialect
-  // The strategy passes work together: Enable → Vectorize → LowerVectors
+  // VECTORIZATION: In LLVM 21+, strategy passes were removed
+  // Use vector lowering passes instead for progressive vector lowering
 
-  // Step 1: Enable vectorization strategy (marks ops for vectorization)
-  pm.addNestedPass<mlir::FuncOp>(
-      mlir::createLinalgStrategyEnablePass());
-
-  // Step 2: Vectorize marked linalg operations
-  pm.addNestedPass<mlir::FuncOp>(
-      mlir::createLinalgStrategyVectorizePass(""));
+  // Vector multi-reduction and mask lowering (LLVM 21+ API)
+  pm.addNestedPass<mlir::func::FuncOp>(mlir::vector::createLowerVectorMultiReductionPass());
+  pm.addNestedPass<mlir::func::FuncOp>(mlir::vector::createLowerVectorMaskPass());
 
   // Canonicalize after vectorization (skip in debug mode)
   if (!enableDebugInfo) {
@@ -391,20 +390,9 @@ void MLIRCompilationPipeline::buildPhase2_LinalgOptimization(mlir::OpPassManager
     pm.addPass(mlir::createCSEPass());
   }
 
-  // Step 3: Lower vector dialect operations
-  // These passes convert high-level vector ops (like vector.contract) to LLVM-compatible ops
-  pm.addNestedPass<mlir::FuncOp>(
-      mlir::createLinalgStrategyLowerVectorsPass());
-
-  // Apply canonicalization after vector lowering (skip in debug mode)
-  if (!enableDebugInfo) {
-    pm.addPass(mlir::createCanonicalizerPass());
-    pm.addPass(mlir::createCSEPass());
-  }
-
   // Lower remaining Linalg ops (non-vectorized) to SCF loops
   // Only operations that couldn't be vectorized will go through this
-  pm.addNestedPass<mlir::FuncOp>(mlir::createConvertLinalgToLoopsPass());
+  pm.addNestedPass<mlir::func::FuncOp>(mlir::createConvertLinalgToLoopsPass());
 
   // Apply general canonicalization and CSE (skip in debug mode)
   if (!enableDebugInfo) {
@@ -412,20 +400,22 @@ void MLIRCompilationPipeline::buildPhase2_LinalgOptimization(mlir::OpPassManager
     pm.addPass(mlir::createCSEPass());
   }
 
-  // INSERT PREFETCH: Add prefetch operations to hide memory latency (skip in debug mode)
-  if (enablePrefetch && !enableDebugInfo) {
+  // INSERT PREFETCH: Add prefetch operations to hide memory latency
+  // NOTE: Prefetch is disabled when using LLVM vectorization path because
+  // InsertPrefetchPass can generate invalid IR with certain loop structures.
+  if (enablePrefetch && !enableDebugInfo && !skipMLIRVectorization) {
     llvm::outs() << "[Prefetch] Inserting prefetch operations into loops\n";
-    pm.addNestedPass<mlir::FuncOp>(mlir::simp::createInsertPrefetchPass());
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::simp::createInsertPrefetchPass());
     pm.addPass(mlir::createCanonicalizerPass());
   }
 
   // OPTIMIZATION: Skip optimizations in debug mode
   if (!enableDebugInfo) {
     // Apply loop invariant code motion to hoist invariant operations
-    pm.addNestedPass<mlir::FuncOp>(mlir::createLoopInvariantCodeMotionPass());
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::createLoopInvariantCodeMotionPass());
 
     // Apply loop unrolling for better ILP
-    pm.addNestedPass<mlir::FuncOp>(mlir::createLoopUnrollPass(4));
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createLoopUnrollPass(/*unrollFactor=*/4));
   }
 }
 
@@ -435,15 +425,15 @@ void MLIRCompilationPipeline::buildPhase2_LinalgOptimization(mlir::OpPassManager
 
 void MLIRCompilationPipeline::buildPhase2_5_BufferManagement(mlir::OpPassManager& pm) {
   // First, hoist buffer allocations out of loops to avoid repeated allocation
-  pm.addNestedPass<mlir::FuncOp>(mlir::bufferization::createBufferHoistingPass());
-  pm.addNestedPass<mlir::FuncOp>(mlir::bufferization::createBufferLoopHoistingPass());
+  pm.addNestedPass<mlir::func::FuncOp>(mlir::bufferization::createBufferHoistingPass());
+  pm.addNestedPass<mlir::func::FuncOp>(mlir::bufferization::createBufferLoopHoistingPass());
 
-  // Then add buffer deallocation pass
-  // This inserts memref.dealloc operations after the last use of allocated buffers
-  pm.addNestedPass<mlir::FuncOp>(mlir::bufferization::createBufferDeallocationPass());
+  // LLVM 21+: Use ownership-based buffer deallocation (replaces createBufferDeallocationPass)
+  pm.addPass(mlir::bufferization::createOwnershipBasedBufferDeallocationPass());
+  pm.addPass(mlir::bufferization::createLowerDeallocationsPass());
 
   // Convert bufferization ops (like bufferization.clone) to memref ops
-  pm.addPass(mlir::createBufferizationToMemRefPass());
+  pm.addPass(mlir::createConvertBufferizationToMemRefPass());
 }
 
 //===----------------------------------------------------------------------===//
@@ -457,16 +447,21 @@ void MLIRCompilationPipeline::buildPhase3_LLVMDialectLowering(mlir::OpPassManage
   // 1. First, lower Vector transfer ops to simpler vector operations
   // Lower vector.transfer_read/write to simpler vector operations
   // This converts high-level vector ops to operations LLVM can handle
-  pm.addNestedPass<mlir::FuncOp>(mlir::createConvertVectorToSCFPass());
+  pm.addNestedPass<mlir::func::FuncOp>(mlir::createConvertVectorToSCFPass());
+
+  // 1.5. CRITICAL: Expand strided metadata (subview, reinterpret_cast, etc.)
+  // This MUST run BEFORE LowerAffinePass because it creates affine.apply ops
+  // SubViewOp must be expanded before LLVM conversion
+  pm.addPass(mlir::memref::createExpandStridedMetadataPass());
 
   // 2. Lower Affine and SCF to Standard dialect control flow
-  // Lower Affine ops (affine.min, etc.) to Standard
+  // Lower Affine ops (affine.min, affine.apply, etc.) to Standard
   pm.addPass(mlir::createLowerAffinePass());
 
   // Always lower SCF to CF, even when OpenMP is enabled
   // The SCF-to-OpenMP pass only converts scf.parallel, leaving other SCF ops
   // (scf.while, scf.for, scf.if) that need to be converted to CF
-  pm.addPass(mlir::createLowerToCFGPass());
+  pm.addPass(mlir::createSCFToControlFlowPass());
 
   // CRITICAL: Run createConvertOpenMPToLLVMPass() AFTER createLowerToCFGPass()!
   // This fixes index/i64 type mismatches in branches inside OpenMP regions
@@ -477,20 +472,32 @@ void MLIRCompilationPipeline::buildPhase3_LLVMDialectLowering(mlir::OpPassManage
 
   // 2.5. Expand Arithmetic ops (maxf, minf) to operations that can be lowered to LLVM
   //      MaxFOp/MinFOp don't have direct LLVM lowering - they must be expanded to CmpF + Select
-  pm.addNestedPass<mlir::FuncOp>(mlir::arith::createArithmeticExpandOpsPass());
+  pm.addNestedPass<mlir::func::FuncOp>(mlir::arith::createArithExpandOpsPass());
 
-  // 3. Add canonicalization and CSE passes for cleanup (skip in debug mode)
-  // Pattern-based conversions will be applied after running the pipeline
+  // 3. Lower MemRef ops to LLVM (including subview, cast, etc.)
+  // This must happen before the pattern-based final conversion
+  pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
+
+  // 4. Lower Arith ops to LLVM
+  pm.addPass(mlir::createArithToLLVMConversionPass());
+
+  // 5. Lower ControlFlow ops to LLVM
+  pm.addPass(mlir::createConvertControlFlowToLLVMPass());
+
+  // 6. Lower Func ops to LLVM
+  pm.addPass(mlir::createConvertFuncToLLVMPass());
+
+  // 6.5. Lower Index ops to LLVM (handles index type conversions)
+  pm.addPass(mlir::createConvertIndexToLLVMPass());
+
+  // 7. Add canonicalization and CSE passes for cleanup (skip in debug mode)
   if (!enableDebugInfo) {
     pm.addPass(mlir::createCanonicalizerPass());
     pm.addPass(mlir::createCSEPass());
   }
 
-  // 4. Final reconciliation of unrealized casts
-  // Skip when OpenMP is enabled - casts inside omp regions can't be reconciled until LLVM IR translation
-  if (!enableOpenMP) {
-    pm.addPass(mlir::createReconcileUnrealizedCastsPass());
-  }
+  // 8. Final reconciliation of unrealized casts
+  pm.addPass(mlir::createReconcileUnrealizedCastsPass());
 }
 
 //===----------------------------------------------------------------------===//
@@ -504,41 +511,30 @@ bool MLIRCompilationPipeline::applyLLVMDialectConversion() {
   // Skip vector optimization patterns in debug mode to preserve variable mappings
   if (!enableDebugInfo) {
     // Step 1: Lower vector operations to simpler forms BEFORE LLVM conversion
+    // LLVM 21+: Many vector lowering patterns have been reorganized
     {
       mlir::RewritePatternSet patterns(module.getContext());
 
-      // Lower vector.contract to outer products and vector.transpose to shuffles
-      mlir::vector::VectorTransformsOptions vectorOptions;
-      vectorOptions.setVectorTransformsOptions(mlir::vector::VectorContractLowering::OuterProduct);
-      vectorOptions.setVectorTransposeLowering(mlir::vector::VectorTransposeLowering::Shuffle);
-      mlir::vector::populateVectorContractLoweringPatterns(patterns, vectorOptions);
-      mlir::vector::populateVectorTransposeLoweringPatterns(patterns, vectorOptions);
-
-      // Lower vector.transpose, vector.broadcast, vector.shape_cast, etc.
+      // Use available canonicalization patterns
       mlir::vector::populateVectorToVectorCanonicalizationPatterns(patterns);
-      mlir::vector::populateVectorBroadcastLoweringPatterns(patterns);
-      mlir::vector::populateVectorMaskOpLoweringPatterns(patterns);
-      mlir::vector::populateVectorShapeCastLoweringPatterns(patterns);
+      // Vector transfer ops - use full/partial patterns with options
+      mlir::vector::VectorTransformsOptions vectorOptions;
+      mlir::vector::populateVectorTransferFullPartialPatterns(patterns, vectorOptions);
 
-      if (failed(mlir::applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
+      if (failed(mlir::applyPatternsGreedily(module, std::move(patterns)))) {
         llvm::errs() << "Warning: Vector lowering patterns failed\n";
       }
     }
 
-    // Progressive lowering of vector operations (matches LLVM's ConvertVectorToLLVMPass line 64-75)
-    // Run iteratively to handle nested broadcasts (e.g., 1D->2D broadcasts in 1x1 matmul)
+    // Progressive lowering of vector operations
+    // Run iteratively to handle nested operations
     for (int iteration = 0; iteration < 5; ++iteration) {
       mlir::RewritePatternSet patterns(module.getContext());
+      mlir::vector::VectorTransformsOptions vectorOptions;
       mlir::vector::populateVectorToVectorCanonicalizationPatterns(patterns);
-      mlir::vector::populateVectorBroadcastLoweringPatterns(patterns);
-      mlir::vector::populateVectorContractLoweringPatterns(patterns);
-      mlir::vector::populateVectorMaskOpLoweringPatterns(patterns);
-      mlir::vector::populateVectorShapeCastLoweringPatterns(patterns);
-      mlir::vector::populateVectorTransposeLoweringPatterns(patterns);
-      // Vector transfer ops with rank > 1 should be lowered with VectorToSCF
-      mlir::vector::populateVectorTransferLoweringPatterns(patterns, /*maxTransferRank=*/1);
+      mlir::vector::populateVectorTransferFullPartialPatterns(patterns, vectorOptions);
 
-      if (failed(mlir::applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
+      if (failed(mlir::applyPatternsGreedily(module, std::move(patterns)))) {
         llvm::errs() << "Warning: Vector lowering iteration " << iteration << " had issues\n";
       }
     }
@@ -567,27 +563,33 @@ bool MLIRCompilationPipeline::applyLLVMDialectConversion() {
   mlir::RewritePatternSet patterns(module.getContext());
 
   // Add patterns for Arith → LLVM
-  mlir::arith::populateArithmeticToLLVMConversionPatterns(typeConverter, patterns);
+  mlir::arith::populateArithToLLVMConversionPatterns(typeConverter, patterns);
 
   // Add patterns for Math → LLVM
   mlir::populateMathToLLVMConversionPatterns(typeConverter, patterns);
 
   // Add patterns for MemRef → LLVM
-  mlir::populateMemRefToLLVMConversionPatterns(typeConverter, patterns);
+  mlir::populateFinalizeMemRefToLLVMConversionPatterns(typeConverter, patterns);
 
   // NOTE: OpenMP operations remain as omp.* and are translated to LLVM IR
   // during the mlir-translate phase, NOT during LLVM dialect lowering
 
   // Add patterns for Vector → LLVM (CRITICAL for vectorization)
-  // Match LLVM's ConvertVectorToLLVMPass lines 80-85
+  // Match LLVM's ConvertVectorToLLVMPass
+  mlir::vector::VectorTransformsOptions vectorOpts;
   mlir::vector::populateVectorMaskMaterializationPatterns(patterns, /*indexOptimizations=*/false);
-  mlir::vector::populateVectorTransferLoweringPatterns(patterns);
+  mlir::vector::populateVectorTransferFullPartialPatterns(patterns, vectorOpts);
   mlir::populateVectorToLLVMMatrixConversionPatterns(typeConverter, patterns);
   mlir::populateVectorToLLVMConversionPatterns(typeConverter, patterns);
-  mlir::populateVectorToLLVMMatrixConversionPatterns(typeConverter, patterns);
 
-  // Add patterns for Standard → LLVM
-  mlir::populateStdToLLVMConversionPatterns(typeConverter, patterns);
+  // Add patterns for Func → LLVM (converts func.func, func.call, func.return)
+  mlir::populateFuncToLLVMConversionPatterns(typeConverter, patterns);
+
+  // Add patterns for ControlFlow → LLVM (converts cf.br, cf.cond_br)
+  mlir::cf::populateControlFlowToLLVMConversionPatterns(typeConverter, patterns);
+
+  // Add index to LLVM conversion patterns
+  mlir::index::populateIndexToLLVMConversionPatterns(typeConverter, patterns);
 
   // Use partial conversion (allows unrealized casts temporarily)
   if (failed(mlir::applyPartialConversion(module, target, std::move(patterns)))) {
@@ -596,8 +598,15 @@ bool MLIRCompilationPipeline::applyLLVMDialectConversion() {
     return false;
   }
 
-  // Note: createReconcileUnrealizedCastsPass() is already added in buildPhase3_LLVMDialectLowering
-  // and will run after the main pipeline completes
+  // Run reconcile pass to clean up unrealized casts after pattern conversion
+  {
+    mlir::PassManager reconcilePM(module.getContext());
+    reconcilePM.addPass(mlir::createReconcileUnrealizedCastsPass());
+    if (failed(reconcilePM.run(module))) {
+      // Non-fatal - some casts may remain which is expected for certain patterns
+      llvm::errs() << "Warning: Some unrealized casts could not be reconciled\n";
+    }
+  }
 
   return true;
 }

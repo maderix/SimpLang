@@ -21,7 +21,7 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 // Simp_ConstantOp
 //===----------------------------------------------------------------------===//
 
-def Simp_ConstantOp : Simp_Op<"constant", [NoSideEffect, ConstantLike]> {
+def Simp_ConstantOp : Simp_Op<"constant", [Pure, ConstantLike]> {
   let summary = "Constant value";
 
   let description = [{
@@ -54,7 +54,7 @@ def Simp_ConstantOp : Simp_Op<"constant", [NoSideEffect, ConstantLike]> {
 // Binary Arithmetic Operations
 //===----------------------------------------------------------------------===//
 
-def Simp_AddOp : Simp_Op<"add", [NoSideEffect, Commutative]> {
+def Simp_AddOp : Simp_Op<"add", [Pure, Commutative]> {
   let summary = "Addition operation";
 
   let description = [{
@@ -83,7 +83,7 @@ def Simp_AddOp : Simp_Op<"add", [NoSideEffect, Commutative]> {
   let hasCanonicalizer = 1;
 }
 
-def Simp_SubOp : Simp_Op<"sub", [NoSideEffect]> {
+def Simp_SubOp : Simp_Op<"sub", [Pure]> {
   let summary = "Subtraction operation";
 
   let description = [{
@@ -107,7 +107,7 @@ def Simp_SubOp : Simp_Op<"sub", [NoSideEffect]> {
   let hasCanonicalizer = 1;
 }
 
-def Simp_MulOp : Simp_Op<"mul", [NoSideEffect, Commutative]> {
+def Simp_MulOp : Simp_Op<"mul", [Pure, Commutative]> {
   let summary = "Multiplication operation";
 
   let description = [{
@@ -135,7 +135,7 @@ def Simp_MulOp : Simp_Op<"mul", [NoSideEffect, Commutative]> {
   let hasCanonicalizer = 1;
 }
 
-def Simp_DivOp : Simp_Op<"div", [NoSideEffect]> {
+def Simp_DivOp : Simp_Op<"div", [Pure]> {
   let summary = "Division operation";
 
   let description = [{
@@ -159,7 +159,7 @@ def Simp_DivOp : Simp_Op<"div", [NoSideEffect]> {
   let hasCanonicalizer = 1;
 }
 
-def Simp_ModOp : Simp_Op<"mod", [NoSideEffect]> {
+def Simp_ModOp : Simp_Op<"mod", [Pure]> {
   let summary = "Modulo operation";
 
   let description = [{
@@ -187,7 +187,7 @@ def Simp_ModOp : Simp_Op<"mod", [NoSideEffect]> {
 // Simp_NegOp
 //===----------------------------------------------------------------------===//
 
-def Simp_NegOp : Simp_Op<"neg", [NoSideEffect]> {
+def Simp_NegOp : Simp_Op<"neg", [Pure]> {
   let summary = "Unary negation operation";
   let description = [{
     The `simp.neg` operation performs unary negation on a value.
@@ -210,7 +210,7 @@ def Simp_NegOp : Simp_Op<"neg", [NoSideEffect]> {
 // Simp_ArrayCreateOp
 //===----------------------------------------------------------------------===//
 
-def Simp_ArrayCreateOp : Simp_Op<"array_create", [NoSideEffect]> {
+def Simp_ArrayCreateOp : Simp_Op<"array_create", [Pure]> {
   let summary = "Create array with given size";
 
   let description = [{
@@ -245,7 +245,7 @@ def Simp_ArrayCreateOp : Simp_Op<"array_create", [NoSideEffect]> {
 // Simp_ArrayGetOp
 //===----------------------------------------------------------------------===//
 
-def Simp_ArrayGetOp : Simp_Op<"array_get", [NoSideEffect]> {
+def Simp_ArrayGetOp : Simp_Op<"array_get", [Pure]> {
   let summary = "Get element from array (load)";
 
   let description = [{
@@ -283,7 +283,7 @@ def Simp_ArrayGetOp : Simp_Op<"array_get", [NoSideEffect]> {
 // Simp_ArraySetOp
 //===----------------------------------------------------------------------===//
 
-def Simp_ArraySetOp : Simp_Op<"array_set", [NoSideEffect]> {
+def Simp_ArraySetOp : Simp_Op<"array_set", [Pure]> {
   let summary = "Set element in array (functional)";
 
   let description = [{
@@ -326,7 +326,7 @@ def Simp_ArraySetOp : Simp_Op<"array_set", [NoSideEffect]> {
 // Simp_TensorCreateOp
 //===----------------------------------------------------------------------===//
 
-def Simp_TensorCreateOp : Simp_Op<"tensor_create", [NoSideEffect]> {
+def Simp_TensorCreateOp : Simp_Op<"tensor_create", [Pure]> {
   let summary = "Create tensor with given shape";
 
   let description = [{
@@ -359,7 +359,7 @@ def Simp_TensorCreateOp : Simp_Op<"tensor_create", [NoSideEffect]> {
 // Simp_TensorGetOp
 //===----------------------------------------------------------------------===//
 
-def Simp_TensorGetOp : Simp_Op<"tensor_get", [NoSideEffect]> {
+def Simp_TensorGetOp : Simp_Op<"tensor_get", [Pure]> {
   let summary = "Get element from tensor (load)";
 
   let description = [{
@@ -394,7 +394,7 @@ def Simp_TensorGetOp : Simp_Op<"tensor_get", [NoSideEffect]> {
 // Simp_TensorSetOp
 //===----------------------------------------------------------------------===//
 
-def Simp_TensorSetOp : Simp_Op<"tensor_set", [NoSideEffect]> {
+def Simp_TensorSetOp : Simp_Op<"tensor_set", [Pure]> {
   let summary = "Set element in tensor (functional)";
 
   let description = [{
@@ -427,7 +427,7 @@ def Simp_TensorSetOp : Simp_Op<"tensor_set", [NoSideEffect]> {
 // Simp_TensorFromArrayOp
 //===----------------------------------------------------------------------===//
 
-def Simp_TensorFromArrayOp : Simp_Op<"tensor_from_array", [NoSideEffect]> {
+def Simp_TensorFromArrayOp : Simp_Op<"tensor_from_array", [Pure]> {
   let summary = "Create tensor from array (bulk conversion with optional offset)";
 
   let description = [{
@@ -472,7 +472,7 @@ def Simp_TensorFromArrayOp : Simp_Op<"tensor_from_array", [NoSideEffect]> {
 // Tensor Element-wise Operations
 //===----------------------------------------------------------------------===//
 
-def Simp_TensorAddOp : Simp_Op<"tensor_add", [NoSideEffect, Commutative]> {
+def Simp_TensorAddOp : Simp_Op<"tensor_add", [Pure, Commutative]> {
   let summary = "Element-wise tensor addition";
   let description = [{
     Performs element-wise addition of two tensors with the same shape.
@@ -483,7 +483,7 @@ def Simp_TensorAddOp : Simp_Op<"tensor_add", [NoSideEffect, Commutative]> {
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` `(` type($lhs) `,` type($rhs) `)` `->` type($result)";
 }
 
-def Simp_TensorMulOp : Simp_Op<"tensor_mul", [NoSideEffect, Commutative]> {
+def Simp_TensorMulOp : Simp_Op<"tensor_mul", [Pure, Commutative]> {
   let summary = "Element-wise tensor multiplication";
   let description = [{
     Performs element-wise multiplication of two tensors with the same shape.
@@ -494,7 +494,7 @@ def Simp_TensorMulOp : Simp_Op<"tensor_mul", [NoSideEffect, Commutative]> {
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` `(` type($lhs) `,` type($rhs) `)` `->` type($result)";
 }
 
-def Simp_TensorSubOp : Simp_Op<"tensor_sub", [NoSideEffect]> {
+def Simp_TensorSubOp : Simp_Op<"tensor_sub", [Pure]> {
   let summary = "Element-wise tensor subtraction";
   let description = [{
     Performs element-wise subtraction of two tensors with the same shape.
@@ -505,7 +505,7 @@ def Simp_TensorSubOp : Simp_Op<"tensor_sub", [NoSideEffect]> {
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` `(` type($lhs) `,` type($rhs) `)` `->` type($result)";
 }
 
-def Simp_TensorDivOp : Simp_Op<"tensor_div", [NoSideEffect]> {
+def Simp_TensorDivOp : Simp_Op<"tensor_div", [Pure]> {
   let summary = "Element-wise tensor division";
   let description = [{
     Performs element-wise division of two tensors with the same shape.
@@ -516,7 +516,7 @@ def Simp_TensorDivOp : Simp_Op<"tensor_div", [NoSideEffect]> {
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` `(` type($lhs) `,` type($rhs) `)` `->` type($result)";
 }
 
-def Simp_TensorReluOp : Simp_Op<"tensor_relu", [NoSideEffect]> {
+def Simp_TensorReluOp : Simp_Op<"tensor_relu", [Pure]> {
   let summary = "Element-wise ReLU activation";
   let description = [{
     Performs element-wise ReLU (Rectified Linear Unit) activation.
@@ -527,7 +527,7 @@ def Simp_TensorReluOp : Simp_Op<"tensor_relu", [NoSideEffect]> {
   let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
 }
 
-def Simp_TensorSigmoidOp : Simp_Op<"tensor_sigmoid", [NoSideEffect]> {
+def Simp_TensorSigmoidOp : Simp_Op<"tensor_sigmoid", [Pure]> {
   let summary = "Element-wise sigmoid activation";
   let description = [{
     Performs element-wise sigmoid activation.
@@ -538,7 +538,7 @@ def Simp_TensorSigmoidOp : Simp_Op<"tensor_sigmoid", [NoSideEffect]> {
   let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
 }
 
-def Simp_TensorTanhOp : Simp_Op<"tensor_tanh", [NoSideEffect]> {
+def Simp_TensorTanhOp : Simp_Op<"tensor_tanh", [Pure]> {
   let summary = "Element-wise tanh activation";
   let description = [{
     Performs element-wise hyperbolic tangent activation.
@@ -553,7 +553,7 @@ def Simp_TensorTanhOp : Simp_Op<"tensor_tanh", [NoSideEffect]> {
 // Tensor Reduction Operations
 //===----------------------------------------------------------------------===//
 
-def Simp_TensorSumOp : Simp_Op<"tensor_sum", [NoSideEffect]> {
+def Simp_TensorSumOp : Simp_Op<"tensor_sum", [Pure]> {
   let summary = "Tensor sum reduction";
   let description = [{
     Reduces a tensor by summing all elements (full reduction) or along a specific axis.
@@ -569,7 +569,7 @@ def Simp_TensorSumOp : Simp_Op<"tensor_sum", [NoSideEffect]> {
   let assemblyFormat = "$input (`,` $axis^)? attr-dict `:` type($input) `->` type($result)";
 }
 
-def Simp_TensorMeanOp : Simp_Op<"tensor_mean", [NoSideEffect]> {
+def Simp_TensorMeanOp : Simp_Op<"tensor_mean", [Pure]> {
   let summary = "Tensor mean reduction";
   let description = [{
     Reduces a tensor by computing the mean of all elements (full reduction) or along a specific axis.
@@ -582,7 +582,7 @@ def Simp_TensorMeanOp : Simp_Op<"tensor_mean", [NoSideEffect]> {
   let assemblyFormat = "$input (`,` $axis^)? attr-dict `:` type($input) `->` type($result)";
 }
 
-def Simp_TensorMaxOp : Simp_Op<"tensor_max", [NoSideEffect]> {
+def Simp_TensorMaxOp : Simp_Op<"tensor_max", [Pure]> {
   let summary = "Tensor max reduction";
   let description = [{
     Reduces a tensor by finding the maximum element (full reduction) or along a specific axis.
@@ -595,7 +595,7 @@ def Simp_TensorMaxOp : Simp_Op<"tensor_max", [NoSideEffect]> {
   let assemblyFormat = "$input (`,` $axis^)? attr-dict `:` type($input) `->` type($result)";
 }
 
-def Simp_TensorMinOp : Simp_Op<"tensor_min", [NoSideEffect]> {
+def Simp_TensorMinOp : Simp_Op<"tensor_min", [Pure]> {
   let summary = "Tensor min reduction";
   let description = [{
     Reduces a tensor by finding the minimum element (full reduction) or along a specific axis.
@@ -608,7 +608,7 @@ def Simp_TensorMinOp : Simp_Op<"tensor_min", [NoSideEffect]> {
   let assemblyFormat = "$input (`,` $axis^)? attr-dict `:` type($input) `->` type($result)";
 }
 
-def Simp_TensorArgmaxOp : Simp_Op<"tensor_argmax", [NoSideEffect]> {
+def Simp_TensorArgmaxOp : Simp_Op<"tensor_argmax", [Pure]> {
   let summary = "Tensor argmax reduction";
   let description = [{
     Reduces a tensor by finding the index of the maximum element (full reduction) or along a specific axis.
@@ -625,7 +625,7 @@ def Simp_TensorArgmaxOp : Simp_Op<"tensor_argmax", [NoSideEffect]> {
 // Tensor Memory Operations
 //===----------------------------------------------------------------------===//
 
-def Simp_TensorReshapeOp : Simp_Op<"tensor_reshape", [NoSideEffect]> {
+def Simp_TensorReshapeOp : Simp_Op<"tensor_reshape", [Pure]> {
   let summary = "Reshape tensor without copying data";
   let description = [{
     Changes the shape of a tensor without reordering elements. Total number of elements must remain the same.
@@ -640,7 +640,7 @@ def Simp_TensorReshapeOp : Simp_Op<"tensor_reshape", [NoSideEffect]> {
   let assemblyFormat = "$input `,` $new_shape attr-dict `:` `(` type($input) `,` type($new_shape) `)` `->` type($result)";
 }
 
-def Simp_TensorTransposeOp : Simp_Op<"tensor_transpose", [NoSideEffect]> {
+def Simp_TensorTransposeOp : Simp_Op<"tensor_transpose", [Pure]> {
   let summary = "Transpose tensor dimensions";
   let description = [{
     Swaps tensor dimensions according to a permutation.
@@ -658,7 +658,7 @@ def Simp_TensorTransposeOp : Simp_Op<"tensor_transpose", [NoSideEffect]> {
   let assemblyFormat = "$input (`,` $permutation^)? attr-dict `:` `(` type($input) (`,` type($permutation)^)? `)` `->` type($result)";
 }
 
-def Simp_TensorSliceOp : Simp_Op<"tensor_slice", [NoSideEffect]> {
+def Simp_TensorSliceOp : Simp_Op<"tensor_slice", [Pure]> {
   let summary = "Extract sub-tensor slice";
   let description = [{
     Extracts a contiguous sub-tensor using start and end indices for each dimension.
@@ -674,7 +674,7 @@ def Simp_TensorSliceOp : Simp_Op<"tensor_slice", [NoSideEffect]> {
   let assemblyFormat = "$input `,` $indices attr-dict `:` `(` type($input) `,` type($indices) `)` `->` type($result)";
 }
 
-def Simp_TensorGatherOp : Simp_Op<"tensor_gather", [NoSideEffect]> {
+def Simp_TensorGatherOp : Simp_Op<"tensor_gather", [Pure]> {
   let summary = "Gather slices along specified axis (N-D)";
   let description = [{
     Gathers slices from source tensor along the specified axis using indices.
@@ -730,7 +730,7 @@ def Simp_TensorGatherOp : Simp_Op<"tensor_gather", [NoSideEffect]> {
   let assemblyFormat = "$source `,` $indices (`,` $axis^)? attr-dict `:` `(` type($source) `,` type($indices) (`,` type($axis)^)? `)` `->` type($result)";
 }
 
-def Simp_TensorScatterOp : Simp_Op<"tensor_scatter", [NoSideEffect]> {
+def Simp_TensorScatterOp : Simp_Op<"tensor_scatter", [Pure]> {
   let summary = "Scatter values along specified axis (N-D)";
   let description = [{
     Scatters values into destination tensor along the specified axis using indices.
@@ -794,7 +794,7 @@ def Simp_TensorScatterOp : Simp_Op<"tensor_scatter", [NoSideEffect]> {
 // Simp_MatMulOp
 //===----------------------------------------------------------------------===//
 
-def Simp_MatMulOp : Simp_Op<"matmul", [NoSideEffect]> {
+def Simp_MatMulOp : Simp_Op<"matmul", [Pure]> {
   let summary = "Matrix multiplication (GEMM)";
 
   let description = [{
@@ -849,7 +849,7 @@ def Simp_MatMulOp : Simp_Op<"matmul", [NoSideEffect]> {
 // Simp_Conv2DOp
 //===----------------------------------------------------------------------===//
 
-def Simp_Conv2DOp : Simp_Op<"conv2d", [NoSideEffect]> {
+def Simp_Conv2DOp : Simp_Op<"conv2d", [Pure]> {
   let summary = "2D Convolution operation";
 
   let description = [{
@@ -934,7 +934,7 @@ def Simp_Conv2DOp : Simp_Op<"conv2d", [NoSideEffect]> {
 // LLM/Transformer Operations
 // ============================================================================
 
-def Simp_RMSNormOp : Simp_Op<"rmsnorm", [NoSideEffect]> {
+def Simp_RMSNormOp : Simp_Op<"rmsnorm", [Pure]> {
   let summary = "Root Mean Square Layer Normalization";
   let description = [{
     Computes RMSNorm: output = (input / rms) * weight
@@ -962,7 +962,7 @@ def Simp_RMSNormOp : Simp_Op<"rmsnorm", [NoSideEffect]> {
   }];
 }
 
-def Simp_SoftmaxOp : Simp_Op<"softmax", [NoSideEffect]> {
+def Simp_SoftmaxOp : Simp_Op<"softmax", [Pure]> {
   let summary = "Numerically stable softmax";
   let description = [{
     Computes softmax with max subtraction for numerical stability:
@@ -992,7 +992,7 @@ def Simp_SoftmaxOp : Simp_Op<"softmax", [NoSideEffect]> {
   }];
 }
 
-def Simp_SiLUOp : Simp_Op<"silu", [NoSideEffect]> {
+def Simp_SiLUOp : Simp_Op<"silu", [Pure]> {
   let summary = "SiLU (Swish) activation function";
   let description = [{
     Computes SiLU activation: output = x / (1 + exp(-x))
@@ -1021,7 +1021,7 @@ def Simp_SiLUOp : Simp_Op<"silu", [NoSideEffect]> {
 // Quantization Operations
 //===----------------------------------------------------------------------===//
 
-def Simp_DequantW4Op : Simp_Op<"dequant_w4", [NoSideEffect]> {
+def Simp_DequantW4Op : Simp_Op<"dequant_w4", [Pure]> {
   let summary = "Dequantize W4 (4-bit) weight value";
   let description = [{
     Dequantizes a single 4-bit weight value from packed int8 array using per-group scales and zeros.
@@ -1051,7 +1051,7 @@ def Simp_DequantW4Op : Simp_Op<"dequant_w4", [NoSideEffect]> {
   }];
 }
 
-def Simp_MatMulQuantOp : Simp_Op<"matmul_quant", [NoSideEffect]> {
+def Simp_MatMulQuantOp : Simp_Op<"matmul_quant", [Pure]> {
   let summary = "Quantized matrix multiplication with on-the-fly dequantization";
   let description = [{
     Performs matrix multiplication with 4-bit quantized weights:
@@ -1108,7 +1108,7 @@ def Simp_MatMulQuantOp : Simp_Op<"matmul_quant", [NoSideEffect]> {
 // TensorMatMulOp - Matrix multiplication for tensor types (2D/3D/4D)
 //===----------------------------------------------------------------------===//
 
-def Simp_TensorMatMulOp : Simp_Op<"tensor_matmul", [NoSideEffect]> {
+def Simp_TensorMatMulOp : Simp_Op<"tensor_matmul", [Pure]> {
   let summary = "Matrix multiplication for tensors (GEMM, batched GEMM)";
 
   let description = [{
@@ -1172,7 +1172,7 @@ def Simp_TensorMatMulOp : Simp_Op<"tensor_matmul", [NoSideEffect]> {
 // TensorDotOp - Dot product for 1D tensors
 //===----------------------------------------------------------------------===//
 
-def Simp_TensorDotOp : Simp_Op<"tensor_dot", [NoSideEffect]> {
+def Simp_TensorDotOp : Simp_Op<"tensor_dot", [Pure]> {
   let summary = "Dot product for 1D tensors";
 
   let description = [{

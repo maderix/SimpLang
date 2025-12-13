@@ -86,13 +86,16 @@ public:
     virtual llvm::Type* getMaskType(llvm::LLVMContext& context) const = 0;  // For AVX-512 masks
     
     // Vector slice operations
+    // LLVM 21: elementType must be passed explicitly due to opaque pointers
     virtual llvm::Value* createVectorSliceLoad(llvm::IRBuilder<>& builder,
                                              llvm::Value* basePtr,
+                                             llvm::Type* elementType,
                                              llvm::Value* startIndex,
                                              int sliceWidth) = 0;
     virtual void createVectorSliceStore(llvm::IRBuilder<>& builder,
                                       llvm::Value* vector,
                                       llvm::Value* basePtr,
+                                      llvm::Type* elementType,
                                       llvm::Value* startIndex) = 0;
 };
 

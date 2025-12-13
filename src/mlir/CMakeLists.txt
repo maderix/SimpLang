@@ -54,6 +54,7 @@ add_mlir_dialect_library(simp_dialect
   passes/LinalgTiling.cpp
   passes/Pipelines.cpp
   passes/InsertPrefetch.cpp
+  passes/VNNIPass.cpp
   PromoteLargeAllocaToHeap.cpp
 
   ADDITIONAL_HEADER_DIRS
@@ -66,27 +67,35 @@ add_mlir_dialect_library(simp_dialect
 
   LINK_LIBS PUBLIC
   MLIRIR
-  MLIRStandard
-  MLIRSCF
-  MLIRAffine
+  MLIRFuncDialect                 # Replaced MLIRStandard in LLVM 15+
+  MLIRSCFDialect
+  MLIRAffineDialect
   MLIRAffineTransforms
-  MLIRArithmetic
-  MLIRMath
-  MLIRMemRef
-  MLIRLinalg
+  MLIRAffineToStandard            # For createLowerAffinePass
+  MLIRArithDialect                # Renamed from MLIRArithmetic
+  MLIRMathDialect
+  MLIRMemRefDialect
+  MLIRVectorDialect               # Vector dialect
+  MLIRVectorTransforms            # Vector transforms
+  MLIRVectorToLLVM                # Vector to LLVM conversion patterns
+  MLIRLinalgDialect
   MLIRLinalgTransforms
   MLIRBufferizationTransforms
   MLIRBufferizationToMemRef
   MLIRTransforms
-  MLIRLLVMIR
+  MLIRLLVMDialect                 # Renamed from MLIRLLVMIR
   MLIRLLVMCommonConversion
-  MLIRArithmeticToLLVM
+  MLIRControlFlowDialect          # New: needed for SCF lowering
+  MLIRControlFlowToLLVM           # New: ControlFlow to LLVM
+  MLIRIndexDialect                # Index dialect
+  MLIRIndexToLLVM                 # Index to LLVM conversion
+  MLIRArithToLLVM                 # Renamed from MLIRArithmeticToLLVM
   MLIRMathToLLVM
-  MLIRLinalgToLLVM
+  MLIRLinalgToStandard            # Replaced MLIRLinalgToLLVM
   MLIRMemRefToLLVM
-  MLIRSCFToStandard
-  MLIRStandardToLLVM
-  MLIROpenMP                      # OpenMP dialect
+  MLIRSCFToControlFlow            # Renamed from MLIRSCFToStandard
+  MLIRFuncToLLVM                  # Replaced MLIRStandardToLLVM
+  MLIROpenMPDialect               # OpenMP dialect (renamed)
   MLIRSCFToOpenMP                 # SCF to OpenMP conversion
   MLIROpenMPToLLVM                # OpenMP to LLVM conversion
   MLIROpenMPToLLVMIRTranslation   # OpenMP LLVM IR translation

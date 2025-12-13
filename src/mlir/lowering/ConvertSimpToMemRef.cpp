@@ -7,20 +7,20 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/SCF/SCF.h"
-#include "mlir/Dialect/SCF/Transforms.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/Transforms/Transforms.h"
+#include "mlir/Dialect/SCF/Transforms/Patterns.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/simp_dialect.hpp"
 #include "mlir/simp_ops.hpp"
 #include "mlir/simp_types.hpp"
-#include "llvm/ADT/Optional.h"
 #include <optional>
 
 using namespace mlir;
@@ -38,24 +38,14 @@ public:
     addConversion([](Type type) { return type; });
 
     // Convert !simp.array<T> to memref<?xT>
-    addConversion([](ArrayType type) -> llvm::Optional<Type> {
-      // Use -1 for dynamic dimension in MLIR 14
-      return MemRefType::get({-1}, type.getElementType());
+    addConversion([](ArrayType type) -> std::optional<Type> {
+      // LLVM 21: Use ShapedType::kDynamic for dynamic dimension
+      return MemRefType::get({ShapedType::kDynamic}, type.getElementType());
     });
 
     // Convert !simp.tensor<shape x T> to memref<shape x T>
-    addConversion([](simp::SimpTensorType type) -> llvm::Optional<Type> {
+    addConversion([](simp::SimpTensorType type) -> std::optional<Type> {
       return MemRefType::get(type.getShape(), type.getElementType());
-    });
-
-    // Add argument materialization: handles function arguments
-    addArgumentMaterialization([](OpBuilder &builder, Type resultType,
-                                   ValueRange inputs, Location loc) -> Value {
-      // Materialize memref from simp.array for function arguments
-      // Just create an unrealized cast that later passes will clean up
-      if (inputs.size() == 1)
-        return builder.create<UnrealizedConversionCastOp>(loc, resultType, inputs[0]).getResult(0);
-      return nullptr;
     });
 
     // Add source materialization: converts memref back to simp.array when needed
@@ -64,7 +54,7 @@ public:
                                 ValueRange inputs, Location loc) -> Value {
       if (inputs.size() == 1)
         return builder.create<UnrealizedConversionCastOp>(loc, resultType, inputs[0]).getResult(0);
-      return nullptr;
+      return Value();  // Return invalid Value for failure
     });
 
     // Add target materialization: converts simp.array to memref for results
@@ -73,7 +63,7 @@ public:
                                 ValueRange inputs, Location loc) -> Value {
       if (inputs.size() == 1)
         return builder.create<UnrealizedConversionCastOp>(loc, resultType, inputs[0]).getResult(0);
-      return nullptr;
+      return Value();  // Return invalid Value for failure
     });
   }
 };
@@ -88,9 +78,9 @@ static Value promoteType(Value val, Type targetType, OpBuilder& builder, Locatio
   if (srcType == targetType) return val;
 
   // Float to float (extend or truncate)
-  if (srcType.isa<FloatType>() && targetType.isa<FloatType>()) {
-    auto srcFloat = srcType.cast<FloatType>();
-    auto targetFloat = targetType.cast<FloatType>();
+  if (mlir::isa<FloatType>(srcType) && mlir::isa<FloatType>(targetType)) {
+    auto srcFloat = mlir::cast<FloatType>(srcType);
+    auto targetFloat = mlir::cast<FloatType>(targetType);
     if (targetFloat.getWidth() > srcFloat.getWidth()) {
       return builder.create<arith::ExtFOp>(loc, targetType, val);
     } else if (targetFloat.getWidth() < srcFloat.getWidth()) {
@@ -99,9 +89,9 @@ static Value promoteType(Value val, Type targetType, OpBuilder& builder, Locatio
   }
 
   // Int to int (extend or truncate)
-  if (srcType.isa<IntegerType>() && targetType.isa<IntegerType>()) {
-    auto srcInt = srcType.cast<IntegerType>();
-    auto targetInt = targetType.cast<IntegerType>();
+  if (mlir::isa<IntegerType>(srcType) && mlir::isa<IntegerType>(targetType)) {
+    auto srcInt = mlir::cast<IntegerType>(srcType);
+    auto targetInt = mlir::cast<IntegerType>(targetType);
     if (srcInt.getWidth() == 1) return val;  // Don't convert bool
     if (targetInt.getWidth() > srcInt.getWidth()) {
       return builder.create<arith::ExtSIOp>(loc, targetType, val);
@@ -111,12 +101,12 @@ static Value promoteType(Value val, Type targetType, OpBuilder& builder, Locatio
   }
 
   // Int to float (C++ style: always promote int to float in mixed arithmetic)
-  if (srcType.isa<IntegerType>() && targetType.isa<FloatType>()) {
+  if (mlir::isa<IntegerType>(srcType) && mlir::isa<FloatType>(targetType)) {
     return builder.create<arith::SIToFPOp>(loc, targetType, val);
   }
 
   // Float to int (rarely needed, but support it)
-  if (srcType.isa<FloatType>() && targetType.isa<IntegerType>()) {
+  if (mlir::isa<FloatType>(srcType) && mlir::isa<IntegerType>(targetType)) {
     return builder.create<arith::FPToSIOp>(loc, targetType, val);
   }
 
@@ -128,10 +118,10 @@ static Value promoteType(Value val, Type targetType, OpBuilder& builder, Locatio
 //===----------------------------------------------------------------------===//
 
 /// Convert FuncOp signature (convert !simp.array args to memref args)
-struct FuncOpSignatureConversion : public OpConversionPattern<FuncOp> {
+struct FuncOpSignatureConversion : public OpConversionPattern<func::FuncOp> {
   using OpConversionPattern::OpConversionPattern;
 
-  LogicalResult matchAndRewrite(FuncOp funcOp, OpAdaptor adaptor,
+  LogicalResult matchAndRewrite(func::FuncOp funcOp, OpAdaptor adaptor,
                                  ConversionPatternRewriter &rewriter) const override {
     // Convert function signature
     TypeConverter::SignatureConversion signatureConv(funcOp.getNumArguments());
@@ -143,7 +133,7 @@ struct FuncOpSignatureConversion : public OpConversionPattern<FuncOp> {
 
     // Convert result types
     SmallVector<Type, 1> resultTypes;
-    if (failed(getTypeConverter()->convertTypes(funcOp.getType().getResults(), resultTypes)))
+    if (failed(getTypeConverter()->convertTypes(funcOp.getFunctionType().getResults(), resultTypes)))
       return failure();
 
     // Create new function type
@@ -153,7 +143,7 @@ struct FuncOpSignatureConversion : public OpConversionPattern<FuncOp> {
         resultTypes);
 
     // Update function signature in-place
-    rewriter.updateRootInPlace(funcOp, [&] {
+    rewriter.modifyOpInPlace(funcOp, [&] {
       funcOp.setType(newFuncType);
       for (unsigned i = 0, e = funcOp.getNumArguments(); i < e; ++i) {
         funcOp.getArgument(i).setType(signatureConv.getConvertedTypes()[i]);
@@ -173,7 +163,8 @@ struct ConstantOpLowering : public OpConversionPattern<simp::ConstantOp> {
       ConversionPatternRewriter &rewriter) const override {
 
     // Replace with arith.constant (use value() method from TableGen)
-    rewriter.replaceOpWithNewOp<arith::ConstantOp>(op, op.value());
+    // In LLVM 21, arith::ConstantOp requires TypedAttr
+    rewriter.replaceOpWithNewOp<arith::ConstantOp>(op, mlir::cast<TypedAttr>(op.getValue()));
     return success();
   }
 };
@@ -187,10 +178,10 @@ struct ArrayCreateOpLowering : public OpConversionPattern<simp::ArrayCreateOp> {
       ConversionPatternRewriter &rewriter) const override {
 
     // Get the array type
-    auto arrayType = op.getType().cast<ArrayType>();
+    auto arrayType = mlir::cast<ArrayType>(op.getType());
 
-    // Convert to memref<?xT> (-1 means dynamic dimension)
-    auto memrefType = MemRefType::get({-1}, arrayType.getElementType());
+    // LLVM 21: Convert to memref<?xT> using ShapedType::kDynamic for dynamic dimension
+    auto memrefType = MemRefType::get({ShapedType::kDynamic}, arrayType.getElementType());
 
     // Get the size operand
     Value size = adaptor.getOperands()[0];
@@ -202,7 +193,7 @@ struct ArrayCreateOpLowering : public OpConversionPattern<simp::ArrayCreateOp> {
     }
 
     // Create memref.alloc with dynamic size
-    rewriter.replaceOpWithNewOp<memref::AllocOp>(op, memrefType, ValueRange{size});
+    rewriter.replaceOpWithNewOp<memref::AllocOp>(op, memrefType, ValueRange(size));
 
     return success();
   }
@@ -228,7 +219,7 @@ struct ArrayGetOpLowering : public OpConversionPattern<simp::ArrayGetOp> {
     }
 
     // Replace with memref.load
-    rewriter.replaceOpWithNewOp<memref::LoadOp>(op, memref, ValueRange{index});
+    rewriter.replaceOpWithNewOp<memref::LoadOp>(op, memref, ValueRange(index));
 
     return success();
   }
@@ -256,14 +247,14 @@ struct ArraySetOpLowering : public OpConversionPattern<simp::ArraySetOp> {
     }
 
     // Ensure value type matches memref element type using type promotion
-    auto memrefType = memref.getType().cast<MemRefType>();
+    auto memrefType = mlir::cast<MemRefType>(memref.getType());
     Type expectedType = memrefType.getElementType();
     if (value.getType() != expectedType) {
       value = promoteType(value, expectedType, rewriter, op.getLoc());
     }
 
     // Create memref.store (mutates the memref)
-    rewriter.create<memref::StoreOp>(op.getLoc(), value, memref, ValueRange{index});
+    rewriter.create<memref::StoreOp>(op.getLoc(), value, memref, ValueRange(index));
 
     // Array set returns the "updated" array, but in memref semantics,
     // we just return the same memref (since it's mutated in-place)
@@ -286,7 +277,7 @@ struct TensorCreateOpLowering : public OpConversionPattern<simp::TensorCreateOp>
       ConversionPatternRewriter &rewriter) const override {
 
     // Get the tensor type
-    auto tensorType = op.getType().cast<simp::SimpTensorType>();
+    auto tensorType = mlir::cast<simp::SimpTensorType>(op.getType());
 
     // Convert to memref<shape x T> with static dimensions
     auto memrefType = MemRefType::get(tensorType.getShape(), tensorType.getElementType());
@@ -313,10 +304,10 @@ struct TensorFromArrayOpLowering : public OpConversionPattern<simp::TensorFromAr
     auto operands = adaptor.getOperands();
     Value arrayMemref = operands[0];  // memref<?xT>
     Value offsetI64 = operands[1];    // i64 offset
-    auto arrayType = arrayMemref.getType().cast<MemRefType>();
+    auto arrayType = mlir::cast<MemRefType>(arrayMemref.getType());
 
     // Get the target tensor type
-    auto tensorType = op.getType().cast<simp::SimpTensorType>();
+    auto tensorType = mlir::cast<simp::SimpTensorType>(op.getType());
     auto targetShape = tensorType.getShape();
     auto elemType = tensorType.getElementType();
 
@@ -389,7 +380,7 @@ struct TensorGetOpLowering : public OpConversionPattern<simp::TensorGetOp> {
       Value baseOffset = reinterpretOperands[1];    // offset
 
       // Get the static strides from the operation
-      auto staticStrides = reinterpretOp.static_strides();
+      auto staticStrides = reinterpretOp.getStaticStrides();
       int64_t rank = staticStrides.size();
 
       // Calculate linearized index from multi-dimensional indices
@@ -398,10 +389,10 @@ struct TensorGetOpLowering : public OpConversionPattern<simp::TensorGetOp> {
       for (int64_t i = 0; i < rank; ++i) {
         // Get stride value (either from operand or constant)
         Value stride;
-        auto strideAttr = staticStrides[i].cast<IntegerAttr>();
-        int64_t strideVal = strideAttr.getInt();
+        // staticStrides returns ArrayRef<int64_t> - no IntegerAttr cast needed
+        int64_t strideVal = staticStrides[i];
 
-        if (strideVal == ShapedType::kDynamicStrideOrOffset) {
+        if (strideVal == ShapedType::kDynamic) {
           // Dynamic stride - get from operand
           stride = reinterpretOperands[2 + rank + i];
         } else {
@@ -417,7 +408,7 @@ struct TensorGetOpLowering : public OpConversionPattern<simp::TensorGetOp> {
       linearIndex = rewriter.create<arith::AddIOp>(loc, linearIndex, baseOffset);
 
       // Load from source memref using linearized index
-      rewriter.replaceOpWithNewOp<memref::LoadOp>(op, sourceMemref, ValueRange{linearIndex});
+      rewriter.replaceOpWithNewOp<memref::LoadOp>(op, sourceMemref, ValueRange(linearIndex));
     } else {
       // Normal case: just use memref.load with multi-dimensional indices
       rewriter.replaceOpWithNewOp<memref::LoadOp>(op, memref, indices);
@@ -453,7 +444,7 @@ struct TensorSetOpLowering : public OpConversionPattern<simp::TensorSetOp> {
     }
 
     // Ensure value type matches memref element type using type promotion
-    auto memrefType = memref.getType().cast<MemRefType>();
+    auto memrefType = mlir::cast<MemRefType>(memref.getType());
     Type expectedType = memrefType.getElementType();
     if (value.getType() != expectedType) {
       value = promoteType(value, expectedType, rewriter, loc);
@@ -467,7 +458,7 @@ struct TensorSetOpLowering : public OpConversionPattern<simp::TensorSetOp> {
       Value baseOffset = reinterpretOperands[1];    // offset
 
       // Get the static strides from the operation
-      auto staticStrides = reinterpretOp.static_strides();
+      auto staticStrides = reinterpretOp.getStaticStrides();
       int64_t rank = staticStrides.size();
 
       // Calculate linearized index from multi-dimensional indices
@@ -475,10 +466,10 @@ struct TensorSetOpLowering : public OpConversionPattern<simp::TensorSetOp> {
 
       for (int64_t i = 0; i < rank; ++i) {
         Value stride;
-        auto strideAttr = staticStrides[i].cast<IntegerAttr>();
-        int64_t strideVal = strideAttr.getInt();
+        // staticStrides returns ArrayRef<int64_t> - no IntegerAttr cast needed
+        int64_t strideVal = staticStrides[i];
 
-        if (strideVal == ShapedType::kDynamicStrideOrOffset) {
+        if (strideVal == ShapedType::kDynamic) {
           stride = reinterpretOperands[2 + rank + i];
         } else {
           stride = rewriter.create<arith::ConstantIndexOp>(loc, strideVal);
@@ -492,7 +483,7 @@ struct TensorSetOpLowering : public OpConversionPattern<simp::TensorSetOp> {
       linearIndex = rewriter.create<arith::AddIOp>(loc, linearIndex, baseOffset);
 
       // Store to source memref using linearized index
-      rewriter.create<memref::StoreOp>(loc, value, sourceMemref, ValueRange{linearIndex});
+      rewriter.create<memref::StoreOp>(loc, value, sourceMemref, ValueRange(linearIndex));
     } else {
       // Normal case: use memref.store with multi-dimensional indices
       rewriter.create<memref::StoreOp>(loc, value, memref, indices);
@@ -522,7 +513,7 @@ struct TensorBinaryOpLowering : public OpConversionPattern<SimpOp> {
     Value rhs = operands[1];
 
     // Get memref type
-    auto memrefType = lhs.getType().cast<MemRefType>();
+    auto memrefType = mlir::cast<MemRefType>(lhs.getType());
     auto shape = memrefType.getShape();
 
     // Allocate result memref
@@ -576,7 +567,7 @@ struct TensorUnaryOpLowering : public OpConversionPattern<SimpOp> {
     Value input = adaptor.getOperands()[0];
 
     // Get memref type
-    auto memrefType = input.getType().cast<MemRefType>();
+    auto memrefType = mlir::cast<MemRefType>(input.getType());
     auto shape = memrefType.getShape();
     auto elemType = memrefType.getElementType();
 
@@ -605,7 +596,7 @@ struct TensorUnaryOpLowering : public OpConversionPattern<SimpOp> {
                   loc, elemType, builder.getZeroAttr(elemType));
               Value cmp = builder.create<arith::CmpFOp>(
                   loc, arith::CmpFPredicate::OGT, inputVal, zero);
-              resultVal = builder.create<SelectOp>(loc, cmp, inputVal, zero);
+              resultVal = builder.create<arith::SelectOp>(loc, cmp, inputVal, zero);
               break;
             }
             case UnaryOpKind::Sigmoid: {
@@ -653,17 +644,17 @@ struct TensorSumOpLowering : public OpConversionPattern<simp::TensorSumOp> {
 
     auto loc = op.getLoc();
     Value input = adaptor.getOperands()[0];
-    auto memrefType = input.getType().cast<MemRefType>();
+    auto memrefType = mlir::cast<MemRefType>(input.getType());
     auto shape = memrefType.getShape();
     Type elemType = memrefType.getElementType();
     int64_t rank = shape.size();
 
     // Initialize zero value
     Value zero;
-    if (elemType.isa<FloatType>()) {
+    if (mlir::isa<FloatType>(elemType)) {
       zero = rewriter.create<arith::ConstantOp>(loc, elemType,
                  rewriter.getFloatAttr(elemType, 0.0));
-    } else if (elemType.isa<IntegerType>()) {
+    } else if (mlir::isa<IntegerType>(elemType)) {
       zero = rewriter.create<arith::ConstantOp>(loc, elemType,
                  rewriter.getIntegerAttr(elemType, 0));
     } else {
@@ -671,7 +662,7 @@ struct TensorSumOpLowering : public OpConversionPattern<simp::TensorSumOp> {
     }
 
     // CASE 1: Full reduction (no axis specified)
-    if (!op.axis()) {
+    if (!op.getAxis()) {
       // Allocate scalar accumulator on stack
       auto accumulatorType = MemRefType::get({}, elemType);
       Value accumulator = rewriter.create<memref::AllocaOp>(loc, accumulatorType);
@@ -690,7 +681,7 @@ struct TensorSumOpLowering : public OpConversionPattern<simp::TensorSumOp> {
             Value elem = builder.create<memref::LoadOp>(loc, input, ivs);
             Value currentSum = builder.create<memref::LoadOp>(loc, accumulator, ValueRange{});
             Value newSum;
-            if (elemType.isa<FloatType>()) {
+            if (mlir::isa<FloatType>(elemType)) {
               newSum = builder.create<arith::AddFOp>(loc, currentSum, elem);
             } else {
               newSum = builder.create<arith::AddIOp>(loc, currentSum, elem);
@@ -705,17 +696,17 @@ struct TensorSumOpLowering : public OpConversionPattern<simp::TensorSumOp> {
 
     // CASE 2: Axis reduction
     // Extract axis value from operand (handle both arith.constant and simp.constant)
-    Value axisOperand = op.axis();
+    Value axisOperand = op.getAxis();
     int64_t axis;
 
     if (auto arithConstOp = axisOperand.getDefiningOp<arith::ConstantOp>()) {
-      auto axisIntAttr = arithConstOp.getValue().dyn_cast<IntegerAttr>();
+      auto axisIntAttr = mlir::dyn_cast<IntegerAttr>(arithConstOp.getValue());
       if (!axisIntAttr) {
         return op.emitError("Axis must be an integer");
       }
       axis = axisIntAttr.getInt();
     } else if (auto simpConstOp = axisOperand.getDefiningOp<simp::ConstantOp>()) {
-      auto axisIntAttr = simpConstOp.value().dyn_cast<IntegerAttr>();
+      auto axisIntAttr = mlir::dyn_cast<IntegerAttr>(simpConstOp.getValue());
       if (!axisIntAttr) {
         return op.emitError("Axis must be an integer");
       }
@@ -782,7 +773,7 @@ struct TensorSumOpLowering : public OpConversionPattern<simp::TensorSumOp> {
 
                 // Accumulate
                 Value newSum;
-                if (elemType.isa<FloatType>()) {
+                if (mlir::isa<FloatType>(elemType)) {
                   newSum = builder.create<arith::AddFOp>(loc, currentSum, elem);
                 } else {
                   newSum = builder.create<arith::AddIOp>(loc, currentSum, elem);
@@ -808,12 +799,12 @@ struct TensorMeanOpLowering : public OpConversionPattern<simp::TensorMeanOp> {
 
     auto loc = op.getLoc();
     Value input = adaptor.getOperands()[0];
-    auto memrefType = input.getType().cast<MemRefType>();
+    auto memrefType = mlir::cast<MemRefType>(input.getType());
     auto shape = memrefType.getShape();
     Type elemType = memrefType.getElementType();
     int64_t rank = shape.size();
 
-    if (!elemType.isa<FloatType>()) {
+    if (!mlir::isa<FloatType>(elemType)) {
       return op.emitError("Mean only supported for float types");
     }
 
@@ -821,7 +812,7 @@ struct TensorMeanOpLowering : public OpConversionPattern<simp::TensorMeanOp> {
                    rewriter.getFloatAttr(elemType, 0.0));
 
     // CASE 1: Full reduction
-    if (!op.axis()) {
+    if (!op.getAxis()) {
       int64_t totalElements = 1;
       for (int64_t dim : shape) {
         totalElements *= dim;
@@ -856,16 +847,16 @@ struct TensorMeanOpLowering : public OpConversionPattern<simp::TensorMeanOp> {
     }
 
     // CASE 2: Axis reduction
-    Value axisOperand = op.axis();
+    Value axisOperand = op.getAxis();
     int64_t axis;
     if (auto arithConstOp = axisOperand.getDefiningOp<arith::ConstantOp>()) {
-      auto axisIntAttr = arithConstOp.getValue().dyn_cast<IntegerAttr>();
+      auto axisIntAttr = mlir::dyn_cast<IntegerAttr>(arithConstOp.getValue());
       if (!axisIntAttr) {
         return op.emitError("Axis must be an integer");
       }
       axis = axisIntAttr.getInt();
     } else if (auto simpConstOp = axisOperand.getDefiningOp<simp::ConstantOp>()) {
-      auto axisIntAttr = simpConstOp.value().dyn_cast<IntegerAttr>();
+      auto axisIntAttr = mlir::dyn_cast<IntegerAttr>(simpConstOp.getValue());
       if (!axisIntAttr) {
         return op.emitError("Axis must be an integer");
       }
@@ -956,18 +947,18 @@ struct TensorMaxOpLowering : public OpConversionPattern<simp::TensorMaxOp> {
 
     auto loc = op.getLoc();
     Value input = adaptor.getOperands()[0];
-    auto memrefType = input.getType().cast<MemRefType>();
+    auto memrefType = mlir::cast<MemRefType>(input.getType());
     auto shape = memrefType.getShape();
     Type elemType = memrefType.getElementType();
     int64_t rank = shape.size();
 
     // Initialize to negative infinity (for floats) or minimum value (for ints)
     Value initialValue;
-    if (auto floatType = elemType.dyn_cast<FloatType>()) {
+    if (auto floatType = mlir::dyn_cast<FloatType>(elemType)) {
       initialValue = rewriter.create<arith::ConstantOp>(loc, elemType,
           rewriter.getFloatAttr(elemType,
               -std::numeric_limits<double>::infinity()));
-    } else if (auto intType = elemType.dyn_cast<IntegerType>()) {
+    } else if (auto intType = mlir::dyn_cast<IntegerType>(elemType)) {
       int64_t minVal = intType.isUnsigned() ? 0 :
           -(1LL << (intType.getWidth() - 1));
       initialValue = rewriter.create<arith::ConstantOp>(loc, elemType,
@@ -977,7 +968,7 @@ struct TensorMaxOpLowering : public OpConversionPattern<simp::TensorMaxOp> {
     }
 
     // CASE 1: Full reduction
-    if (!op.axis()) {
+    if (!op.getAxis()) {
       auto accumulatorType = MemRefType::get({}, elemType);
       Value accumulator = rewriter.create<memref::AllocaOp>(loc, accumulatorType);
       rewriter.create<memref::StoreOp>(loc, initialValue, accumulator, ValueRange{});
@@ -994,10 +985,10 @@ struct TensorMaxOpLowering : public OpConversionPattern<simp::TensorMaxOp> {
             Value elem = builder.create<memref::LoadOp>(loc, input, ivs);
             Value currentMax = builder.create<memref::LoadOp>(loc, accumulator, ValueRange{});
             Value newMax;
-            if (elemType.isa<FloatType>()) {
-              newMax = builder.create<arith::MaxFOp>(loc, currentMax, elem);
+            if (mlir::isa<FloatType>(elemType)) {
+              newMax = builder.create<arith::MaximumFOp>(loc, currentMax, elem);
             } else {
-              auto intType = elemType.cast<IntegerType>();
+              auto intType = mlir::cast<IntegerType>(elemType);
               if (intType.isUnsigned()) {
                 newMax = builder.create<arith::MaxUIOp>(loc, currentMax, elem);
               } else {
@@ -1013,16 +1004,16 @@ struct TensorMaxOpLowering : public OpConversionPattern<simp::TensorMaxOp> {
     }
 
     // CASE 2: Axis reduction
-    Value axisOperand = op.axis();
+    Value axisOperand = op.getAxis();
     int64_t axis;
     if (auto arithConstOp = axisOperand.getDefiningOp<arith::ConstantOp>()) {
-      auto axisIntAttr = arithConstOp.getValue().dyn_cast<IntegerAttr>();
+      auto axisIntAttr = mlir::dyn_cast<IntegerAttr>(arithConstOp.getValue());
       if (!axisIntAttr) {
         return op.emitError("Axis must be an integer");
       }
       axis = axisIntAttr.getInt();
     } else if (auto simpConstOp = axisOperand.getDefiningOp<simp::ConstantOp>()) {
-      auto axisIntAttr = simpConstOp.value().dyn_cast<IntegerAttr>();
+      auto axisIntAttr = mlir::dyn_cast<IntegerAttr>(simpConstOp.getValue());
       if (!axisIntAttr) {
         return op.emitError("Axis must be an integer");
       }
@@ -1081,10 +1072,10 @@ struct TensorMaxOpLowering : public OpConversionPattern<simp::TensorMaxOp> {
                 Value currentMax = builder.create<memref::LoadOp>(loc, result, outerIvs);
 
                 Value newMax;
-                if (elemType.isa<FloatType>()) {
-                  newMax = builder.create<arith::MaxFOp>(loc, currentMax, elem);
+                if (mlir::isa<FloatType>(elemType)) {
+                  newMax = builder.create<arith::MaximumFOp>(loc, currentMax, elem);
                 } else {
-                  auto intType = elemType.cast<IntegerType>();
+                  auto intType = mlir::cast<IntegerType>(elemType);
                   if (intType.isUnsigned()) {
                     newMax = builder.create<arith::MaxUIOp>(loc, currentMax, elem);
                   } else {
@@ -1112,18 +1103,18 @@ struct TensorMinOpLowering : public OpConversionPattern<simp::TensorMinOp> {
 
     auto loc = op.getLoc();
     Value input = adaptor.getOperands()[0];
-    auto memrefType = input.getType().cast<MemRefType>();
+    auto memrefType = mlir::cast<MemRefType>(input.getType());
     auto shape = memrefType.getShape();
     Type elemType = memrefType.getElementType();
     int64_t rank = shape.size();
 
     // Initialize to positive infinity (for floats) or maximum value (for ints)
     Value initialValue;
-    if (auto floatType = elemType.dyn_cast<FloatType>()) {
+    if (auto floatType = mlir::dyn_cast<FloatType>(elemType)) {
       initialValue = rewriter.create<arith::ConstantOp>(loc, elemType,
           rewriter.getFloatAttr(elemType,
               std::numeric_limits<double>::infinity()));
-    } else if (auto intType = elemType.dyn_cast<IntegerType>()) {
+    } else if (auto intType = mlir::dyn_cast<IntegerType>(elemType)) {
       int64_t maxVal = intType.isUnsigned() ?
           ((1ULL << intType.getWidth()) - 1) :
           ((1LL << (intType.getWidth() - 1)) - 1);
@@ -1134,7 +1125,7 @@ struct TensorMinOpLowering : public OpConversionPattern<simp::TensorMinOp> {
     }
 
     // CASE 1: Full reduction
-    if (!op.axis()) {
+    if (!op.getAxis()) {
       auto accumulatorType = MemRefType::get({}, elemType);
       Value accumulator = rewriter.create<memref::AllocaOp>(loc, accumulatorType);
       rewriter.create<memref::StoreOp>(loc, initialValue, accumulator, ValueRange{});
@@ -1151,10 +1142,10 @@ struct TensorMinOpLowering : public OpConversionPattern<simp::TensorMinOp> {
             Value elem = builder.create<memref::LoadOp>(loc, input, ivs);
             Value currentMin = builder.create<memref::LoadOp>(loc, accumulator, ValueRange{});
             Value newMin;
-            if (elemType.isa<FloatType>()) {
-              newMin = builder.create<arith::MinFOp>(loc, currentMin, elem);
+            if (mlir::isa<FloatType>(elemType)) {
+              newMin = builder.create<arith::MinimumFOp>(loc, currentMin, elem);
             } else {
-              auto intType = elemType.cast<IntegerType>();
+              auto intType = mlir::cast<IntegerType>(elemType);
               if (intType.isUnsigned()) {
                 newMin = builder.create<arith::MinUIOp>(loc, currentMin, elem);
               } else {
@@ -1170,16 +1161,16 @@ struct TensorMinOpLowering : public OpConversionPattern<simp::TensorMinOp> {
     }
 
     // CASE 2: Axis reduction
-    Value axisOperand = op.axis();
+    Value axisOperand = op.getAxis();
     int64_t axis;
     if (auto arithConstOp = axisOperand.getDefiningOp<arith::ConstantOp>()) {
-      auto axisIntAttr = arithConstOp.getValue().dyn_cast<IntegerAttr>();
+      auto axisIntAttr = mlir::dyn_cast<IntegerAttr>(arithConstOp.getValue());
       if (!axisIntAttr) {
         return op.emitError("Axis must be an integer");
       }
       axis = axisIntAttr.getInt();
     } else if (auto simpConstOp = axisOperand.getDefiningOp<simp::ConstantOp>()) {
-      auto axisIntAttr = simpConstOp.value().dyn_cast<IntegerAttr>();
+      auto axisIntAttr = mlir::dyn_cast<IntegerAttr>(simpConstOp.getValue());
       if (!axisIntAttr) {
         return op.emitError("Axis must be an integer");
       }
@@ -1238,10 +1229,10 @@ struct TensorMinOpLowering : public OpConversionPattern<simp::TensorMinOp> {
                 Value currentMin = builder.create<memref::LoadOp>(loc, result, outerIvs);
 
                 Value newMin;
-                if (elemType.isa<FloatType>()) {
-                  newMin = builder.create<arith::MinFOp>(loc, currentMin, elem);
+                if (mlir::isa<FloatType>(elemType)) {
+                  newMin = builder.create<arith::MinimumFOp>(loc, currentMin, elem);
                 } else {
-                  auto intType = elemType.cast<IntegerType>();
+                  auto intType = mlir::cast<IntegerType>(elemType);
                   if (intType.isUnsigned()) {
                     newMin = builder.create<arith::MinUIOp>(loc, currentMin, elem);
                   } else {
@@ -1269,18 +1260,18 @@ struct TensorArgmaxOpLowering : public OpConversionPattern<simp::TensorArgmaxOp>
 
     auto loc = op.getLoc();
     Value input = adaptor.getOperands()[0];
-    auto memrefType = input.getType().cast<MemRefType>();
+    auto memrefType = mlir::cast<MemRefType>(input.getType());
     auto shape = memrefType.getShape();
     Type elemType = memrefType.getElementType();
     int64_t rank = shape.size();
 
     // Initialize to negative infinity / min int
     Value initialValue;
-    if (auto floatType = elemType.dyn_cast<FloatType>()) {
+    if (auto floatType = mlir::dyn_cast<FloatType>(elemType)) {
       initialValue = rewriter.create<arith::ConstantOp>(loc, elemType,
           rewriter.getFloatAttr(elemType,
               -std::numeric_limits<double>::infinity()));
-    } else if (auto intType = elemType.dyn_cast<IntegerType>()) {
+    } else if (auto intType = mlir::dyn_cast<IntegerType>(elemType)) {
       int64_t minVal = intType.isUnsigned() ? 0 :
           -(1LL << (intType.getWidth() - 1));
       initialValue = rewriter.create<arith::ConstantOp>(loc, elemType,
@@ -1293,7 +1284,7 @@ struct TensorArgmaxOpLowering : public OpConversionPattern<simp::TensorArgmaxOp>
         rewriter.getI64IntegerAttr(0));
 
     // CASE 1: Full reduction (return linear index)
-    if (!op.axis()) {
+    if (!op.getAxis()) {
       auto maxValueType = MemRefType::get({}, elemType);
       auto maxIndexType = MemRefType::get({}, rewriter.getI64Type());
       Value maxValueAccum = rewriter.create<memref::AllocaOp>(loc, maxValueType);
@@ -1320,10 +1311,10 @@ struct TensorArgmaxOpLowering : public OpConversionPattern<simp::TensorArgmaxOp>
             Value currentLinearIdx = builder.create<memref::LoadOp>(loc, linearIndexAccum, ValueRange{});
 
             Value isGreater;
-            if (elemType.isa<FloatType>()) {
+            if (mlir::isa<FloatType>(elemType)) {
               isGreater = builder.create<arith::CmpFOp>(loc, arith::CmpFPredicate::OGT, elem, currentMax);
             } else {
-              auto intType = elemType.cast<IntegerType>();
+              auto intType = mlir::cast<IntegerType>(elemType);
               if (intType.isUnsigned()) {
                 isGreater = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ugt, elem, currentMax);
               } else {
@@ -1331,8 +1322,8 @@ struct TensorArgmaxOpLowering : public OpConversionPattern<simp::TensorArgmaxOp>
               }
             }
 
-            Value newMaxValue = builder.create<SelectOp>(loc, isGreater, elem, currentMax);
-            Value newMaxIndex = builder.create<SelectOp>(loc, isGreater, currentLinearIdx,
+            Value newMaxValue = builder.create<arith::SelectOp>(loc, isGreater, elem, currentMax);
+            Value newMaxIndex = builder.create<arith::SelectOp>(loc, isGreater, currentLinearIdx,
                 builder.create<memref::LoadOp>(loc, maxIndexAccum, ValueRange{}));
 
             builder.create<memref::StoreOp>(loc, newMaxValue, maxValueAccum, ValueRange{});
@@ -1350,16 +1341,16 @@ struct TensorArgmaxOpLowering : public OpConversionPattern<simp::TensorArgmaxOp>
     }
 
     // CASE 2: Axis reduction (return tensor of indices along reduction axis)
-    Value axisOperand = op.axis();
+    Value axisOperand = op.getAxis();
     int64_t axis;
     if (auto arithConstOp = axisOperand.getDefiningOp<arith::ConstantOp>()) {
-      auto axisIntAttr = arithConstOp.getValue().dyn_cast<IntegerAttr>();
+      auto axisIntAttr = mlir::dyn_cast<IntegerAttr>(arithConstOp.getValue());
       if (!axisIntAttr) {
         return op.emitError("Axis must be an integer");
       }
       axis = axisIntAttr.getInt();
     } else if (auto simpConstOp = axisOperand.getDefiningOp<simp::ConstantOp>()) {
-      auto axisIntAttr = simpConstOp.value().dyn_cast<IntegerAttr>();
+      auto axisIntAttr = mlir::dyn_cast<IntegerAttr>(simpConstOp.getValue());
       if (!axisIntAttr) {
         return op.emitError("Axis must be an integer");
       }
@@ -1423,10 +1414,10 @@ struct TensorArgmaxOpLowering : public OpConversionPattern<simp::TensorArgmaxOp>
 
                 // Compare: is elem > currentMax?
                 Value isGreater;
-                if (elemType.isa<FloatType>()) {
+                if (mlir::isa<FloatType>(elemType)) {
                   isGreater = builder.create<arith::CmpFOp>(loc, arith::CmpFPredicate::OGT, elem, currentMax);
                 } else {
-                  auto intType = elemType.cast<IntegerType>();
+                  auto intType = mlir::cast<IntegerType>(elemType);
                   if (intType.isUnsigned()) {
                     isGreater = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ugt, elem, currentMax);
                   } else {
@@ -1435,13 +1426,13 @@ struct TensorArgmaxOpLowering : public OpConversionPattern<simp::TensorArgmaxOp>
                 }
 
                 // Update max value and index if greater
-                Value newMaxValue = builder.create<SelectOp>(loc, isGreater, elem, currentMax);
+                Value newMaxValue = builder.create<arith::SelectOp>(loc, isGreater, elem, currentMax);
                 builder.create<memref::StoreOp>(loc, newMaxValue, maxValues, outerIvs);
 
                 // Convert reduction axis index from index to i64
                 Value ivI64 = builder.create<arith::IndexCastOp>(loc, builder.getI64Type(), iv);
                 Value currentIdx = builder.create<memref::LoadOp>(loc, result, outerIvs);
-                Value newIdx = builder.create<SelectOp>(loc, isGreater, ivI64, currentIdx);
+                Value newIdx = builder.create<arith::SelectOp>(loc, isGreater, ivI64, currentIdx);
                 builder.create<memref::StoreOp>(loc, newIdx, result, outerIvs);
 
                 builder.create<scf::YieldOp>(loc);
@@ -1465,9 +1456,9 @@ struct AddOpLowering : public OpConversionPattern<simp::AddOp> {
     auto resultType = op.getResult().getType();
     auto operands = adaptor.getOperands();
 
-    if (resultType.isa<FloatType>()) {
+    if (mlir::isa<FloatType>(resultType)) {
       rewriter.replaceOpWithNewOp<arith::AddFOp>(op, operands[0], operands[1]);
-    } else if (resultType.isa<IntegerType>()) {
+    } else if (mlir::isa<IntegerType>(resultType)) {
       rewriter.replaceOpWithNewOp<arith::AddIOp>(op, operands[0], operands[1]);
     } else {
       return failure();
@@ -1488,9 +1479,9 @@ struct SubOpLowering : public OpConversionPattern<simp::SubOp> {
     auto resultType = op.getResult().getType();
     auto operands = adaptor.getOperands();
 
-    if (resultType.isa<FloatType>()) {
+    if (mlir::isa<FloatType>(resultType)) {
       rewriter.replaceOpWithNewOp<arith::SubFOp>(op, operands[0], operands[1]);
-    } else if (resultType.isa<IntegerType>()) {
+    } else if (mlir::isa<IntegerType>(resultType)) {
       rewriter.replaceOpWithNewOp<arith::SubIOp>(op, operands[0], operands[1]);
     } else {
       return failure();
@@ -1511,9 +1502,9 @@ struct MulOpLowering : public OpConversionPattern<simp::MulOp> {
     auto resultType = op.getResult().getType();
     auto operands = adaptor.getOperands();
 
-    if (resultType.isa<FloatType>()) {
+    if (mlir::isa<FloatType>(resultType)) {
       rewriter.replaceOpWithNewOp<arith::MulFOp>(op, operands[0], operands[1]);
-    } else if (resultType.isa<IntegerType>()) {
+    } else if (mlir::isa<IntegerType>(resultType)) {
       rewriter.replaceOpWithNewOp<arith::MulIOp>(op, operands[0], operands[1]);
     } else {
       return failure();
@@ -1534,9 +1525,9 @@ struct DivOpLowering : public OpConversionPattern<simp::DivOp> {
     auto resultType = op.getResult().getType();
     auto operands = adaptor.getOperands();
 
-    if (resultType.isa<FloatType>()) {
+    if (mlir::isa<FloatType>(resultType)) {
       rewriter.replaceOpWithNewOp<arith::DivFOp>(op, operands[0], operands[1]);
-    } else if (resultType.isa<IntegerType>()) {
+    } else if (mlir::isa<IntegerType>(resultType)) {
       // Use signed integer division
       rewriter.replaceOpWithNewOp<arith::DivSIOp>(op, operands[0], operands[1]);
     } else {
@@ -1558,9 +1549,9 @@ struct ModOpLowering : public OpConversionPattern<simp::ModOp> {
     auto resultType = op.getResult().getType();
     auto operands = adaptor.getOperands();
 
-    if (resultType.isa<FloatType>()) {
+    if (mlir::isa<FloatType>(resultType)) {
       rewriter.replaceOpWithNewOp<arith::RemFOp>(op, operands[0], operands[1]);
-    } else if (resultType.isa<IntegerType>()) {
+    } else if (mlir::isa<IntegerType>(resultType)) {
       // Use signed integer remainder
       rewriter.replaceOpWithNewOp<arith::RemSIOp>(op, operands[0], operands[1]);
     } else {
@@ -1582,13 +1573,13 @@ struct NegOpLowering : public OpConversionPattern<simp::NegOp> {
     auto resultType = op.getResult().getType();
     Value operand = adaptor.getOperands()[0];
 
-    if (resultType.isa<FloatType>()) {
+    if (mlir::isa<FloatType>(resultType)) {
       // Float negation: use arith.negf
       rewriter.replaceOpWithNewOp<arith::NegFOp>(op, operand);
-    } else if (resultType.isa<IntegerType>()) {
+    } else if (mlir::isa<IntegerType>(resultType)) {
       // Integer negation: compute 0 - x
       auto zero = rewriter.create<arith::ConstantIntOp>(
-          op.getLoc(), 0, resultType.cast<IntegerType>());
+          op.getLoc(), mlir::cast<IntegerType>(resultType), 0);
       rewriter.replaceOpWithNewOp<arith::SubIOp>(op, zero, operand);
     } else {
       return failure();
@@ -1599,11 +1590,11 @@ struct NegOpLowering : public OpConversionPattern<simp::NegOp> {
 };
 
 /// Convert CallOp to handle type conversions
-struct CallOpLowering : public OpConversionPattern<CallOp> {
-  using OpConversionPattern<CallOp>::OpConversionPattern;
+struct CallOpLowering : public OpConversionPattern<func::CallOp> {
+  using OpConversionPattern<func::CallOp>::OpConversionPattern;
 
   LogicalResult matchAndRewrite(
-      CallOp callOp, OpAdaptor adaptor,
+      func::CallOp callOp, OpAdaptor adaptor,
       ConversionPatternRewriter &rewriter) const override {
 
     // Convert result types
@@ -1612,7 +1603,7 @@ struct CallOpLowering : public OpConversionPattern<CallOp> {
       return failure();
 
     // Create new call with converted operands and result types
-    rewriter.replaceOpWithNewOp<CallOp>(
+    rewriter.replaceOpWithNewOp<func::CallOp>(
         callOp,
         callOp.getCallee(),
         resultTypes,
@@ -1646,7 +1637,7 @@ struct MatMulOpLowering : public OpConversionPattern<simp::MatMulOp> {
     Value output_offset = operands[8]; // Offset into output array
 
     // Get element type
-    auto lhsMemRefType = lhs.getType().cast<MemRefType>();
+    auto lhsMemRefType = mlir::cast<MemRefType>(lhs.getType());
     Type elemType = lhsMemRefType.getElementType();
 
     // Convert dimensions to index type
@@ -1701,21 +1692,14 @@ struct MatMulOpLowering : public OpConversionPattern<simp::MatMulOp> {
       }
     }
 
-    // Create 2D memref types for matrices
-    // Use static shapes if all dimensions are constant (enables MLIR vectorization)
-    MemRefType matrixAType, matrixBType, matrixCType;
-
-    if (mConst && kConst && nConst) {
-      // All dimensions are constant - use static shapes for vectorization!
-      matrixAType = MemRefType::get({*mConst, *kConst}, elemType);  // MxK
-      matrixBType = MemRefType::get({*kConst, *nConst}, elemType);  // KxN
-      matrixCType = MemRefType::get({*mConst, *nConst}, elemType);  // MxN
-    } else {
-      // Dynamic shapes (fallback for runtime dimensions)
-      matrixAType = MemRefType::get({-1, -1}, elemType);  // MxK
-      matrixBType = MemRefType::get({-1, -1}, elemType);  // KxN
-      matrixCType = MemRefType::get({-1, -1}, elemType);  // MxN
-    }
+    // LLVM 21: Always use dynamic shapes with strided layout for proper offset/stride handling
+    // Create strided layout with dynamic offset and strides
+    SmallVector<int64_t> dynamicStrides2D = {ShapedType::kDynamic, ShapedType::kDynamic};
+    auto stridedLayout = StridedLayoutAttr::get(rewriter.getContext(),
+                                                 ShapedType::kDynamic, dynamicStrides2D);
+    auto matrixAType = MemRefType::get({ShapedType::kDynamic, ShapedType::kDynamic}, elemType, stridedLayout);  // MxK
+    auto matrixBType = MemRefType::get({ShapedType::kDynamic, ShapedType::kDynamic}, elemType, stridedLayout);  // KxN
+    auto matrixCType = MemRefType::get({ShapedType::kDynamic, ShapedType::kDynamic}, elemType, stridedLayout);  // MxN
 
     // Create stride constants
     Value oneStride = rewriter.create<arith::ConstantIndexOp>(loc, 1);
@@ -1729,8 +1713,6 @@ struct MatMulOpLowering : public OpConversionPattern<simp::MatMulOp> {
         loc, matrixBType, rhs, rhs_offset,
         ValueRange{k, n}, ValueRange{n, oneStride});
 
-    // Use the pre-allocated output buffer (host-kernel model: no allocations in kernel)
-    // Reinterpret output as 2D matrix
     auto output2D = rewriter.create<memref::ReinterpretCastOp>(
         loc, matrixCType, output, output_offset,
         ValueRange{m, n}, ValueRange{n, oneStride});
@@ -1782,7 +1764,7 @@ struct Conv2DOpLowering : public OpConversionPattern<simp::Conv2DOp> {
     Value pad_w = operands[14];     // Horizontal padding
 
     // Get element type
-    auto inputMemRefType = input.getType().cast<MemRefType>();
+    auto inputMemRefType = mlir::cast<MemRefType>(input.getType());
     Type elemType = inputMemRefType.getElementType();
 
     // Helper to convert i64 -> index
@@ -1846,23 +1828,23 @@ struct Conv2DOpLowering : public OpConversionPattern<simp::Conv2DOp> {
     Value oc = ocLoop.getInductionVar();
 
     // Initialize accumulator with bias[oc]
-    Value biasVal = rewriter.create<memref::LoadOp>(loc, bias, ValueRange{oc});
+    Value biasVal = rewriter.create<memref::LoadOp>(loc, bias, ValueRange(oc));
 
     // Create inner reduction loops with iter_args for accumulation
     // for kh in [0, kernel_h)
-    auto khLoop = rewriter.create<scf::ForOp>(loc, c0, kernelHIdx, c1, ValueRange{biasVal});
+    auto khLoop = rewriter.create<scf::ForOp>(loc, c0, kernelHIdx, c1, ValueRange(biasVal));
     rewriter.setInsertionPointToStart(khLoop.getBody());
     Value kh = khLoop.getInductionVar();
     Value accKh = khLoop.getRegionIterArgs()[0];
 
     // for kw in [0, kernel_w)
-    auto kwLoop = rewriter.create<scf::ForOp>(loc, c0, kernelWIdx, c1, ValueRange{accKh});
+    auto kwLoop = rewriter.create<scf::ForOp>(loc, c0, kernelWIdx, c1, ValueRange(accKh));
     rewriter.setInsertionPointToStart(kwLoop.getBody());
     Value kw = kwLoop.getInductionVar();
     Value accKw = kwLoop.getRegionIterArgs()[0];
 
     // for ic in [0, in_c)
-    auto icLoop = rewriter.create<scf::ForOp>(loc, c0, inCIdx, c1, ValueRange{accKw});
+    auto icLoop = rewriter.create<scf::ForOp>(loc, c0, inCIdx, c1, ValueRange(accKw));
     rewriter.setInsertionPointToStart(icLoop.getBody());
     Value ic = icLoop.getInductionVar();
     Value acc = icLoop.getRegionIterArgs()[0];
@@ -1906,7 +1888,7 @@ struct Conv2DOpLowering : public OpConversionPattern<simp::Conv2DOp> {
     inputIdx = rewriter.create<arith::AddIOp>(loc, inputIdx, iwOffset);
     inputIdx = rewriter.create<arith::AddIOp>(loc, inputIdx, ic);
 
-    Value inputVal = rewriter.create<memref::LoadOp>(loc, input, ValueRange{inputIdx});
+    Value inputVal = rewriter.create<memref::LoadOp>(loc, input, ValueRange(inputIdx));
 
     // Flatten weight index: weights[oc, kh, kw, ic] -> weights[oc*kh*kw*ic + kh*kw*ic + kw*ic + ic]
     Value weightIdx = rewriter.create<arith::MulIOp>(loc, oc, kernelHIdx);
@@ -1921,18 +1903,18 @@ struct Conv2DOpLowering : public OpConversionPattern<simp::Conv2DOp> {
     weightIdx = rewriter.create<arith::AddIOp>(loc, weightIdx, kwOffset);
     weightIdx = rewriter.create<arith::AddIOp>(loc, weightIdx, ic);
 
-    Value weightVal = rewriter.create<memref::LoadOp>(loc, weights, ValueRange{weightIdx});
+    Value weightVal = rewriter.create<memref::LoadOp>(loc, weights, ValueRange(weightIdx));
 
     // Compute product and add to accumulator
     Value product;
-    if (elemType.isa<FloatType>()) {
+    if (mlir::isa<FloatType>(elemType)) {
       product = rewriter.create<arith::MulFOp>(loc, inputVal, weightVal);
     } else {
       product = rewriter.create<arith::MulIOp>(loc, inputVal, weightVal);
     }
 
     Value newAcc;
-    if (elemType.isa<FloatType>()) {
+    if (mlir::isa<FloatType>(elemType)) {
       newAcc = rewriter.create<arith::AddFOp>(loc, acc, product);
     } else {
       newAcc = rewriter.create<arith::AddIOp>(loc, acc, product);
@@ -1972,7 +1954,7 @@ struct Conv2DOpLowering : public OpConversionPattern<simp::Conv2DOp> {
     outputIdx = rewriter.create<arith::AddIOp>(loc, outputIdx, owOffset);
     outputIdx = rewriter.create<arith::AddIOp>(loc, outputIdx, oc);
 
-    rewriter.create<memref::StoreOp>(loc, finalAcc, output, ValueRange{outputIdx});
+    rewriter.create<memref::StoreOp>(loc, finalAcc, output, ValueRange(outputIdx));
 
     // Return to module level and replace original op with output buffer
     rewriter.setInsertionPointAfter(batchLoop);
@@ -1995,15 +1977,15 @@ struct RMSNormOpLowering : public OpConversionPattern<simp::RMSNormOp> {
       ConversionPatternRewriter &rewriter) const override {
 
     auto loc = op.getLoc();
-    auto input = adaptor.input();
-    auto weight = adaptor.weight();
-    auto output = adaptor.output();
-    auto size = adaptor.size();
-    auto epsilon = adaptor.epsilon();
-    auto weight_offset = adaptor.weight_offset();
+    auto input = adaptor.getInput();
+    auto weight = adaptor.getWeight();
+    auto output = adaptor.getOutput();
+    auto size = adaptor.getSize();
+    auto epsilon = adaptor.getEpsilon();
+    auto weight_offset = adaptor.getWeightOffset();
 
     // Extract element type
-    auto inputType = input.getType().dyn_cast<MemRefType>();
+    auto inputType = mlir::dyn_cast<MemRefType>(input.getType());
     auto elemType = inputType.getElementType();
 
     // Constants
@@ -2015,7 +1997,7 @@ struct RMSNormOpLowering : public OpConversionPattern<simp::RMSNormOp> {
     // Cast epsilon to element type if needed
     Value epsFloat = epsilon;
     if (epsilon.getType() != elemType) {
-      if (epsilon.getType().cast<FloatType>().getWidth() > elemType.cast<FloatType>().getWidth()) {
+      if (mlir::cast<FloatType>(epsilon.getType()).getWidth() > mlir::cast<FloatType>(elemType).getWidth()) {
         epsFloat = rewriter.create<arith::TruncFOp>(loc, elemType, epsilon);
       } else {
         epsFloat = rewriter.create<arith::ExtFOp>(loc, elemType, epsilon);
@@ -2030,7 +2012,7 @@ struct RMSNormOpLowering : public OpConversionPattern<simp::RMSNormOp> {
     rewriter.setInsertionPointToStart(sumLoop.getBody());
 
     auto i = sumLoop.getInductionVar();
-    auto val = rewriter.create<memref::LoadOp>(loc, input, ValueRange{i});
+    auto val = rewriter.create<memref::LoadOp>(loc, input, ValueRange(i));
     auto sq = rewriter.create<arith::MulFOp>(loc, val, val);
     auto currentSum = rewriter.create<memref::LoadOp>(loc, sumSqAlloc, ValueRange());
     auto newSum = rewriter.create<arith::AddFOp>(loc, currentSum, sq);
@@ -2051,16 +2033,16 @@ struct RMSNormOpLowering : public OpConversionPattern<simp::RMSNormOp> {
     rewriter.setInsertionPointToStart(normLoop.getBody());
 
     auto normI = normLoop.getInductionVar();
-    auto normVal = rewriter.create<memref::LoadOp>(loc, input, ValueRange{normI});
+    auto normVal = rewriter.create<memref::LoadOp>(loc, input, ValueRange(normI));
 
     // Add weight_offset to index for layer-specific weights
     auto offsetIdx = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), weight_offset);
     auto weightIdx = rewriter.create<arith::AddIOp>(loc, offsetIdx, normI);
-    auto w = rewriter.create<memref::LoadOp>(loc, weight, ValueRange{weightIdx});
+    auto w = rewriter.create<memref::LoadOp>(loc, weight, ValueRange(weightIdx));
 
     auto norm = rewriter.create<arith::DivFOp>(loc, normVal, rms);
     auto scaled = rewriter.create<arith::MulFOp>(loc, norm, w);
-    rewriter.create<memref::StoreOp>(loc, scaled, output, ValueRange{normI});
+    rewriter.create<memref::StoreOp>(loc, scaled, output, ValueRange(normI));
 
     rewriter.setInsertionPointAfter(normLoop);
     rewriter.replaceOp(op, output);
@@ -2077,13 +2059,13 @@ struct SoftmaxOpLowering : public OpConversionPattern<simp::SoftmaxOp> {
       ConversionPatternRewriter &rewriter) const override {
 
     auto loc = op.getLoc();
-    auto input = adaptor.input();
-    auto output = adaptor.output();
-    auto size = adaptor.size();
-    auto input_offset = adaptor.input_offset();
-    auto output_offset = adaptor.output_offset();
+    auto input = adaptor.getInput();
+    auto output = adaptor.getOutput();
+    auto size = adaptor.getSize();
+    auto input_offset = adaptor.getInputOffset();
+    auto output_offset = adaptor.getOutputOffset();
 
-    auto inputType = input.getType().dyn_cast<MemRefType>();
+    auto inputType = mlir::dyn_cast<MemRefType>(input.getType());
     auto elemType = inputType.getElementType();
 
     auto c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
@@ -2096,7 +2078,7 @@ struct SoftmaxOpLowering : public OpConversionPattern<simp::SoftmaxOp> {
 
     // Step 1: Find max value
     auto firstIdx = rewriter.create<arith::AddIOp>(loc, c0, inputOffsetIdx);
-    auto firstVal = rewriter.create<memref::LoadOp>(loc, input, ValueRange{firstIdx});
+    auto firstVal = rewriter.create<memref::LoadOp>(loc, input, ValueRange(firstIdx));
     auto maxAlloc = rewriter.create<memref::AllocaOp>(loc, MemRefType::get({}, elemType));
     rewriter.create<memref::StoreOp>(loc, firstVal, maxAlloc, ValueRange());
 
@@ -2105,11 +2087,11 @@ struct SoftmaxOpLowering : public OpConversionPattern<simp::SoftmaxOp> {
 
     auto i = maxLoop.getInductionVar();
     auto inputIdx = rewriter.create<arith::AddIOp>(loc, i, inputOffsetIdx);
-    auto val = rewriter.create<memref::LoadOp>(loc, input, ValueRange{inputIdx});
+    auto val = rewriter.create<memref::LoadOp>(loc, input, ValueRange(inputIdx));
     auto currentMax = rewriter.create<memref::LoadOp>(loc, maxAlloc, ValueRange());
     // Use compare + select instead of MaxFOp
     auto cmp = rewriter.create<arith::CmpFOp>(loc, arith::CmpFPredicate::OGT, val, currentMax);
-    auto newMax = rewriter.create<mlir::SelectOp>(loc, cmp, val, currentMax);
+    auto newMax = rewriter.create<mlir::arith::SelectOp>(loc, cmp, val, currentMax);
     rewriter.create<memref::StoreOp>(loc, newMax, maxAlloc, ValueRange());
 
     rewriter.setInsertionPointAfter(maxLoop);
@@ -2126,10 +2108,10 @@ struct SoftmaxOpLowering : public OpConversionPattern<simp::SoftmaxOp> {
     auto expI = expLoop.getInductionVar();
     auto expInputIdx = rewriter.create<arith::AddIOp>(loc, expI, inputOffsetIdx);
     auto expOutputIdx = rewriter.create<arith::AddIOp>(loc, expI, outputOffsetIdx);
-    auto expInputVal = rewriter.create<memref::LoadOp>(loc, input, ValueRange{expInputIdx});
+    auto expInputVal = rewriter.create<memref::LoadOp>(loc, input, ValueRange(expInputIdx));
     auto shifted = rewriter.create<arith::SubFOp>(loc, expInputVal, maxVal);
     auto expVal = rewriter.create<math::ExpOp>(loc, shifted);
-    rewriter.create<memref::StoreOp>(loc, expVal, output, ValueRange{expOutputIdx});
+    rewriter.create<memref::StoreOp>(loc, expVal, output, ValueRange(expOutputIdx));
 
     auto currentSum = rewriter.create<memref::LoadOp>(loc, sumAlloc, ValueRange());
     auto newSum = rewriter.create<arith::AddFOp>(loc, currentSum, expVal);
@@ -2144,9 +2126,9 @@ struct SoftmaxOpLowering : public OpConversionPattern<simp::SoftmaxOp> {
 
     auto normI = normLoop.getInductionVar();
     auto normOutputIdx = rewriter.create<arith::AddIOp>(loc, normI, outputOffsetIdx);
-    auto normExpVal = rewriter.create<memref::LoadOp>(loc, output, ValueRange{normOutputIdx});
+    auto normExpVal = rewriter.create<memref::LoadOp>(loc, output, ValueRange(normOutputIdx));
     auto prob = rewriter.create<arith::DivFOp>(loc, normExpVal, sumExp);
-    rewriter.create<memref::StoreOp>(loc, prob, output, ValueRange{normOutputIdx});
+    rewriter.create<memref::StoreOp>(loc, prob, output, ValueRange(normOutputIdx));
 
     rewriter.setInsertionPointAfter(normLoop);
     rewriter.replaceOp(op, output);
@@ -2163,11 +2145,11 @@ struct SiLUOpLowering : public OpConversionPattern<simp::SiLUOp> {
       ConversionPatternRewriter &rewriter) const override {
 
     auto loc = op.getLoc();
-    auto input = adaptor.input();
-    auto output = adaptor.output();
-    auto size = adaptor.size();
+    auto input = adaptor.getInput();
+    auto output = adaptor.getOutput();
+    auto size = adaptor.getSize();
 
-    auto inputType = input.getType().dyn_cast<MemRefType>();
+    auto inputType = mlir::dyn_cast<MemRefType>(input.getType());
     auto elemType = inputType.getElementType();
 
     auto c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
@@ -2179,12 +2161,12 @@ struct SiLUOpLowering : public OpConversionPattern<simp::SiLUOp> {
     rewriter.setInsertionPointToStart(siluLoop.getBody());
 
     auto i = siluLoop.getInductionVar();
-    auto x = rewriter.create<memref::LoadOp>(loc, input, ValueRange{i});
+    auto x = rewriter.create<memref::LoadOp>(loc, input, ValueRange(i));
     auto negX = rewriter.create<arith::NegFOp>(loc, x);
     auto expNegX = rewriter.create<math::ExpOp>(loc, negX);
     auto denom = rewriter.create<arith::AddFOp>(loc, oneFloat, expNegX);
     auto result = rewriter.create<arith::DivFOp>(loc, x, denom);
-    rewriter.create<memref::StoreOp>(loc, result, output, ValueRange{i});
+    rewriter.create<memref::StoreOp>(loc, result, output, ValueRange(i));
 
     rewriter.setInsertionPointAfter(siluLoop);
     rewriter.replaceOp(op, output);
@@ -2205,11 +2187,11 @@ struct DequantW4OpLowering : public OpConversionPattern<simp::DequantW4Op> {
       ConversionPatternRewriter &rewriter) const override {
 
     auto loc = op.getLoc();
-    auto qweights = adaptor.qweights();
-    auto scales = adaptor.scales();
-    auto zeros = adaptor.zeros();
-    auto idx = adaptor.idx();
-    auto group_size = adaptor.group_size();
+    auto qweights = adaptor.getQweights();
+    auto scales = adaptor.getScales();
+    auto zeros = adaptor.getZeros();
+    auto idx = adaptor.getIdx();
+    auto group_size = adaptor.getGroupSize();
 
     auto i8Type = rewriter.getIntegerType(8);
     auto f32Type = rewriter.getF32Type();
@@ -2220,15 +2202,15 @@ struct DequantW4OpLowering : public OpConversionPattern<simp::DequantW4Op> {
     auto gIdx = rewriter.create<arith::DivUIOp>(loc, idxCast, groupSizeCast);
 
     // Load scale and zero for this group
-    auto scale = rewriter.create<memref::LoadOp>(loc, scales, ValueRange{gIdx});
-    auto zero = rewriter.create<memref::LoadOp>(loc, zeros, ValueRange{gIdx});
+    auto scale = rewriter.create<memref::LoadOp>(loc, scales, ValueRange(gIdx));
+    auto zero = rewriter.create<memref::LoadOp>(loc, zeros, ValueRange(gIdx));
 
     // byte_idx = idx / 2
     auto c2Idx = rewriter.create<arith::ConstantIndexOp>(loc, 2);
     auto byteIdx = rewriter.create<arith::DivUIOp>(loc, idxCast, c2Idx);
 
     // Load packed byte
-    auto qbyte_i8 = rewriter.create<memref::LoadOp>(loc, qweights, ValueRange{byteIdx});
+    auto qbyte_i8 = rewriter.create<memref::LoadOp>(loc, qweights, ValueRange(byteIdx));
 
     // Convert i8 to i32 for bitwise operations
     auto qbyte = rewriter.create<arith::ExtUIOp>(loc, rewriter.getI32Type(), qbyte_i8);
@@ -2247,7 +2229,7 @@ struct DequantW4OpLowering : public OpConversionPattern<simp::DequantW4Op> {
     auto qbyteShifted = rewriter.create<arith::ShRUIOp>(loc, qbyte, c4I32);
     auto qvalEven = rewriter.create<arith::AndIOp>(loc, qbyte, c15I32);
     auto qvalOdd = rewriter.create<arith::AndIOp>(loc, qbyteShifted, c15I32);
-    auto qval_i32 = rewriter.create<SelectOp>(loc, isEven, qvalEven, qvalOdd);
+    auto qval_i32 = rewriter.create<arith::SelectOp>(loc, isEven, qvalEven, qvalOdd);
 
     // Convert qval to float
     auto qval_f = rewriter.create<arith::UIToFPOp>(loc, f32Type, qval_i32);
@@ -2270,9 +2252,9 @@ struct TensorReshapeOpLowering : public OpConversionPattern<simp::TensorReshapeO
       ConversionPatternRewriter &rewriter) const override {
 
     auto loc = op.getLoc();
-    auto input = adaptor.input();
-    auto inputType = input.getType().cast<MemRefType>();
-    auto resultType = getTypeConverter()->convertType(op.getType()).cast<MemRefType>();
+    auto input = adaptor.getInput();
+    auto inputType = mlir::cast<MemRefType>(input.getType());
+    auto resultType = mlir::cast<MemRefType>(getTypeConverter()->convertType(op.getType()));
 
     // Compute total number of elements
     int64_t totalElements = 1;
@@ -2299,13 +2281,13 @@ struct TensorReshapeOpLowering : public OpConversionPattern<simp::TensorReshapeO
         mlir::AffineMap::getMultiDimIdentityMap(1, rewriter.getContext()),  // input
         mlir::AffineMap::getMultiDimIdentityMap(1, rewriter.getContext())   // output
     };
-    SmallVector<mlir::StringRef, 1> iteratorTypes = {mlir::getParallelIteratorTypeName()};
+    SmallVector<mlir::utils::IteratorType, 1> iteratorTypes = {mlir::utils::IteratorType::parallel};
 
     rewriter.create<mlir::linalg::GenericOp>(
         loc,
         TypeRange{},  // No results (writes to output arg)
-        ValueRange{inputFlat},  // inputs
-        ValueRange{resultFlat}, // outputs
+        ValueRange(inputFlat),  // inputs
+        ValueRange(resultFlat), // outputs
         indexingMaps,
         iteratorTypes,
         [&](OpBuilder &b, Location loc, ValueRange args) {
@@ -2327,9 +2309,9 @@ struct TensorTransposeOpLowering : public OpConversionPattern<simp::TensorTransp
       ConversionPatternRewriter &rewriter) const override {
 
     auto loc = op.getLoc();
-    auto input = adaptor.input();
-    auto inputType = input.getType().cast<MemRefType>();
-    auto resultType = getTypeConverter()->convertType(op.getType()).cast<MemRefType>();
+    auto input = adaptor.getInput();
+    auto inputType = mlir::cast<MemRefType>(input.getType());
+    auto resultType = mlir::cast<MemRefType>(getTypeConverter()->convertType(op.getType()));
 
     // Extract permutation from operands (first operand is tensor, rest are indices)
     auto allOperands = adaptor.getOperands();
@@ -2345,11 +2327,11 @@ struct TensorTransposeOpLowering : public OpConversionPattern<simp::TensorTransp
       for (size_t i = 1; i < allOperands.size(); i++) {
         Value indexVal = allOperands[i];
         if (auto constOp = indexVal.getDefiningOp<arith::ConstantOp>()) {
-          if (auto intAttr = constOp.getValue().dyn_cast<IntegerAttr>()) {
+          if (auto intAttr = mlir::dyn_cast<IntegerAttr>(constOp.getValue())) {
             permutation.push_back(intAttr.getInt());
           }
         } else if (auto simpConstOp = indexVal.getDefiningOp<simp::ConstantOp>()) {
-          if (auto intAttr = simpConstOp.value().dyn_cast<IntegerAttr>()) {
+          if (auto intAttr = mlir::dyn_cast<IntegerAttr>(simpConstOp.getValue())) {
             permutation.push_back(intAttr.getInt());
           }
         }
@@ -2397,9 +2379,9 @@ struct TensorSliceOpLowering : public OpConversionPattern<simp::TensorSliceOp> {
       ConversionPatternRewriter &rewriter) const override {
 
     auto loc = op.getLoc();
-    auto input = adaptor.input();
-    auto inputType = input.getType().cast<MemRefType>();
-    auto resultType = getTypeConverter()->convertType(op.getType()).cast<MemRefType>();
+    auto input = adaptor.getInput();
+    auto inputType = mlir::cast<MemRefType>(input.getType());
+    auto resultType = mlir::cast<MemRefType>(getTypeConverter()->convertType(op.getType()));
 
     auto inputShape = inputType.getShape();
     auto resultShape = resultType.getShape();
@@ -2463,21 +2445,21 @@ struct TensorGatherOpLowering : public OpConversionPattern<simp::TensorGatherOp>
       ConversionPatternRewriter &rewriter) const override {
 
     auto loc = op.getLoc();
-    auto source = adaptor.source();
-    auto indices = adaptor.indices();
-    auto sourceType = source.getType().cast<MemRefType>();
-    auto indicesType = indices.getType().cast<MemRefType>();
-    auto resultType = getTypeConverter()->convertType(op.getType()).cast<MemRefType>();
+    auto source = adaptor.getSource();
+    auto indices = adaptor.getIndices();
+    auto sourceType = mlir::cast<MemRefType>(source.getType());
+    auto indicesType = mlir::cast<MemRefType>(indices.getType());
+    auto resultType = mlir::cast<MemRefType>(getTypeConverter()->convertType(op.getType()));
 
     // Get axis (default 0)
     int64_t axis = 0;
-    if (adaptor.axis()) {
-      if (auto constOp = adaptor.axis().getDefiningOp<arith::ConstantOp>()) {
-        if (auto intAttr = constOp.getValue().dyn_cast<IntegerAttr>()) {
+    if (adaptor.getAxis()) {
+      if (auto constOp = adaptor.getAxis().getDefiningOp<arith::ConstantOp>()) {
+        if (auto intAttr = mlir::dyn_cast<IntegerAttr>(constOp.getValue())) {
           axis = intAttr.getInt();
         }
-      } else if (auto simpConstOp = adaptor.axis().getDefiningOp<simp::ConstantOp>()) {
-        if (auto intAttr = simpConstOp.value().dyn_cast<IntegerAttr>()) {
+      } else if (auto simpConstOp = adaptor.getAxis().getDefiningOp<simp::ConstantOp>()) {
+        if (auto intAttr = mlir::dyn_cast<IntegerAttr>(simpConstOp.getValue())) {
           axis = intAttr.getInt();
         }
       }
@@ -2510,7 +2492,7 @@ struct TensorGatherOpLowering : public OpConversionPattern<simp::TensorGatherOp>
       rewriter.create<scf::ForOp>(
           loc, c0, numIndicesVal, c1, ValueRange{},
           [&](OpBuilder &builder, Location loc, Value outIdx, ValueRange) {
-            Value srcIdxVal = builder.create<memref::LoadOp>(loc, indices, ValueRange{outIdx});
+            Value srcIdxVal = builder.create<memref::LoadOp>(loc, indices, ValueRange(outIdx));
             Value srcIdx = builder.create<arith::IndexCastOp>(loc, builder.getIndexType(), srcIdxVal);
 
             // Inner loops over slice dimensions (j, k)
@@ -2540,7 +2522,7 @@ struct TensorGatherOpLowering : public OpConversionPattern<simp::TensorGatherOp>
       rewriter.create<scf::ForOp>(
           loc, c0, numIndicesVal, c1, ValueRange{},
           [&](OpBuilder &builder, Location loc, Value outIdx, ValueRange) {
-            Value srcIdxVal = builder.create<memref::LoadOp>(loc, indices, ValueRange{outIdx});
+            Value srcIdxVal = builder.create<memref::LoadOp>(loc, indices, ValueRange(outIdx));
             Value srcIdx = builder.create<arith::IndexCastOp>(loc, builder.getIndexType(), srcIdxVal);
 
             // Inner loop over row elements
@@ -2617,23 +2599,23 @@ struct TensorScatterOpLowering : public OpConversionPattern<simp::TensorScatterO
       ConversionPatternRewriter &rewriter) const override {
 
     auto loc = op.getLoc();
-    auto dst = adaptor.dst();
-    auto indices = adaptor.indices();
-    auto values = adaptor.values();
-    auto dstType = dst.getType().cast<MemRefType>();
-    auto indicesType = indices.getType().cast<MemRefType>();
-    auto valuesType = values.getType().cast<MemRefType>();
-    auto resultType = getTypeConverter()->convertType(op.getType()).cast<MemRefType>();
+    auto dst = adaptor.getDst();
+    auto indices = adaptor.getIndices();
+    auto values = adaptor.getValues();
+    auto dstType = mlir::cast<MemRefType>(dst.getType());
+    auto indicesType = mlir::cast<MemRefType>(indices.getType());
+    auto valuesType = mlir::cast<MemRefType>(values.getType());
+    auto resultType = mlir::cast<MemRefType>(getTypeConverter()->convertType(op.getType()));
 
     // Get axis (default 0)
     int64_t axis = 0;
-    if (adaptor.axis()) {
-      if (auto constOp = adaptor.axis().getDefiningOp<arith::ConstantOp>()) {
-        if (auto intAttr = constOp.getValue().dyn_cast<IntegerAttr>()) {
+    if (adaptor.getAxis()) {
+      if (auto constOp = adaptor.getAxis().getDefiningOp<arith::ConstantOp>()) {
+        if (auto intAttr = mlir::dyn_cast<IntegerAttr>(constOp.getValue())) {
           axis = intAttr.getInt();
         }
-      } else if (auto simpConstOp = adaptor.axis().getDefiningOp<simp::ConstantOp>()) {
-        if (auto intAttr = simpConstOp.value().dyn_cast<IntegerAttr>()) {
+      } else if (auto simpConstOp = adaptor.getAxis().getDefiningOp<simp::ConstantOp>()) {
+        if (auto intAttr = mlir::dyn_cast<IntegerAttr>(simpConstOp.getValue())) {
           axis = intAttr.getInt();
         }
       }
@@ -2722,11 +2704,11 @@ struct TensorMatMulOpLowering : public OpConversionPattern<simp::TensorMatMulOp>
       ConversionPatternRewriter &rewriter) const override {
 
     auto loc = op.getLoc();
-    auto lhs = adaptor.lhs();
-    auto rhs = adaptor.rhs();
-    auto lhsType = lhs.getType().cast<MemRefType>();
-    auto rhsType = rhs.getType().cast<MemRefType>();
-    auto resultType = getTypeConverter()->convertType(op.getType()).cast<MemRefType>();
+    auto lhs = adaptor.getLhs();
+    auto rhs = adaptor.getRhs();
+    auto lhsType = mlir::cast<MemRefType>(lhs.getType());
+    auto rhsType = mlir::cast<MemRefType>(rhs.getType());
+    auto resultType = mlir::cast<MemRefType>(getTypeConverter()->convertType(op.getType()));
 
     auto lhsShape = lhsType.getShape();
     auto rhsShape = rhsType.getShape();
@@ -2740,7 +2722,7 @@ struct TensorMatMulOpLowering : public OpConversionPattern<simp::TensorMatMulOp>
     auto elemType = resultType.getElementType();
     Value zero = rewriter.create<arith::ConstantOp>(
         loc, elemType, rewriter.getZeroAttr(elemType));
-    rewriter.create<linalg::FillOp>(loc, zero, result);
+    rewriter.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{result});
 
     if (lhsRank == 2 && rhsRank == 2) {
       // Case 1: Standard 2D matrix multiplication (GEMM)
@@ -2776,16 +2758,16 @@ struct TensorMatMulOpLowering : public OpConversionPattern<simp::TensorMatMulOp>
         // Initialize wide result to zero
         Value wideZero = rewriter.create<arith::ConstantOp>(
             loc, wideType, rewriter.getZeroAttr(wideType));
-        rewriter.create<linalg::FillOp>(loc, wideZero, resultWide);
+        rewriter.create<linalg::FillOp>(loc, ValueRange{wideZero}, ValueRange{resultWide});
 
         // Cast lhs to i32 using linalg.generic
         SmallVector<AffineMap, 2> lhsCastMaps = {
             AffineMap::getMultiDimIdentityMap(2, rewriter.getContext()),
             AffineMap::getMultiDimIdentityMap(2, rewriter.getContext())};
-        SmallVector<StringRef, 2> lhsCastIters = {
-            getParallelIteratorTypeName(), getParallelIteratorTypeName()};
+        SmallVector<utils::IteratorType, 2> lhsCastIters = {
+            utils::IteratorType::parallel, utils::IteratorType::parallel};
         rewriter.create<linalg::GenericOp>(
-            loc, TypeRange{}, ValueRange{lhs}, ValueRange{lhsWide},
+            loc, TypeRange{}, ValueRange(lhs), ValueRange(lhsWide),
             lhsCastMaps, lhsCastIters,
             [&](OpBuilder &b, Location loc, ValueRange args) {
               Value extended = b.create<arith::ExtSIOp>(loc, wideType, args[0]);
@@ -2796,10 +2778,10 @@ struct TensorMatMulOpLowering : public OpConversionPattern<simp::TensorMatMulOp>
         SmallVector<AffineMap, 2> rhsCastMaps = {
             AffineMap::getMultiDimIdentityMap(2, rewriter.getContext()),
             AffineMap::getMultiDimIdentityMap(2, rewriter.getContext())};
-        SmallVector<StringRef, 2> rhsCastIters = {
-            getParallelIteratorTypeName(), getParallelIteratorTypeName()};
+        SmallVector<utils::IteratorType, 2> rhsCastIters = {
+            utils::IteratorType::parallel, utils::IteratorType::parallel};
         rewriter.create<linalg::GenericOp>(
-            loc, TypeRange{}, ValueRange{rhs}, ValueRange{rhsWide},
+            loc, TypeRange{}, ValueRange(rhs), ValueRange(rhsWide),
             rhsCastMaps, rhsCastIters,
             [&](OpBuilder &b, Location loc, ValueRange args) {
               Value extended = b.create<arith::ExtSIOp>(loc, wideType, args[0]);
@@ -2808,7 +2790,7 @@ struct TensorMatMulOpLowering : public OpConversionPattern<simp::TensorMatMulOp>
 
         // Perform matmul with i32 accumulator - result stays as i32
         rewriter.create<linalg::MatmulOp>(
-            loc, ValueRange{lhsWide, rhsWide}, ValueRange{resultWide});
+            loc, ValueRange{lhsWide, rhsWide}, ValueRange(resultWide));
 
         // Return i32 result directly - NO truncation
         // User gets i32 tensor instead of i8/i16 to avoid overflow
@@ -2821,7 +2803,7 @@ struct TensorMatMulOpLowering : public OpConversionPattern<simp::TensorMatMulOp>
       } else {
         // General 2D matmul: Use linalg.matmul for optimal performance
         rewriter.create<linalg::MatmulOp>(
-            loc, ValueRange{lhs, rhs}, ValueRange{result});
+            loc, ValueRange{lhs, rhs}, ValueRange(result));
       }
 
     } else if (lhsRank == 3 && rhsRank == 3) {
@@ -2829,7 +2811,7 @@ struct TensorMatMulOpLowering : public OpConversionPattern<simp::TensorMatMulOp>
       // A: BxMxK, B: BxKxN → C: BxMxN
       // Use linalg.batch_matmul
       rewriter.create<linalg::BatchMatmulOp>(
-          loc, ValueRange{lhs, rhs}, ValueRange{result});
+          loc, ValueRange{lhs, rhs}, ValueRange(result));
 
     } else if (lhsRank == 4 && rhsRank == 2) {
       // Case 3: 4D NHWC input with 2D weight matrix (fully connected layer)
@@ -2885,10 +2867,10 @@ struct TensorMatMulOpLowering : public OpConversionPattern<simp::TensorMatMulOp>
           loc, MemRefType::get({spatial, C_out}, elemType));
 
       // Initialize tempResult to zero
-      rewriter.create<linalg::FillOp>(loc, zero, tempResult);
+      rewriter.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{tempResult});
 
       rewriter.create<linalg::MatmulOp>(
-          loc, ValueRange{lhsCollapsed, rhsTransposed}, ValueRange{tempResult});
+          loc, ValueRange{lhsCollapsed, rhsTransposed}, ValueRange(tempResult));
 
       // Reshape result back to (N, H, W, C_out)
       SmallVector<ReassociationIndices, 2> resultReassoc = {{0, 1, 2}, {3}};
@@ -2917,9 +2899,9 @@ struct TensorDotOpLowering : public OpConversionPattern<simp::TensorDotOp> {
       ConversionPatternRewriter &rewriter) const override {
 
     auto loc = op.getLoc();
-    auto lhs = adaptor.lhs();
-    auto rhs = adaptor.rhs();
-    auto lhsType = lhs.getType().cast<MemRefType>();
+    auto lhs = adaptor.getLhs();
+    auto rhs = adaptor.getRhs();
+    auto lhsType = mlir::cast<MemRefType>(lhs.getType());
 
     auto shape = lhsType.getShape();
     if (shape.size() != 1) {
@@ -2940,13 +2922,13 @@ struct TensorDotOpLowering : public OpConversionPattern<simp::TensorDotOp> {
     // Tight reduction loop: sum = sum + lhs[i] * rhs[i]
     // This is auto-vectorizable by LLVM
     auto loopResult = rewriter.create<scf::ForOp>(
-        loc, c0, N_val, c1, ValueRange{zero},
+        loc, c0, N_val, c1, ValueRange(zero),
         [&](OpBuilder &builder, Location loc, Value i, ValueRange iterArgs) {
           Value currentSum = iterArgs[0];
 
           // Load elements
-          Value lhsElem = builder.create<memref::LoadOp>(loc, lhs, ValueRange{i});
-          Value rhsElem = builder.create<memref::LoadOp>(loc, rhs, ValueRange{i});
+          Value lhsElem = builder.create<memref::LoadOp>(loc, lhs, ValueRange(i));
+          Value rhsElem = builder.create<memref::LoadOp>(loc, rhs, ValueRange(i));
 
           // Multiply
           Value product = builder.create<arith::MulFOp>(loc, lhsElem, rhsElem);
@@ -2954,7 +2936,7 @@ struct TensorDotOpLowering : public OpConversionPattern<simp::TensorDotOp> {
           // Accumulate
           Value newSum = builder.create<arith::AddFOp>(loc, currentSum, product);
 
-          builder.create<scf::YieldOp>(loc, ValueRange{newSum});
+          builder.create<scf::YieldOp>(loc, ValueRange(newSum));
         });
 
     // Replace with the final sum
@@ -2974,15 +2956,15 @@ struct MatMulQuantOpLowering : public OpConversionPattern<simp::MatMulQuantOp> {
       ConversionPatternRewriter &rewriter) const override {
 
     auto loc = op.getLoc();
-    auto qweights = adaptor.qweights();
-    auto scales = adaptor.scales();
-    auto zeros = adaptor.zeros();
-    auto input = adaptor.input();
-    auto output = adaptor.output();
-    auto rows = adaptor.rows();  // M
-    auto cols = adaptor.cols();  // K
-    auto group_size = adaptor.group_size();
-    auto offset = adaptor.offset();
+    auto qweights = adaptor.getQweights();
+    auto scales = adaptor.getScales();
+    auto zeros = adaptor.getZeros();
+    auto input = adaptor.getInput();
+    auto output = adaptor.getOutput();
+    auto rows = adaptor.getRows();  // M
+    auto cols = adaptor.getCols();  // K
+    auto group_size = adaptor.getGroupSize();
+    auto offset = adaptor.getOffset();
 
     auto f32Type = rewriter.getF32Type();
     auto i32Type = rewriter.getIntegerType(32);
@@ -3026,7 +3008,7 @@ struct MatMulQuantOpLowering : public OpConversionPattern<simp::MatMulQuantOp> {
     auto rowOffset = rewriter.create<arith::MulIOp>(loc, i, colsIdx);
 
     // Initialize output[i] = 0
-    rewriter.create<memref::StoreOp>(loc, zeroF32, output, ValueRange{i});
+    rewriter.create<memref::StoreOp>(loc, zeroF32, output, ValueRange(i));
 
     // Group loop: for each group of GS weights (128 weights per group)
     auto numGroups = rewriter.create<arith::DivUIOp>(loc, colsIdx, groupSizeCast);
@@ -3038,14 +3020,14 @@ struct MatMulQuantOpLowering : public OpConversionPattern<simp::MatMulQuantOp> {
     // Load scale/zero once per group
     auto rowGroupBase = rewriter.create<arith::DivUIOp>(loc, rowOffset, groupSizeCast);
     auto groupIdx = rewriter.create<arith::AddIOp>(loc, rowGroupBase, g);
-    auto scale = rewriter.create<memref::LoadOp>(loc, scales, ValueRange{groupIdx});
-    auto zero = rewriter.create<memref::LoadOp>(loc, zeros, ValueRange{groupIdx});
+    auto scale = rewriter.create<memref::LoadOp>(loc, scales, ValueRange(groupIdx));
+    auto zero = rewriter.create<memref::LoadOp>(loc, zeros, ValueRange(groupIdx));
 
     // Tile loop: process 16 weights at a time within group (128/16 = 8 tiles)
     auto numTiles = rewriter.create<arith::ConstantIndexOp>(loc, 8);  // 128/16 = 8
     auto tileLoop = rewriter.create<scf::ForOp>(
         loc, c0, numTiles, c1,
-        ValueRange{zeroF32},  // Accumulator
+        ValueRange(zeroF32),  // Accumulator
         [&](OpBuilder &b, Location loc, Value t, ValueRange iterArgs) {
           Value acc = iterArgs[0];
           auto tileStart = b.create<arith::MulIOp>(loc, t, c16);
@@ -3064,7 +3046,7 @@ struct MatMulQuantOpLowering : public OpConversionPattern<simp::MatMulQuantOp> {
             // Extract nibble
             auto c1I64 = b.create<arith::ConstantOp>(loc, wIdx.getType(), b.getIntegerAttr(wIdx.getType(), 1));
             auto qByteIdx = b.create<arith::ShRUIOp>(loc, wIdx, c1I64);
-            auto qByte_i8 = b.create<memref::LoadOp>(loc, qweights, ValueRange{qByteIdx});
+            auto qByte_i8 = b.create<memref::LoadOp>(loc, qweights, ValueRange(qByteIdx));
             auto qByte = b.create<arith::ExtUIOp>(loc, i32Type, qByte_i8);
 
             auto idxAnd1 = b.create<arith::AndIOp>(loc, wIdx, c1I64);
@@ -3074,7 +3056,7 @@ struct MatMulQuantOpLowering : public OpConversionPattern<simp::MatMulQuantOp> {
             auto lowNibble = b.create<arith::AndIOp>(loc, qByte, c15i32);
             auto qbyteShifted = b.create<arith::ShRUIOp>(loc, qByte, c4i32);
             auto highNibble = b.create<arith::AndIOp>(loc, qbyteShifted, c15i32);
-            auto nibble = b.create<SelectOp>(loc, isEven, lowNibble, highNibble);
+            auto nibble = b.create<arith::SelectOp>(loc, isEven, lowNibble, highNibble);
 
             // Dequantize: weight = nibble * scale + zero
             auto nibbleF = b.create<arith::UIToFPOp>(loc, f32Type, nibble);
@@ -3082,43 +3064,45 @@ struct MatMulQuantOpLowering : public OpConversionPattern<simp::MatMulQuantOp> {
             auto weightF = b.create<arith::AddFOp>(loc, scaled, zero);
 
             // Store in tile buffer
-            b.create<memref::StoreOp>(loc, weightF, weightTile, ValueRange{jIdx});
+            b.create<memref::StoreOp>(loc, weightF, weightTile, ValueRange(jIdx));
           }
 
           // Simple loop for dot product
           auto dotLoop = b.create<scf::ForOp>(
               loc, c0, c16, c1,
-              ValueRange{acc},
+              ValueRange(acc),
               [&](OpBuilder &b2, Location loc, Value j, ValueRange iterArgs2) {
                 Value dotAcc = iterArgs2[0];
                 auto kGlobal = b2.create<arith::AddIOp>(loc, kStart, j);
 
                 // Bounds check
                 auto kValid = b2.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ult, kGlobal, colsIdx);
+                // In LLVM 21, scf::IfOp with builder lambdas doesn't take TypeRange
+                // Result types are inferred from yield operations
                 auto ifOp = b2.create<scf::IfOp>(
-                    loc, TypeRange{f32Type}, kValid,
+                    loc, kValid,
                     [&](OpBuilder &b3, Location loc) {
-                      auto w = b3.create<memref::LoadOp>(loc, weightTile, ValueRange{j});
-                      auto x = b3.create<memref::LoadOp>(loc, input, ValueRange{kGlobal});
+                      auto w = b3.create<memref::LoadOp>(loc, weightTile, ValueRange(j));
+                      auto x = b3.create<memref::LoadOp>(loc, input, ValueRange(kGlobal));
                       auto prod = b3.create<arith::MulFOp>(loc, w, x);
                       auto newAcc = b3.create<arith::AddFOp>(loc, dotAcc, prod);
-                      b3.create<scf::YieldOp>(loc, ValueRange{newAcc});
+                      b3.create<scf::YieldOp>(loc, ValueRange(newAcc));
                     },
                     [&](OpBuilder &b3, Location loc) {
-                      b3.create<scf::YieldOp>(loc, ValueRange{dotAcc});
+                      b3.create<scf::YieldOp>(loc, ValueRange(dotAcc));
                     });
 
-                b2.create<scf::YieldOp>(loc, ValueRange{ifOp.getResult(0)});
+                b2.create<scf::YieldOp>(loc, ValueRange(ifOp.getResult(0)));
               });
 
-          b.create<scf::YieldOp>(loc, ValueRange{dotLoop.getResult(0)});
+          b.create<scf::YieldOp>(loc, ValueRange(dotLoop.getResult(0)));
         });
 
     // Add tile result to output[i]
-    auto currentOut = rewriter.create<memref::LoadOp>(loc, output, ValueRange{i});
+    auto currentOut = rewriter.create<memref::LoadOp>(loc, output, ValueRange(i));
     auto tileResult = tileLoop.getResult(0);
     auto newOut = rewriter.create<arith::AddFOp>(loc, currentOut, tileResult);
-    rewriter.create<memref::StoreOp>(loc, newOut, output, ValueRange{i});
+    rewriter.create<memref::StoreOp>(loc, newOut, output, ValueRange(i));
 
     rewriter.setInsertionPointAfter(groupLoop);
     rewriter.setInsertionPointAfter(rowLoop);
@@ -3147,7 +3131,7 @@ struct ConvertSimpToMemRefPass
 
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<memref::MemRefDialect>();
-    registry.insert<arith::ArithmeticDialect>();
+    registry.insert<arith::ArithDialect>();
     registry.insert<linalg::LinalgDialect>();
     registry.insert<math::MathDialect>();
   }
@@ -3161,19 +3145,19 @@ struct ConvertSimpToMemRefPass
     // Set up conversion target
     ConversionTarget target(getContext());
     target.addLegalDialect<memref::MemRefDialect>();
-    target.addLegalDialect<arith::ArithmeticDialect>();
+    target.addLegalDialect<arith::ArithDialect>();
     target.addLegalDialect<linalg::LinalgDialect>();
     target.addLegalDialect<math::MathDialect>();
-    target.addLegalDialect<StandardOpsDialect>();
+    target.addLegalDialect<func::FuncDialect>();
     target.addLegalOp<ModuleOp>();
 
     // FuncOp is legal only if its signature has been converted (no simp types)
-    target.addDynamicallyLegalOp<FuncOp>([&](FuncOp op) {
-      return typeConverter.isSignatureLegal(op.getType());
+    target.addDynamicallyLegalOp<func::FuncOp>([&](func::FuncOp op) {
+      return typeConverter.isSignatureLegal(op.getFunctionType());
     });
 
     // CallOp is legal only if its operands and results have legal types
-    target.addDynamicallyLegalOp<CallOp>([&](CallOp op) {
+    target.addDynamicallyLegalOp<func::CallOp>([&](func::CallOp op) {
       return typeConverter.isLegal(op);
     });
 

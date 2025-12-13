@@ -16,11 +16,20 @@ llvm::Value* SIMDHelper::performOp(
     auto* simd = context.getSIMDInterface();
     
     // Load pointers if needed
+    // LLVM 21: Opaque pointers - get type from AllocaInst or use context
+    auto getLoadType = [&](llvm::Value* val) -> llvm::Type* {
+        if (auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(val)) {
+            return alloca->getAllocatedType();
+        }
+        // For SIMD ops, we're typically working with doubles
+        return builder.getDoubleTy();
+    };
+
     if (lhs->getType()->isPointerTy()) {
-        lhs = builder.CreateLoad(lhs->getType()->getPointerElementType(), lhs);
+        lhs = builder.CreateLoad(getLoadType(lhs), lhs);
     }
     if (rhs->getType()->isPointerTy()) {
-        rhs = builder.CreateLoad(rhs->getType()->getPointerElementType(), rhs);
+        rhs = builder.CreateLoad(getLoadType(rhs), rhs);
     }
     
     // Convert SIMDOp to ArithOp
@@ -58,7 +67,12 @@ llvm::Value* SIMDHelper::createVector(
     if (elements.size() == 1) {
         llvm::Value* elem = elements[0];
         if (elem->getType()->isPointerTy()) {
-            elem = builder.CreateLoad(elem->getType()->getPointerElementType(), elem);
+            // LLVM 21: Opaque pointers - get type from AllocaInst or use double
+            llvm::Type* loadType = builder.getDoubleTy();
+            if (auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(elem)) {
+                loadType = alloca->getAllocatedType();
+            }
+            elem = builder.CreateLoad(loadType, elem);
         }
         return broadcastScalar(context, elem, vecType);
     }

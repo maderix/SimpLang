@@ -78,11 +78,11 @@ mlir::Type SimpDialect::parseType(mlir::DialectAsmParser &parser) const {
 }
 
 void SimpDialect::printType(mlir::Type type, mlir::DialectAsmPrinter &printer) const {
-  if (auto arrayType = type.dyn_cast<ArrayType>()) {
+  if (auto arrayType = mlir::dyn_cast<ArrayType>(type)) {
     printer << "array<";
     printer.printType(arrayType.getElementType());
     printer << ">";
-  } else if (auto tensorType = type.dyn_cast<SimpTensorType>()) {
+  } else if (auto tensorType = mlir::dyn_cast<SimpTensorType>(type)) {
     printer << "tensor<";
     // Print shape
     for (size_t i = 0; i < tensorType.getShape().size(); ++i) {

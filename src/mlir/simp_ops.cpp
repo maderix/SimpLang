@@ -19,9 +19,9 @@ using namespace mlir::simp;
 // ConstantOp
 //===----------------------------------------------------------------------===//
 
-mlir::OpFoldResult ConstantOp::fold(llvm::ArrayRef<mlir::Attribute> operands) {
+mlir::OpFoldResult ConstantOp::fold(FoldAdaptor adaptor) {
   // Constants fold to themselves
-  return value();
+  return getValue();
 }
 
 //===----------------------------------------------------------------------===//

@@ -6,9 +6,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
-    llvm-14-dev \
-    llvm-14-tools \
-    clang-14 \
+    llvm-21-dev \
+    llvm-21-tools \
+    clang-21 \
     cmake \
     libboost-all-dev \
     libreadline-dev \
@@ -20,9 +20,9 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Set up LLVM alternatives
-RUN update-alternatives --install /usr/bin/llvm-config llvm-config /usr/bin/llvm-config-14 100 && \
-    update-alternatives --install /usr/bin/clang clang /usr/bin/clang-14 100 && \
-    update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-14 100
+RUN update-alternatives --install /usr/bin/llvm-config llvm-config /usr/bin/llvm-config-21 100 && \
+    update-alternatives --install /usr/bin/clang clang /usr/bin/clang-21 100 && \
+    update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-21 100
 
 # Set working directory
 WORKDIR /app
@@ -38,7 +38,7 @@ FROM ubuntu:22.04 AS runtime
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
-    llvm-14-runtime \
+    llvm-21-runtime \
     libboost-system1.74.0 \
     libreadline8 \
     && rm -rf /var/lib/apt/lists/*

@@ -12,7 +12,10 @@
 #include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
-#include "mlir/Dialect/SCF/SCF.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
@@ -37,7 +40,7 @@ struct SimpLinalgTilingPassOptions {
 /// workloads (768×768 matrices) and achieves 45.68 tok/s on Stories110M.
 ///
 class SimpLinalgTilingPass
-    : public PassWrapper<SimpLinalgTilingPass, OperationPass<FuncOp>> {
+    : public PassWrapper<SimpLinalgTilingPass, OperationPass<func::FuncOp>> {
 private:
   SimpLinalgTilingPassOptions options;
 
@@ -54,13 +57,37 @@ public:
   }
 
   void runOnOperation() override {
-    FuncOp func = getOperation();
+    func::FuncOp func = getOperation();
     MLIRContext *context = &getContext();
 
     // Determine loop type based on parallelization flag
     LinalgTilingLoopType loopType = options.parallelLoops
         ? LinalgTilingLoopType::ParallelLoops
         : LinalgTilingLoopType::Loops;
+
+    // Collect all linalg ops first to avoid iterator invalidation
+    SmallVector<LinalgOp, 8> linalgOps;
+    func.walk([&](LinalgOp op) { linalgOps.push_back(op); });
+
+    IRRewriter rewriter(context);
+
+    auto tileOps = [&](ArrayRef<int64_t> tileSizes, LinalgTilingLoopType lt) -> LogicalResult {
+      LinalgTilingOptions tilingOptions;
+      tilingOptions.setTileSizes(tileSizes).setLoopType(lt);
+
+      for (LinalgOp op : linalgOps) {
+        // Skip if op is no longer valid (replaced by previous tiling)
+        if (op->getParentOp() == nullptr)
+          continue;
+
+        rewriter.setInsertionPoint(op);
+        FailureOr<TiledLinalgOp> tiledOp = tileLinalgOp(rewriter, op, tilingOptions);
+        if (succeeded(tiledOp)) {
+          rewriter.eraseOp(op);
+        }
+      }
+      return success();
+    };
 
     if (options.hierarchical) {
       // Two-level hierarchical tiling
@@ -70,32 +97,27 @@ public:
                    << "×" << options.tileSize << "\n";
 
       // Level 1: Outer tiling (L2/L3 cache aware)
-      llvm::SmallVector<int64_t, 3> outerTileSizes(3, options.outerTileSize);
-      PassManager pm1(context);
-      pm1.addPass(createLinalgTilingPass(outerTileSizes, loopType));
-      pm1.addPass(createCanonicalizerPass());
-      if (failed(pm1.run(func))) {
+      SmallVector<int64_t, 3> outerTileSizes(3, options.outerTileSize);
+      if (failed(tileOps(outerTileSizes, loopType))) {
         signalPassFailure();
         return;
       }
 
+      // Re-collect linalg ops after first tiling pass
+      linalgOps.clear();
+      func.walk([&](LinalgOp op) { linalgOps.push_back(op); });
+
       // Level 2: Inner tiling (L1 cache + vectorization)
-      llvm::SmallVector<int64_t, 3> innerTileSizes(3, options.tileSize);
-      PassManager pm2(context);
-      pm2.addPass(createLinalgTilingPass(innerTileSizes, LinalgTilingLoopType::Loops));
-      pm2.addPass(createCanonicalizerPass());
-      if (failed(pm2.run(func))) {
+      SmallVector<int64_t, 3> innerTileSizes(3, options.tileSize);
+      if (failed(tileOps(innerTileSizes, LinalgTilingLoopType::Loops))) {
         signalPassFailure();
         return;
       }
 
     } else {
       // Single-level tiling
-      llvm::SmallVector<int64_t, 3> tileSizes(3, options.tileSize);
-      PassManager pm(context);
-      pm.addPass(createLinalgTilingPass(tileSizes, loopType));
-      pm.addPass(createCanonicalizerPass());
-      if (failed(pm.run(func))) {
+      SmallVector<int64_t, 3> tileSizes(3, options.tileSize);
+      if (failed(tileOps(tileSizes, loopType))) {
         signalPassFailure();
         return;
       }

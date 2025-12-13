@@ -10,12 +10,13 @@
 
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/FileSystem.h>
-#include <llvm/Support/Host.h>
+#include <llvm/TargetParser/Host.h>
 #include <llvm/Support/CommandLine.h>
-#include <llvm/MC/SubtargetFeature.h>
+#include <llvm/TargetParser/SubtargetFeature.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Verifier.h>
-#include <llvm/Transforms/Vectorize.h>
+#include <llvm/Transforms/Vectorize/LoopVectorize.h>
+#include <llvm/Transforms/Vectorize/SLPVectorizer.h>
 #include <llvm/Transforms/Scalar.h>
 #include <llvm/Transforms/Utils.h>
 #include <llvm/Analysis/TargetTransformInfo.h>
@@ -28,7 +29,10 @@
 #include "mlir/Passes.h"
 #include "mlir/ExecutionEngine/OptUtils.h"
 #include "mlir/PromoteLargeAllocaToHeap.h"
+#include "mlir/passes/VNNIPass.h"
 #include "ast/transforms/normalize_returns.hpp"
+#include <llvm/Transforms/Utils/LoopSimplify.h>
+#include <llvm/Transforms/Utils/LCSSA.h>
 #endif
 
 extern BlockAST* programBlock;
@@ -47,6 +51,7 @@ int main(int argc, char** argv) {
     bool enablePrefetch = true;  // Prefetch insertion for memory latency hiding (enabled by default)
     bool debugBuild = false;  // Debug build - disables ALL optimizations for debugging
     bool dumpMLIRPasses = false;  // Dump MLIR at each pipeline stage
+    bool llvmVectorize = false;  // Skip MLIR vectorization, let LLVM handle it (better for INT8/INT4)
     std::string outputPath;
     std::string logLevel = "INFO";  // Default log level
     std::string targetArch = "";  // Target architecture (empty = native)
@@ -85,6 +90,7 @@ int main(int argc, char** argv) {
         std::cout << "  --hierarchical-tiling  Multi-level cache-aware tiling (L1/L2/L3)" << std::endl;
         std::cout << "  --enable-openmp    Enable OpenMP parallelization (multi-threading)" << std::endl;
         std::cout << "  --no-prefetch      Disable prefetch insertion (memory latency hiding)" << std::endl;
+        std::cout << "  --llvm-vectorize   Use LLVM vectorization + VNNI (better for INT8/INT4)" << std::endl;
         std::cout << "  --no-opt           Disable LLVM O3 optimization (faster compilation)" << std::endl;
         std::cout << std::endl;
 #endif
@@ -177,6 +183,9 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "--no-prefetch") == 0) {
             enablePrefetch = false;
         }
+        else if (strcmp(argv[i], "--llvm-vectorize") == 0) {
+            llvmVectorize = true;
+        }
         else if (strcmp(argv[i], "--no-opt") == 0) {
             enableO3 = false;
         }
@@ -198,8 +207,8 @@ int main(int argc, char** argv) {
     llvm::InitializeAllAsmPrinters();
 
 #ifdef USE_MLIR
-    // Initialize LLVM optimization passes (required for makeOptimizingTransformer)
-    mlir::initializeLLVMPasses();
+    // NOTE: mlir::initializeLLVMPasses() removed in LLVM 21
+    // LLVM passes are initialized automatically when needed
 #endif
 
     // Set input file
@@ -292,6 +301,10 @@ int main(int argc, char** argv) {
         pipeline.setEnableHierarchicalTiling(enableHierarchicalTiling);
         pipeline.setEnableOpenMP(enableOpenMP);
         pipeline.setEnablePrefetch(enablePrefetch);
+        pipeline.setSkipMLIRVectorization(llvmVectorize);
+        if (llvmVectorize) {
+            LOG_INFO("Using LLVM vectorization + VNNI (MLIR vectorization disabled)");
+        }
         if (enableTiling) {
             if (enableHierarchicalTiling) {
                 LOG_INFO("Hierarchical tiling enabled (L3: 128x128x128, L2: 32x32x32, L1: 8x8x8)");
@@ -405,7 +418,8 @@ int main(int argc, char** argv) {
             }
             LOG_INFO("Target: " + targetTriple + " (cross-compilation)");
         }
-        llvmModule->setTargetTriple(targetTriple);
+        // LLVM 21: setTargetTriple takes llvm::Triple
+        llvmModule->setTargetTriple(llvm::Triple(targetTriple));
 
         std::string error;
         auto target = llvm::TargetRegistry::lookupTarget(targetTriple, error);
@@ -421,8 +435,8 @@ int main(int argc, char** argv) {
         if (targetArch.empty()) {
             // Native compilation: use host CPU features for maximum performance
             cpu = llvm::sys::getHostCPUName().str();
-            llvm::StringMap<bool> featureMap;
-            llvm::sys::getHostCPUFeatures(featureMap);
+            // LLVM 21: getHostCPUFeatures returns the map directly
+            llvm::StringMap<bool> featureMap = llvm::sys::getHostCPUFeatures();
             llvm::SubtargetFeatures subtargetFeatures;
             for (auto &feature : featureMap) {
                 subtargetFeatures.AddFeature(feature.first(), feature.second);
@@ -445,10 +459,23 @@ int main(int argc, char** argv) {
         }
 
         llvm::TargetOptions opt;
-        auto rm = llvm::Optional<llvm::Reloc::Model>(llvm::Reloc::PIC_);
+        auto rm = std::optional<llvm::Reloc::Model>(llvm::Reloc::PIC_);
         auto targetMachine = target->createTargetMachine(targetTriple, cpu, features, opt, rm);
 
         llvmModule->setDataLayout(targetMachine->createDataLayout());
+
+        // Run VNNI optimization pass BEFORE O3 to identify and transform i8 dot product loops
+        // Only run when --llvm-vectorize is enabled (for INT8/INT4 workloads)
+        if (llvmVectorize) {
+            LOG_INFO("Running VNNI optimization pass...");
+            llvm::legacy::PassManager vnniPM;
+            // First simplify loops to create proper preheaders
+            vnniPM.add(llvm::createLoopSimplifyPass());
+            vnniPM.add(llvm::createLCSSAPass());
+            // Now run VNNI pass
+            vnniPM.add(llvm::createVNNIPass());
+            vnniPM.run(*llvmModule);
+        }
 
         // RUN LLVM OPTIMIZATION PASSES (Critical for performance!)
         // Use MLIR's optimization transformer (same as Toy tutorial Ch6)
@@ -498,7 +525,8 @@ int main(int argc, char** argv) {
         LOG_INFO("Final heap promotion pass before codegen...");
         pass.add(llvm::createPromoteLargeAllocaToHeapPass());
 
-        auto fileType = llvm::CGFT_ObjectFile;
+        // LLVM 21: CodeGenFileType enum is now scoped
+        auto fileType = llvm::CodeGenFileType::ObjectFile;
 
         if (targetMachine->addPassesToEmitFile(pass, destObj, nullptr, fileType)) {
             llvm::errs() << "TargetMachine can't emit a file of this type\n";
@@ -620,11 +648,12 @@ int main(int argc, char** argv) {
         modulePM.add(llvm::createLoopDataPrefetchPass());
     }
 
-    // Add vectorization passes (skip in debug build)
-    if (!debugBuild) {
-        modulePM.add(llvm::createLoopVectorizePass());        // Loop vectorizer
-        modulePM.add(llvm::createSLPVectorizerPass());        // SLP vectorizer
-    }
+    // NOTE: Legacy vectorization passes removed in LLVM 21
+    // MLIR handles vectorization through the pipeline instead
+    // if (!debugBuild) {
+    //     modulePM.add(llvm::createLoopVectorizePass());        // Loop vectorizer
+    //     modulePM.add(llvm::createSLPVectorizerPass());        // SLP vectorizer
+    // }
 
     // Run the optimization passes (skip entirely in debug build if no passes added)
     if (!debugBuild || enablePrefetch) {
@@ -640,7 +669,7 @@ int main(int argc, char** argv) {
     }
 
     llvm::TargetMachine* targetMachine = context.getTargetMachine();
-    auto FileType = llvm::CGFT_ObjectFile;
+    auto FileType = llvm::CodeGenFileType::ObjectFile;
 
     if (targetMachine->addPassesToEmitFile(pass, destObj, nullptr, FileType)) {
         llvm::errs() << "TargetMachine can't emit a file of this type\n";

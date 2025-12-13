@@ -39,20 +39,14 @@ def Simp_Dialect : Dialect {
 
   let cppNamespace = "::mlir::simp";
 
-  // Use automatic type parsing/printing from TableGen
+  // Use automatic type parsing/printing from TableGen (MLIR 15+ handles this)
   let useDefaultTypePrinterParser = 1;
 
   // Enable constant materialization for constant folding
   let hasConstantMaterializer = 1;
 
-  // Extra class declarations for type parsing/printing
-  let extraClassDeclaration = [{
-    /// Parse a type registered to this dialect.
-    mlir::Type parseType(mlir::DialectAsmParser &parser) const override;
-
-    /// Print a type registered to this dialect.
-    void printType(mlir::Type type, mlir::DialectAsmPrinter &printer) const override;
-  }];
+  // Note: parseType/printType are auto-generated when useDefaultTypePrinterParser = 1
+  // Do NOT declare them manually in extraClassDeclaration
 }
 
 //===----------------------------------------------------------------------===//

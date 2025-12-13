@@ -10,7 +10,7 @@
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/MC/TargetRegistry.h>
-#include <llvm/Support/Host.h>
+#include <llvm/TargetParser/Host.h>
 #include <llvm/IR/DIBuilder.h>
 #include <llvm/IR/DebugLoc.h>
 #include <llvm/IR/DebugInfo.h>
@@ -96,6 +96,9 @@ private:
     
     // Array element type tracking for opaque pointer compatibility
     std::map<std::string, llvm::Type*> arrayElementTypes;
+
+    // LLVM 21: Helper for slice struct type with opaque pointers
+    llvm::StructType* getSliceStructType(llvm::Value* slice);
     
     // Global symbol table for global variables
     std::map<std::string, llvm::Value*> globalSymbols;

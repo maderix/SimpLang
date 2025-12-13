@@ -1,6 +1,8 @@
 #include "simd_backend.hpp"
 #include <llvm/IR/IntrinsicsX86.h>
 #include <llvm/IR/Constants.h>
+#include <llvm/IR/Module.h>
+#include <llvm/IR/DerivedTypes.h>
 #include <immintrin.h>
 
 class AVX512Backend : public SIMDBackend {
@@ -39,34 +41,35 @@ public:
         return true;  // AVX-512 includes FMA
     }
     
-    llvm::Value* createAlignedAlloc(llvm::IRBuilder<>& builder, 
-                                   llvm::Type* elementType, 
+    llvm::Value* createAlignedAlloc(llvm::IRBuilder<>& builder,
+                                   llvm::Type* elementType,
                                    llvm::Value* count) override {
         auto& context = builder.getContext();
         auto* module = builder.GetInsertBlock()->getModule();
-        
+
         // Calculate total size: count * sizeof(elementType)
         auto* elementSize = llvm::ConstantInt::get(
-            llvm::Type::getInt64Ty(context), 
+            llvm::Type::getInt64Ty(context),
             elementType->getPrimitiveSizeInBits() / 8
         );
         auto* totalSize = builder.CreateMul(count, elementSize, "total_size");
-        
+
+        // LLVM 21: Use opaque pointer type (all pointers are ptr in LLVM's opaque pointer mode)
+        auto* ptrType = llvm::PointerType::get(context, 0);
+
         // Call aligned_alloc(64, totalSize)
         auto aligned_alloc = module->getOrInsertFunction(
             "aligned_alloc",
             llvm::FunctionType::get(
-                llvm::Type::getInt8PtrTy(context),
+                ptrType,
                 {llvm::Type::getInt64Ty(context), llvm::Type::getInt64Ty(context)},
                 false
             )
         );
-        
+
         auto* alignment = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 64);
-        auto* ptr = builder.CreateCall(aligned_alloc, {alignment, totalSize});
-        
-        // Cast to appropriate pointer type
-        return builder.CreateBitCast(ptr, elementType->getPointerTo(), "aligned_ptr");
+        // LLVM 21: No bitcast needed with opaque pointers - all pointers are the same type
+        return builder.CreateCall(aligned_alloc, {alignment, totalSize}, "aligned_ptr");
     }
     
     llvm::Value* createVectorLoad(llvm::IRBuilder<>& builder, 
@@ -242,29 +245,32 @@ public:
     
     llvm::Value* createVectorSliceLoad(llvm::IRBuilder<>& builder,
                                       llvm::Value* basePtr,
+                                      llvm::Type* elementType,
                                       llvm::Value* startIndex,
                                       int sliceWidth) override {
+        // LLVM 21: elementType must be passed explicitly due to opaque pointers
         // Calculate offset: basePtr + startIndex
         auto* offset = builder.CreateGEP(
-            basePtr->getType()->getPointerElementType(),
+            elementType,
             basePtr, startIndex, "slice_ptr");
-        
+
         // Create vector type for slice
-        auto* elementType = basePtr->getType()->getPointerElementType();
         auto* sliceVectorType = llvm::VectorType::get(elementType, sliceWidth, false);
-        
+
         return createVectorLoad(builder, offset, sliceVectorType);
     }
-    
+
     void createVectorSliceStore(llvm::IRBuilder<>& builder,
                                llvm::Value* vector,
                                llvm::Value* basePtr,
+                               llvm::Type* elementType,
                                llvm::Value* startIndex) override {
-        // Calculate offset: basePtr + startIndex  
+        // LLVM 21: elementType must be passed explicitly due to opaque pointers
+        // Calculate offset: basePtr + startIndex
         auto* offset = builder.CreateGEP(
-            basePtr->getType()->getPointerElementType(),
+            elementType,
             basePtr, startIndex, "slice_ptr");
-        
+
         createVectorStore(builder, vector, offset);
     }
 };

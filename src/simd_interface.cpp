@@ -1,6 +1,7 @@
 #include "simd_interface.hpp"
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
+#include <llvm/IR/Module.h>
 #include <llvm/IR/IntrinsicsX86.h>
 #include <iostream>
 

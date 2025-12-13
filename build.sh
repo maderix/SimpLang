@@ -213,7 +213,7 @@ setup_llvm_mlir() {
     # Clone LLVM project if not exists
     if [ ! -d "$LLVM_PROJECT_DIR" ]; then
         echo -e "${YELLOW}Cloning LLVM project...${NC}"
-        git clone --depth 1 --branch llvmorg-14.0.0 https://github.com/llvm/llvm-project.git "$LLVM_PROJECT_DIR"
+        git clone --depth 1 --branch llvmorg-21.1.7 https://github.com/llvm/llvm-project.git "$LLVM_PROJECT_DIR"
     fi
 
     # Build LLVM with MLIR
@@ -253,13 +253,13 @@ build_standard() {
     init_submodules
 
     # Use system LLVM
-    if command -v llvm-config-14 >/dev/null 2>&1; then
-        LLVM_DIR="$(llvm-config-14 --cmakedir)"
+    if command -v llvm-config-21 >/dev/null 2>&1; then
+        LLVM_DIR="$(llvm-config-21 --cmakedir)"
     elif command -v llvm-config >/dev/null 2>&1; then
         LLVM_DIR="$(llvm-config --cmakedir)"
     else
         echo -e "${RED}Error: llvm-config not found${NC}"
-        echo "Install LLVM: sudo apt-get install llvm-14-dev"
+        echo "Install LLVM: sudo apt-get install llvm-21-dev"
         return 1
     fi
 

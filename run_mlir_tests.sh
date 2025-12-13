@@ -17,7 +17,7 @@ VERBOSE=${VERBOSE:-0}
 # Build MLIR compiler if needed
 if [ ! -f "build_mlir/src/simplang" ]; then
     echo -e "${BLUE}Building MLIR compiler...${NC}"
-    cmake -B build_mlir -DENABLE_MLIR=ON -DLLVM_DIR="$(llvm-config-14 --cmakedir || llvm-config --cmakedir)"
+    cmake -B build_mlir -DENABLE_MLIR=ON -DLLVM_DIR="$(llvm-config-21 --cmakedir || llvm-config --cmakedir)"
     cmake --build build_mlir --target simplang -j8
 fi
 

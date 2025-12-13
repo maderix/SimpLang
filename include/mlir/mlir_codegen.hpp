@@ -16,7 +16,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"  // For FuncOp in MLIR 14
+#include "mlir/Dialect/Func/IR/FuncOps.h"  // For FuncOp in MLIR 15+
 #include <map>
 #include <set>
 #include <string>
@@ -101,10 +101,10 @@ public:
   //===--------------------------------------------------------------------===//
 
   /// Set the current function being lowered
-  void setCurrentFunction(mlir::FuncOp func) { currentFunction = func; }
+  void setCurrentFunction(mlir::func::FuncOp func) { currentFunction = func; }
 
   /// Get the current function
-  mlir::FuncOp getCurrentFunction() { return currentFunction; }
+  mlir::func::FuncOp getCurrentFunction() { return currentFunction; }
 
   //===--------------------------------------------------------------------===//
   // AST Lowering Entry Points
@@ -114,7 +114,7 @@ public:
   mlir::ModuleOp lowerAST(BlockAST* programBlock);
 
   /// Lower a function definition
-  mlir::FuncOp lowerFunction(FunctionAST* funcAst);
+  mlir::func::FuncOp lowerFunction(FunctionAST* funcAst);
 
   /// Lower a statement
   mlir::LogicalResult lowerStatement(StmtAST* stmt);
@@ -271,7 +271,7 @@ private:
   std::map<std::string, llvm::SmallVector<mlir::Value, 4>> arrayDimensions;
 
   /// Current function being lowered
-  mlir::FuncOp currentFunction;
+  mlir::func::FuncOp currentFunction;
 
   /// Source file name for debug locations
   std::string sourceFileName;
@@ -287,8 +287,8 @@ private:
   void createModule(const std::string& moduleName);
 
   /// Get or create a function declaration
-  mlir::FuncOp getOrCreateFunction(const std::string& name,
-                                   mlir::FunctionType funcType);
+  mlir::func::FuncOp getOrCreateFunction(const std::string& name,
+                                         mlir::FunctionType funcType);
 };
 
 } // namespace simp

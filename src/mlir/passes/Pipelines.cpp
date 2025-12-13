@@ -12,21 +12,25 @@
 #include "mlir/Pass/PassRegistry.h"
 #include "mlir/Transforms/Passes.h"
 #include "mlir/Dialect/Linalg/Passes.h"
-#include "mlir/Dialect/Arithmetic/Transforms/Passes.h"
+#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+#include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
-#include "mlir/Dialect/SCF/Transforms.h"
+#include "mlir/Dialect/SCF/Transforms/Passes.h"
 #include "mlir/Dialect/Affine/Passes.h"
 #include "mlir/Dialect/Vector/Transforms/VectorTransforms.h"
+#include "mlir/Dialect/Vector/Transforms/Passes.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
-#include "mlir/Conversion/SCFToStandard/SCFToStandard.h"
+#include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Conversion/SCFToOpenMP/SCFToOpenMP.h"
 #include "mlir/Conversion/OpenMPToLLVM/ConvertOpenMPToLLVM.h"
 #include "mlir/Conversion/BufferizationToMemRef/BufferizationToMemRef.h"
 #include "mlir/Conversion/VectorToSCF/VectorToSCF.h"
-#include "mlir/Conversion/ArithmeticToLLVM/ArithmeticToLLVM.h"
+#include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
-#include "mlir/Conversion/StandardToLLVM/ConvertStandardToLLVM.h"
+#include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
+#include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
 #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
 
@@ -63,7 +67,7 @@ struct LinalgOptOptions {
 void buildLinalgOptimizationPipeline(OpPassManager &pm, const LinalgOptOptions &opts) {
   // Tiling for cache locality
   if (opts.enableTiling) {
-    pm.addNestedPass<FuncOp>(
+    pm.addNestedPass<func::FuncOp>(
         createSimpLinalgTilingPass(opts.tileSize, opts.hierarchical, opts.enableOpenMP));
   }
 
@@ -73,25 +77,27 @@ void buildLinalgOptimizationPipeline(OpPassManager &pm, const LinalgOptOptions &
     pm.addPass(createCanonicalizerPass());
   }
 
-  // Vectorization
+  // Vectorization - Strategy passes were removed in LLVM 15+
+  // The tiling pass now handles vectorization preparation, and
+  // vector lowering happens automatically during the conversion pipeline
   if (opts.enableVectorization) {
-    pm.addNestedPass<FuncOp>(createLinalgStrategyEnablePass());
-    pm.addNestedPass<FuncOp>(createLinalgStrategyVectorizePass(""));
+    // Apply vector lowering transformations
+    pm.addNestedPass<func::FuncOp>(vector::createLowerVectorMultiReductionPass());
+    pm.addNestedPass<func::FuncOp>(vector::createLowerVectorMaskPass());
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
-    pm.addNestedPass<FuncOp>(createLinalgStrategyLowerVectorsPass());
   }
 
   // Fallback: Lower remaining Linalg ops to loops
-  pm.addNestedPass<FuncOp>(createConvertLinalgToLoopsPass());
+  pm.addNestedPass<func::FuncOp>(createConvertLinalgToLoopsPass());
 
   // Cleanup and optimization
   pm.addPass(createCanonicalizerPass());
   pm.addPass(createCSEPass());
 
   // Loop optimizations
-  pm.addNestedPass<FuncOp>(createLoopInvariantCodeMotionPass());
-  pm.addNestedPass<FuncOp>(createLoopUnrollPass(4));
+  pm.addPass(createLoopInvariantCodeMotionPass());
+  pm.addNestedPass<func::FuncOp>(affine::createLoopUnrollPass());
 }
 
 //===----------------------------------------------------------------------===//
@@ -101,10 +107,12 @@ void buildLinalgOptimizationPipeline(OpPassManager &pm, const LinalgOptOptions &
 /// Build the buffer management pipeline
 /// Hoists allocations and inserts deallocations
 void buildBufferManagementPipeline(OpPassManager &pm) {
-  pm.addNestedPass<FuncOp>(bufferization::createBufferHoistingPass());
-  pm.addNestedPass<FuncOp>(bufferization::createBufferLoopHoistingPass());
-  pm.addNestedPass<FuncOp>(bufferization::createBufferDeallocationPass());
-  pm.addPass(createBufferizationToMemRefPass());
+  pm.addNestedPass<func::FuncOp>(bufferization::createBufferHoistingPass());
+  pm.addNestedPass<func::FuncOp>(bufferization::createBufferLoopHoistingPass());
+  // Use ownership-based deallocation (replaces old buffer deallocation pass)
+  pm.addPass(bufferization::createOwnershipBasedBufferDeallocationPass());
+  pm.addPass(bufferization::createLowerDeallocationsPass());
+  pm.addPass(createConvertBufferizationToMemRefPass());
 }
 
 //===----------------------------------------------------------------------===//
@@ -115,11 +123,11 @@ void buildBufferManagementPipeline(OpPassManager &pm) {
 /// Lowers MemRef, Arith, SCF, Vector to LLVM dialect
 void buildLLVMLoweringPipeline(OpPassManager &pm, bool enableOpenMP) {
   // Vector lowering
-  pm.addNestedPass<FuncOp>(createConvertVectorToSCFPass());
+  pm.addNestedPass<func::FuncOp>(createConvertVectorToSCFPass());
 
   // Control flow lowering
   pm.addPass(createLowerAffinePass());
-  pm.addPass(createLowerToCFGPass());
+  pm.addPass(createSCFToControlFlowPass());
 
   // OpenMP lowering (if enabled)
   if (enableOpenMP) {
@@ -127,7 +135,7 @@ void buildLLVMLoweringPipeline(OpPassManager &pm, bool enableOpenMP) {
   }
 
   // Arithmetic expansion (maxf/minf → cmpf + select)
-  pm.addNestedPass<FuncOp>(arith::createArithmeticExpandOpsPass());
+  pm.addNestedPass<func::FuncOp>(arith::createArithExpandOpsPass());
 
   // Final conversions to LLVM dialect
   pm.addPass(createCanonicalizerPass());

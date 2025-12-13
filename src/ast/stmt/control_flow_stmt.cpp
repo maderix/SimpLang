@@ -48,7 +48,8 @@ llvm::Value* IfAST::codeGen(CodeGenContext& context) {
     llvm::BasicBlock* elseEndBB = nullptr;
     llvm::Value* elseV = nullptr;
     if (elseBlock) {
-        theFunction->getBasicBlockList().push_back(elseBB);
+        // LLVM 21: insert(end, BB) instead of getBasicBlockList().push_back
+        theFunction->insert(theFunction->end(), elseBB);
         context.getBuilder().SetInsertPoint(elseBB);
         elseV = elseBlock->codeGen(context);
         if (!elseV) return nullptr;
@@ -59,7 +60,8 @@ llvm::Value* IfAST::codeGen(CodeGenContext& context) {
     }
 
     // Add merge block
-    theFunction->getBasicBlockList().push_back(mergeBB);
+    // LLVM 21: insert(end, BB) instead of getBasicBlockList().push_back
+    theFunction->insert(theFunction->end(), mergeBB);
     context.getBuilder().SetInsertPoint(mergeBB);
 
     // If both then and else terminate (e.g., with return), no PHI needed

@@ -13,13 +13,15 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/IR/AffineMap.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"
-#include "mlir/Dialect/SCF/SCF.h"
-#include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/MemRef/Transforms/AllocationOpInterfaceImpl.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/tensor_layout.hpp"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/raw_ostream.h"
@@ -47,15 +49,22 @@ MLIRCodeGenContext::MLIRCodeGenContext(const std::string& moduleName)
 }
 
 void MLIRCodeGenContext::initializeMLIRContext() {
+  // LLVM 21: Register external models for bufferization interface
+  // This must be done BEFORE loading dialects
+  mlir::DialectRegistry registry;
+  mlir::memref::registerAllocationOpInterfaceExternalModels(registry);
+  mlirContext.appendDialectRegistry(registry);
+
   // Load required dialects
   mlirContext.getOrLoadDialect<mlir::simp::SimpDialect>();
-  mlirContext.getOrLoadDialect<mlir::StandardOpsDialect>();
+  mlirContext.getOrLoadDialect<mlir::func::FuncDialect>();
   mlirContext.getOrLoadDialect<mlir::scf::SCFDialect>();
-  mlirContext.getOrLoadDialect<mlir::arith::ArithmeticDialect>();
+  mlirContext.getOrLoadDialect<mlir::arith::ArithDialect>();
   mlirContext.getOrLoadDialect<mlir::math::MathDialect>();
   mlirContext.getOrLoadDialect<mlir::vector::VectorDialect>();  // For vectorization
   mlirContext.getOrLoadDialect<mlir::memref::MemRefDialect>();  // For memref ops
   mlirContext.getOrLoadDialect<mlir::linalg::LinalgDialect>();  // For linalg ops
+  mlirContext.getOrLoadDialect<mlir::bufferization::BufferizationDialect>();  // For bufferization
 }
 
 void MLIRCodeGenContext::createModule(const std::string& moduleName) {
@@ -175,15 +184,15 @@ public:
 
   /// Check if type supports arithmetic operations
   static bool supportsArithmetic(mlir::Type type) {
-    return type.isa<mlir::FloatType>() || type.isa<mlir::IntegerType>();
+    return mlir::isa<mlir::FloatType>(type) || mlir::isa<mlir::IntegerType>(type);
   }
 
   /// Get type size in bits
   static unsigned getTypeSizeInBits(mlir::Type type) {
-    if (auto floatTy = type.dyn_cast<mlir::FloatType>()) {
+    if (auto floatTy = mlir::dyn_cast<mlir::FloatType>(type)) {
       return floatTy.getWidth();
     }
-    if (auto intTy = type.dyn_cast<mlir::IntegerType>()) {
+    if (auto intTy = mlir::dyn_cast<mlir::IntegerType>(type)) {
       return intTy.getWidth();
     }
     return 32; // Default
@@ -291,7 +300,7 @@ mlir::MemRefType createMemRefWithLayout(mlir::ArrayRef<int64_t> shape,
 
 /// Helper to cast i64 to index type
 mlir::Value castToIndex(mlir::Value val, mlir::OpBuilder& builder, mlir::Location loc) {
-  if (val.getType().isa<mlir::IndexType>()) {
+  if (mlir::isa<mlir::IndexType>(val.getType())) {
     return val;
   }
   return builder.create<mlir::arith::IndexCastOp>(loc, builder.getIndexType(), val);
@@ -304,7 +313,7 @@ mlir::Value castToIndex(mlir::Value val, mlir::OpBuilder& builder, mlir::Locatio
 /// Get type precedence for C++ style promotion (higher = wider type)
 /// Float types always outrank integer types in mixed arithmetic
 int getTypePrecedence(mlir::Type type) {
-  if (auto floatTy = type.dyn_cast<mlir::FloatType>()) {
+  if (auto floatTy = mlir::dyn_cast<mlir::FloatType>(type)) {
     // Float precedence: f16=10, bf16=11, f32=12, f64=13
     switch (floatTy.getWidth()) {
       case 16: return floatTy.isBF16() ? 11 : 10;
@@ -313,7 +322,7 @@ int getTypePrecedence(mlir::Type type) {
       default: return 10;
     }
   }
-  if (auto intTy = type.dyn_cast<mlir::IntegerType>()) {
+  if (auto intTy = mlir::dyn_cast<mlir::IntegerType>(type)) {
     if (intTy.getWidth() == 1) return 0;  // bool (lowest)
     // Integer precedence: i8=1, i16=2, i32=3, i64=4 (below all floats)
     return (intTy.getWidth() / 16) + 1;  // i8=1, i16=2, i32=3, i64=5
@@ -328,9 +337,9 @@ mlir::Value promoteType(mlir::Value val, mlir::Type targetType,
   if (srcType == targetType) return val;
 
   // Float to float (extend or truncate)
-  if (srcType.isa<mlir::FloatType>() && targetType.isa<mlir::FloatType>()) {
-    auto srcFloat = srcType.cast<mlir::FloatType>();
-    auto targetFloat = targetType.cast<mlir::FloatType>();
+  if (mlir::isa<mlir::FloatType>(srcType) && mlir::isa<mlir::FloatType>(targetType)) {
+    auto srcFloat = mlir::cast<mlir::FloatType>(srcType);
+    auto targetFloat = mlir::cast<mlir::FloatType>(targetType);
     if (targetFloat.getWidth() > srcFloat.getWidth()) {
       return builder.create<mlir::arith::ExtFOp>(loc, targetType, val);
     } else if (targetFloat.getWidth() < srcFloat.getWidth()) {
@@ -339,9 +348,9 @@ mlir::Value promoteType(mlir::Value val, mlir::Type targetType,
   }
 
   // Int to int (extend or truncate)
-  if (srcType.isa<mlir::IntegerType>() && targetType.isa<mlir::IntegerType>()) {
-    auto srcInt = srcType.cast<mlir::IntegerType>();
-    auto targetInt = targetType.cast<mlir::IntegerType>();
+  if (mlir::isa<mlir::IntegerType>(srcType) && mlir::isa<mlir::IntegerType>(targetType)) {
+    auto srcInt = mlir::cast<mlir::IntegerType>(srcType);
+    auto targetInt = mlir::cast<mlir::IntegerType>(targetType);
     if (srcInt.getWidth() == 1) return val;  // Don't convert bool
     if (targetInt.getWidth() > srcInt.getWidth()) {
       return builder.create<mlir::arith::ExtSIOp>(loc, targetType, val);
@@ -351,12 +360,12 @@ mlir::Value promoteType(mlir::Value val, mlir::Type targetType,
   }
 
   // Int to float (C++ style: always promote int to float in mixed arithmetic)
-  if (srcType.isa<mlir::IntegerType>() && targetType.isa<mlir::FloatType>()) {
+  if (mlir::isa<mlir::IntegerType>(srcType) && mlir::isa<mlir::FloatType>(targetType)) {
     return builder.create<mlir::arith::SIToFPOp>(loc, targetType, val);
   }
 
   // Float to int (rarely needed, but support it)
-  if (srcType.isa<mlir::FloatType>() && targetType.isa<mlir::IntegerType>()) {
+  if (mlir::isa<mlir::FloatType>(srcType) && mlir::isa<mlir::IntegerType>(targetType)) {
     return builder.create<mlir::arith::FPToSIOp>(loc, targetType, val);
   }
 
@@ -675,8 +684,8 @@ mlir::Value MLIRCodeGenContext::lowerBinaryOp(BinaryExprAST* binOp) {
   }
 
   // Check if operands are tensors - use tensor-specific operations
-  auto lhsTensorType = lhs.getType().dyn_cast<mlir::simp::SimpTensorType>();
-  auto rhsTensorType = rhs.getType().dyn_cast<mlir::simp::SimpTensorType>();
+  auto lhsTensorType = mlir::dyn_cast<mlir::simp::SimpTensorType>(lhs.getType());
+  auto rhsTensorType = mlir::dyn_cast<mlir::simp::SimpTensorType>(rhs.getType());
 
   if (lhsTensorType && rhsTensorType) {
     // Both operands are tensors - use tensor element-wise operations
@@ -719,7 +728,7 @@ mlir::Value MLIRCodeGenContext::lowerBinaryOp(BinaryExprAST* binOp) {
     // Result type is always i1 (boolean) for comparisons
     // Need to check operand type: use CmpIOp for integers, CmpFOp for floats
     case OpLT:
-      if (lhs.getType().isa<mlir::IntegerType>()) {
+      if (mlir::isa<mlir::IntegerType>(lhs.getType())) {
         return builder.create<mlir::arith::CmpIOp>(
             loc, mlir::arith::CmpIPredicate::slt, lhs, rhs);
       } else {
@@ -727,7 +736,7 @@ mlir::Value MLIRCodeGenContext::lowerBinaryOp(BinaryExprAST* binOp) {
             loc, mlir::arith::CmpFPredicate::OLT, lhs, rhs);
       }
     case OpGT:
-      if (lhs.getType().isa<mlir::IntegerType>()) {
+      if (mlir::isa<mlir::IntegerType>(lhs.getType())) {
         return builder.create<mlir::arith::CmpIOp>(
             loc, mlir::arith::CmpIPredicate::sgt, lhs, rhs);
       } else {
@@ -735,7 +744,7 @@ mlir::Value MLIRCodeGenContext::lowerBinaryOp(BinaryExprAST* binOp) {
             loc, mlir::arith::CmpFPredicate::OGT, lhs, rhs);
       }
     case OpLE:
-      if (lhs.getType().isa<mlir::IntegerType>()) {
+      if (mlir::isa<mlir::IntegerType>(lhs.getType())) {
         return builder.create<mlir::arith::CmpIOp>(
             loc, mlir::arith::CmpIPredicate::sle, lhs, rhs);
       } else {
@@ -743,7 +752,7 @@ mlir::Value MLIRCodeGenContext::lowerBinaryOp(BinaryExprAST* binOp) {
             loc, mlir::arith::CmpFPredicate::OLE, lhs, rhs);
       }
     case OpGE:
-      if (lhs.getType().isa<mlir::IntegerType>()) {
+      if (mlir::isa<mlir::IntegerType>(lhs.getType())) {
         return builder.create<mlir::arith::CmpIOp>(
             loc, mlir::arith::CmpIPredicate::sge, lhs, rhs);
       } else {
@@ -751,7 +760,7 @@ mlir::Value MLIRCodeGenContext::lowerBinaryOp(BinaryExprAST* binOp) {
             loc, mlir::arith::CmpFPredicate::OGE, lhs, rhs);
       }
     case OpEQ:
-      if (lhs.getType().isa<mlir::IntegerType>()) {
+      if (mlir::isa<mlir::IntegerType>(lhs.getType())) {
         return builder.create<mlir::arith::CmpIOp>(
             loc, mlir::arith::CmpIPredicate::eq, lhs, rhs);
       } else {
@@ -759,7 +768,7 @@ mlir::Value MLIRCodeGenContext::lowerBinaryOp(BinaryExprAST* binOp) {
             loc, mlir::arith::CmpFPredicate::OEQ, lhs, rhs);
       }
     case OpNE:
-      if (lhs.getType().isa<mlir::IntegerType>()) {
+      if (mlir::isa<mlir::IntegerType>(lhs.getType())) {
         return builder.create<mlir::arith::CmpIOp>(
             loc, mlir::arith::CmpIPredicate::ne, lhs, rhs);
       } else {
@@ -769,35 +778,35 @@ mlir::Value MLIRCodeGenContext::lowerBinaryOp(BinaryExprAST* binOp) {
 
     // Bitwise operations - only valid for integer types
     case OpAnd:
-      if (!lhs.getType().isa<mlir::IntegerType>()) {
+      if (!mlir::isa<mlir::IntegerType>(lhs.getType())) {
         llvm::errs() << "Error: Bitwise AND (&) can only be applied to integer types\n";
         return nullptr;
       }
       return builder.create<mlir::arith::AndIOp>(loc, lhs, rhs);
 
     case OpOr:
-      if (!lhs.getType().isa<mlir::IntegerType>()) {
+      if (!mlir::isa<mlir::IntegerType>(lhs.getType())) {
         llvm::errs() << "Error: Bitwise OR (|) can only be applied to integer types\n";
         return nullptr;
       }
       return builder.create<mlir::arith::OrIOp>(loc, lhs, rhs);
 
     case OpXor:
-      if (!lhs.getType().isa<mlir::IntegerType>()) {
+      if (!mlir::isa<mlir::IntegerType>(lhs.getType())) {
         llvm::errs() << "Error: Bitwise XOR (^) can only be applied to integer types\n";
         return nullptr;
       }
       return builder.create<mlir::arith::XOrIOp>(loc, lhs, rhs);
 
     case OpLShift:
-      if (!lhs.getType().isa<mlir::IntegerType>()) {
+      if (!mlir::isa<mlir::IntegerType>(lhs.getType())) {
         llvm::errs() << "Error: Left shift (<<) can only be applied to integer types\n";
         return nullptr;
       }
       return builder.create<mlir::arith::ShLIOp>(loc, lhs, rhs);
 
     case OpRShift:
-      if (!lhs.getType().isa<mlir::IntegerType>()) {
+      if (!mlir::isa<mlir::IntegerType>(lhs.getType())) {
         llvm::errs() << "Error: Right shift (>>) can only be applied to integer types\n";
         return nullptr;
       }
@@ -805,7 +814,7 @@ mlir::Value MLIRCodeGenContext::lowerBinaryOp(BinaryExprAST* binOp) {
       return builder.create<mlir::arith::ShRSIOp>(loc, lhs, rhs);
 
     case OpMod:
-      if (lhs.getType().isa<mlir::IntegerType>()) {
+      if (mlir::isa<mlir::IntegerType>(lhs.getType())) {
         return builder.create<mlir::arith::RemSIOp>(loc, lhs, rhs);
       } else {
         return builder.create<mlir::arith::RemFOp>(loc, lhs, rhs);
@@ -863,8 +872,8 @@ mlir::Value MLIRCodeGenContext::lowerCast(CastExprAST* castExpr) {
   // Handle conversions
   bool sourceIsInt = sourceType.isInteger(64);
   bool targetIsInt = targetType.isInteger(64);
-  bool sourceIsFloat = sourceType.isa<mlir::Float32Type>() || sourceType.isa<mlir::Float64Type>();
-  bool targetIsFloat = targetType.isa<mlir::Float32Type>() || targetType.isa<mlir::Float64Type>();
+  bool sourceIsFloat = mlir::isa<mlir::Float32Type>(sourceType) || mlir::isa<mlir::Float64Type>(sourceType);
+  bool targetIsFloat = mlir::isa<mlir::Float32Type>(targetType) || mlir::isa<mlir::Float64Type>(targetType);
 
   // int -> float
   if (sourceIsInt && targetIsFloat) {
@@ -990,7 +999,7 @@ mlir::Value MLIRCodeGenContext::lowerArrayAccess(ArrayAccessExprAST* arrayAccess
   }
 
   // Check if this is a tensor type (static multi-dimensional)
-  auto tensorType = array.getType().dyn_cast<mlir::simp::SimpTensorType>();
+  auto tensorType = mlir::dyn_cast<mlir::simp::SimpTensorType>(array.getType());
   if (tensorType) {
     // For tensors, use multi-dimensional indexing directly
     if (newValue) {
@@ -1053,24 +1062,24 @@ mlir::Value MLIRCodeGenContext::lowerArrayAccess(ArrayAccessExprAST* arrayAccess
 
   // Ensure final index is i64 for array operations
   mlir::Value index = flatIndex;
-  if (!index.getType().isa<mlir::IntegerType>() ||
-      index.getType().cast<mlir::IntegerType>().getWidth() != 64) {
+  if (!mlir::isa<mlir::IntegerType>(index.getType()) ||
+      mlir::cast<mlir::IntegerType>(index.getType()).getWidth() != 64) {
     index = builder.create<mlir::arith::IndexCastOp>(loc, builder.getI64Type(), flatIndex);
   }
 
   // If newValue is provided, this is an array_set
   if (newValue) {
     // Cast value to match array element type if needed
-    auto arrayType = array.getType().dyn_cast<mlir::simp::ArrayType>();
+    auto arrayType = mlir::dyn_cast<mlir::simp::ArrayType>(array.getType());
     if (arrayType) {
       mlir::Type elemType = arrayType.getElementType();
       mlir::Type valueType = newValue.getType();
 
       if (elemType != valueType) {
         // Handle float type mismatches
-        if (elemType.isa<mlir::FloatType>() && valueType.isa<mlir::FloatType>()) {
-          auto expectedFloat = elemType.cast<mlir::FloatType>();
-          auto actualFloat = valueType.cast<mlir::FloatType>();
+        if (mlir::isa<mlir::FloatType>(elemType) && mlir::isa<mlir::FloatType>(valueType)) {
+          auto expectedFloat = mlir::cast<mlir::FloatType>(elemType);
+          auto actualFloat = mlir::cast<mlir::FloatType>(valueType);
 
           if (expectedFloat.getWidth() > actualFloat.getWidth()) {
             // Extend: f32 -> f64, f16 -> f32, etc.
@@ -1079,20 +1088,20 @@ mlir::Value MLIRCodeGenContext::lowerArrayAccess(ArrayAccessExprAST* arrayAccess
             // Truncate: f64 -> f32, f32 -> f16, etc.
             newValue = builder.create<mlir::arith::TruncFOp>(loc, elemType, newValue);
           }
-        } else if (elemType.isa<mlir::IntegerType>() && valueType.isa<mlir::IntegerType>()) {
+        } else if (mlir::isa<mlir::IntegerType>(elemType) && mlir::isa<mlir::IntegerType>(valueType)) {
           // Handle integer conversions
-          auto expectedInt = elemType.cast<mlir::IntegerType>();
-          auto actualInt = valueType.cast<mlir::IntegerType>();
+          auto expectedInt = mlir::cast<mlir::IntegerType>(elemType);
+          auto actualInt = mlir::cast<mlir::IntegerType>(valueType);
 
           if (expectedInt.getWidth() > actualInt.getWidth()) {
             newValue = builder.create<mlir::arith::ExtSIOp>(loc, elemType, newValue);
           } else if (expectedInt.getWidth() < actualInt.getWidth()) {
             newValue = builder.create<mlir::arith::TruncIOp>(loc, elemType, newValue);
           }
-        } else if (elemType.isa<mlir::FloatType>() && valueType.isa<mlir::IntegerType>()) {
+        } else if (mlir::isa<mlir::FloatType>(elemType) && mlir::isa<mlir::IntegerType>(valueType)) {
           // Int to float conversion (C++ style promotion)
           newValue = builder.create<mlir::arith::SIToFPOp>(loc, elemType, newValue);
-        } else if (elemType.isa<mlir::IntegerType>() && valueType.isa<mlir::FloatType>()) {
+        } else if (mlir::isa<mlir::IntegerType>(elemType) && mlir::isa<mlir::FloatType>(valueType)) {
           // Float to int conversion (truncation)
           newValue = builder.create<mlir::arith::FPToSIOp>(loc, elemType, newValue);
         }
@@ -1104,7 +1113,7 @@ mlir::Value MLIRCodeGenContext::lowerArrayAccess(ArrayAccessExprAST* arrayAccess
   } else {
     // Otherwise, it's an array_get
     // Get element type from array type
-    auto arrayType = array.getType().dyn_cast<mlir::simp::ArrayType>();
+    auto arrayType = mlir::dyn_cast<mlir::simp::ArrayType>(array.getType());
     if (!arrayType) {
       llvm::errs() << "Error: Array access on non-array type\n";
       return nullptr;
@@ -1157,7 +1166,7 @@ mlir::Value MLIRCodeGenContext::lowerArrayStore(ArrayStoreExprAST* arrayStore) {
   }
 
   // Check if this is a tensor type
-  auto tensorType = array.getType().dyn_cast<mlir::simp::SimpTensorType>();
+  auto tensorType = mlir::dyn_cast<mlir::simp::SimpTensorType>(array.getType());
   if (tensorType) {
     // For tensors, use tensor_set with multi-dimensional indices
     mlir::Value result = builder.create<mlir::simp::TensorSetOp>(loc, tensorType, array, indexValues, value);
@@ -1204,22 +1213,22 @@ mlir::Value MLIRCodeGenContext::lowerArrayStore(ArrayStoreExprAST* arrayStore) {
   }
 
   // Cast to i64 for array operations
-  if (!index.getType().isa<mlir::IntegerType>() ||
-      index.getType().cast<mlir::IntegerType>().getWidth() != 64) {
+  if (!mlir::isa<mlir::IntegerType>(index.getType()) ||
+      mlir::cast<mlir::IntegerType>(index.getType()).getWidth() != 64) {
     index = builder.create<mlir::arith::IndexCastOp>(loc, builder.getI64Type(), index);
   }
 
   // Cast value to match array element type if needed (value already lowered above)
-  auto arrayType = array.getType().dyn_cast<mlir::simp::ArrayType>();
+  auto arrayType = mlir::dyn_cast<mlir::simp::ArrayType>(array.getType());
   if (arrayType) {
     mlir::Type elemType = arrayType.getElementType();
     mlir::Type valueType = value.getType();
 
     if (elemType != valueType) {
       // Handle float type mismatches
-      if (elemType.isa<mlir::FloatType>() && valueType.isa<mlir::FloatType>()) {
-        auto expectedFloat = elemType.cast<mlir::FloatType>();
-        auto actualFloat = valueType.cast<mlir::FloatType>();
+      if (mlir::isa<mlir::FloatType>(elemType) && mlir::isa<mlir::FloatType>(valueType)) {
+        auto expectedFloat = mlir::cast<mlir::FloatType>(elemType);
+        auto actualFloat = mlir::cast<mlir::FloatType>(valueType);
 
         if (expectedFloat.getWidth() > actualFloat.getWidth()) {
           // Extend: f32 -> f64, f16 -> f32, etc.
@@ -1228,20 +1237,20 @@ mlir::Value MLIRCodeGenContext::lowerArrayStore(ArrayStoreExprAST* arrayStore) {
           // Truncate: f64 -> f32, f32 -> f16, etc.
           value = builder.create<mlir::arith::TruncFOp>(loc, elemType, value);
         }
-      } else if (elemType.isa<mlir::IntegerType>() && valueType.isa<mlir::IntegerType>()) {
+      } else if (mlir::isa<mlir::IntegerType>(elemType) && mlir::isa<mlir::IntegerType>(valueType)) {
         // Handle integer conversions
-        auto expectedInt = elemType.cast<mlir::IntegerType>();
-        auto actualInt = valueType.cast<mlir::IntegerType>();
+        auto expectedInt = mlir::cast<mlir::IntegerType>(elemType);
+        auto actualInt = mlir::cast<mlir::IntegerType>(valueType);
 
         if (expectedInt.getWidth() > actualInt.getWidth()) {
           value = builder.create<mlir::arith::ExtSIOp>(loc, elemType, value);
         } else if (expectedInt.getWidth() < actualInt.getWidth()) {
           value = builder.create<mlir::arith::TruncIOp>(loc, elemType, value);
         }
-      } else if (elemType.isa<mlir::FloatType>() && valueType.isa<mlir::IntegerType>()) {
+      } else if (mlir::isa<mlir::FloatType>(elemType) && mlir::isa<mlir::IntegerType>(valueType)) {
         // Int to float conversion (C++ style promotion)
         value = builder.create<mlir::arith::SIToFPOp>(loc, elemType, value);
-      } else if (elemType.isa<mlir::IntegerType>() && valueType.isa<mlir::FloatType>()) {
+      } else if (mlir::isa<mlir::IntegerType>(elemType) && mlir::isa<mlir::FloatType>(valueType)) {
         // Float to int conversion (truncation)
         value = builder.create<mlir::arith::FPToSIOp>(loc, elemType, value);
       }
@@ -1323,7 +1332,7 @@ mlir::Value MLIRCodeGenContext::lowerMatMul(MatMulExprAST* matmul) {
   }
 
   // Get the array type
-  auto arrayType = output.getType().dyn_cast<mlir::simp::ArrayType>();
+  auto arrayType = mlir::dyn_cast<mlir::simp::ArrayType>(output.getType());
   if (!arrayType) {
     llvm::errs() << "Error: MatMul output is not an array type\n";
     return nullptr;
@@ -1594,7 +1603,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
       return nullptr;
     }
     mlir::Value tensor = args[0];
-    auto tensorType = tensor.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    auto tensorType = mlir::dyn_cast<mlir::simp::SimpTensorType>(tensor.getType());
     if (!tensorType) {
       llvm::errs() << "Error: tensor_sum requires a tensor argument\n";
       return nullptr;
@@ -1609,11 +1618,11 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
       // Extract axis value to compute result shape
       int64_t axis = -1;
       if (auto simpConstOp = axisValue.getDefiningOp<mlir::simp::ConstantOp>()) {
-        if (auto intAttr = simpConstOp.value().dyn_cast<mlir::IntegerAttr>()) {
+        if (auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(simpConstOp.getValue())) {
           axis = intAttr.getInt();
         }
       } else if (auto arithConstOp = axisValue.getDefiningOp<mlir::arith::ConstantOp>()) {
-        if (auto intAttr = arithConstOp.getValue().dyn_cast<mlir::IntegerAttr>()) {
+        if (auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(arithConstOp.getValue())) {
           axis = intAttr.getInt();
         }
       }
@@ -1650,11 +1659,11 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
     // Extract axis to compute result shape
     int64_t axis = -1;
     if (auto simpConstOp = axisValue.getDefiningOp<mlir::simp::ConstantOp>()) {
-      if (auto intAttr = simpConstOp.value().dyn_cast<mlir::IntegerAttr>()) {
+      if (auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(simpConstOp.getValue())) {
         axis = intAttr.getInt();
       }
     } else if (auto arithConstOp = axisValue.getDefiningOp<mlir::arith::ConstantOp>()) {
-      if (auto intAttr = arithConstOp.getValue().dyn_cast<mlir::IntegerAttr>()) {
+      if (auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(arithConstOp.getValue())) {
         axis = intAttr.getInt();
       }
     }
@@ -1681,7 +1690,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
       return nullptr;
     }
     mlir::Value tensor = args[0];
-    auto tensorType = tensor.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    auto tensorType = mlir::dyn_cast<mlir::simp::SimpTensorType>(tensor.getType());
     if (!tensorType) {
       llvm::errs() << "Error: tensor_mean requires a tensor argument\n";
       return nullptr;
@@ -1698,7 +1707,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
       return nullptr;
     }
     mlir::Value tensor = args[0];
-    auto tensorType = tensor.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    auto tensorType = mlir::dyn_cast<mlir::simp::SimpTensorType>(tensor.getType());
     if (!tensorType) {
       llvm::errs() << "Error: tensor_max requires a tensor argument\n";
       return nullptr;
@@ -1715,7 +1724,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
       return nullptr;
     }
     mlir::Value tensor = args[0];
-    auto tensorType = tensor.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    auto tensorType = mlir::dyn_cast<mlir::simp::SimpTensorType>(tensor.getType());
     if (!tensorType) {
       llvm::errs() << "Error: tensor_min requires a tensor argument\n";
       return nullptr;
@@ -1732,7 +1741,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
       return nullptr;
     }
     mlir::Value tensor = args[0];
-    auto tensorType = tensor.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    auto tensorType = mlir::dyn_cast<mlir::simp::SimpTensorType>(tensor.getType());
     if (!tensorType) {
       llvm::errs() << "Error: tensor_argmax requires a tensor argument\n";
       return nullptr;
@@ -1751,7 +1760,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
     }
 
     mlir::Value tensor = args[0];
-    auto tensorType = tensor.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    auto tensorType = mlir::dyn_cast<mlir::simp::SimpTensorType>(tensor.getType());
     if (!tensorType) {
       llvm::errs() << "Error: tensor_reshape requires a tensor argument\n";
       return nullptr;
@@ -1761,11 +1770,11 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
     llvm::SmallVector<int64_t, 4> newShape;
     for (size_t i = 1; i < args.size(); i++) {
       if (auto constOp = args[i].getDefiningOp<mlir::simp::ConstantOp>()) {
-        if (auto intAttr = constOp.value().dyn_cast<mlir::IntegerAttr>()) {
+        if (auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(constOp.getValue())) {
           newShape.push_back(intAttr.getInt());
         }
       } else if (auto arithConstOp = args[i].getDefiningOp<mlir::arith::ConstantOp>()) {
-        if (auto intAttr = arithConstOp.getValue().dyn_cast<mlir::IntegerAttr>()) {
+        if (auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(arithConstOp.getValue())) {
           newShape.push_back(intAttr.getInt());
         }
       }
@@ -1789,7 +1798,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
     }
 
     mlir::Value tensor = args[0];
-    auto tensorType = tensor.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    auto tensorType = mlir::dyn_cast<mlir::simp::SimpTensorType>(tensor.getType());
     if (!tensorType) {
       llvm::errs() << "Error: tensor_transpose requires a tensor argument\n";
       return nullptr;
@@ -1808,11 +1817,11 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
       llvm::SmallVector<int64_t, 4> perm;
       for (size_t i = 1; i < args.size(); i++) {
         if (auto constOp = args[i].getDefiningOp<mlir::simp::ConstantOp>()) {
-          if (auto intAttr = constOp.value().dyn_cast<mlir::IntegerAttr>()) {
+          if (auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(constOp.getValue())) {
             perm.push_back(intAttr.getInt());
           }
         } else if (auto arithConstOp = args[i].getDefiningOp<mlir::arith::ConstantOp>()) {
-          if (auto intAttr = arithConstOp.getValue().dyn_cast<mlir::IntegerAttr>()) {
+          if (auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(arithConstOp.getValue())) {
             perm.push_back(intAttr.getInt());
           }
         }
@@ -1845,7 +1854,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
     }
 
     mlir::Value tensor = args[0];
-    auto tensorType = tensor.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    auto tensorType = mlir::dyn_cast<mlir::simp::SimpTensorType>(tensor.getType());
     if (!tensorType) {
       llvm::errs() << "Error: tensor_slice requires a tensor argument\n";
       return nullptr;
@@ -1865,21 +1874,21 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
       int64_t start = -1, end = -1;
 
       if (auto constOp = args[1 + i * 2].getDefiningOp<mlir::simp::ConstantOp>()) {
-        if (auto intAttr = constOp.value().dyn_cast<mlir::IntegerAttr>()) {
+        if (auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(constOp.getValue())) {
           start = intAttr.getInt();
         }
       } else if (auto arithConstOp = args[1 + i * 2].getDefiningOp<mlir::arith::ConstantOp>()) {
-        if (auto intAttr = arithConstOp.getValue().dyn_cast<mlir::IntegerAttr>()) {
+        if (auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(arithConstOp.getValue())) {
           start = intAttr.getInt();
         }
       }
 
       if (auto constOp = args[1 + i * 2 + 1].getDefiningOp<mlir::simp::ConstantOp>()) {
-        if (auto intAttr = constOp.value().dyn_cast<mlir::IntegerAttr>()) {
+        if (auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(constOp.getValue())) {
           end = intAttr.getInt();
         }
       } else if (auto arithConstOp = args[1 + i * 2 + 1].getDefiningOp<mlir::arith::ConstantOp>()) {
-        if (auto intAttr = arithConstOp.getValue().dyn_cast<mlir::IntegerAttr>()) {
+        if (auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(arithConstOp.getValue())) {
           end = intAttr.getInt();
         }
       }
@@ -1906,8 +1915,8 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
 
     mlir::Value source = args[0];
     mlir::Value indices = args[1];
-    auto sourceType = source.getType().dyn_cast<mlir::simp::SimpTensorType>();
-    auto indicesType = indices.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    auto sourceType = mlir::dyn_cast<mlir::simp::SimpTensorType>(source.getType());
+    auto indicesType = mlir::dyn_cast<mlir::simp::SimpTensorType>(indices.getType());
 
     if (!sourceType) {
       llvm::errs() << "Error: tensor_gather requires tensor source argument\n";
@@ -1929,11 +1938,11 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
     mlir::Value axisVal = nullptr;
     if (args.size() == 3) {
       if (auto constOp = args[2].getDefiningOp<mlir::simp::ConstantOp>()) {
-        if (auto intAttr = constOp.value().dyn_cast<mlir::IntegerAttr>()) {
+        if (auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(constOp.getValue())) {
           axis = intAttr.getInt();
         }
       } else if (auto arithConstOp = args[2].getDefiningOp<mlir::arith::ConstantOp>()) {
-        if (auto intAttr = arithConstOp.getValue().dyn_cast<mlir::IntegerAttr>()) {
+        if (auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(arithConstOp.getValue())) {
           axis = intAttr.getInt();
         }
       }
@@ -1982,9 +1991,9 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
     mlir::Value dst = args[0];
     mlir::Value indices = args[1];
     mlir::Value values = args[2];
-    auto dstType = dst.getType().dyn_cast<mlir::simp::SimpTensorType>();
-    auto indicesType = indices.getType().dyn_cast<mlir::simp::SimpTensorType>();
-    auto valuesType = values.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    auto dstType = mlir::dyn_cast<mlir::simp::SimpTensorType>(dst.getType());
+    auto indicesType = mlir::dyn_cast<mlir::simp::SimpTensorType>(indices.getType());
+    auto valuesType = mlir::dyn_cast<mlir::simp::SimpTensorType>(values.getType());
 
     if (!dstType) {
       llvm::errs() << "Error: tensor_scatter requires tensor dst argument\n";
@@ -2010,11 +2019,11 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
     mlir::Value axisVal = nullptr;
     if (args.size() == 4) {
       if (auto constOp = args[3].getDefiningOp<mlir::simp::ConstantOp>()) {
-        if (auto intAttr = constOp.value().dyn_cast<mlir::IntegerAttr>()) {
+        if (auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(constOp.getValue())) {
           axis = intAttr.getInt();
         }
       } else if (auto arithConstOp = args[3].getDefiningOp<mlir::arith::ConstantOp>()) {
-        if (auto intAttr = arithConstOp.getValue().dyn_cast<mlir::IntegerAttr>()) {
+        if (auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(arithConstOp.getValue())) {
           axis = intAttr.getInt();
         }
       }
@@ -2081,8 +2090,8 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
 
     mlir::Value lhs = args[0];
     mlir::Value rhs = args[1];
-    auto lhsType = lhs.getType().dyn_cast<mlir::simp::SimpTensorType>();
-    auto rhsType = rhs.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    auto lhsType = mlir::dyn_cast<mlir::simp::SimpTensorType>(lhs.getType());
+    auto rhsType = mlir::dyn_cast<mlir::simp::SimpTensorType>(rhs.getType());
 
     if (!lhsType) {
       llvm::errs() << "Error: tensor_matmul requires tensor lhs argument\n";
@@ -2178,8 +2187,8 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
 
     mlir::Value lhs = args[0];
     mlir::Value rhs = args[1];
-    auto lhsType = lhs.getType().dyn_cast<mlir::simp::SimpTensorType>();
-    auto rhsType = rhs.getType().dyn_cast<mlir::simp::SimpTensorType>();
+    auto lhsType = mlir::dyn_cast<mlir::simp::SimpTensorType>(lhs.getType());
+    auto rhsType = mlir::dyn_cast<mlir::simp::SimpTensorType>(rhs.getType());
 
     if (!lhsType) {
       llvm::errs() << "Error: tensor_dot requires tensor lhs argument\n";
@@ -2210,7 +2219,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
   }
 
   // Look up user-defined functions in the module
-  mlir::FuncOp callee = module.lookupSymbol<mlir::FuncOp>(calleeName);
+  mlir::func::FuncOp callee = module.lookupSymbol<mlir::func::FuncOp>(calleeName);
   if (!callee) {
     llvm::errs() << "Error: Undefined function '" << calleeName << "'\n";
     return nullptr;
@@ -2218,7 +2227,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
 
   // Create the call operation (Standard dialect in MLIR 14)
   // CallOp takes: location, callee symbol, arguments
-  auto callOp = builder.create<mlir::CallOp>(
+  auto callOp = builder.create<mlir::func::CallOp>(
       loc,
       callee,
       args
@@ -2303,7 +2312,7 @@ mlir::LogicalResult MLIRCodeGenContext::lowerDeclaration(VariableDeclarationAST*
     auto loc = varLoc;
     // Get the full tensor type from the declaration
     auto tensorType = getMLIRType(const_cast<TypeInfo*>(decl->getStaticType()));
-    auto simpTensorType = tensorType.dyn_cast<mlir::simp::SimpTensorType>();
+    auto simpTensorType = mlir::dyn_cast<mlir::simp::SimpTensorType>(tensorType);
 
     if (!simpTensorType) {
       llvm::errs() << "Error: Expected SimpTensorType for tensor declaration\n";
@@ -2348,8 +2357,9 @@ mlir::LogicalResult MLIRCodeGenContext::lowerDeclaration(VariableDeclarationAST*
         remainingIndex %= stride;
 
         // Create index value as i64 (TensorSetOp expects i64 indices)
+        // In LLVM 21, ConstantIntOp signature is (Type, value), not (value, Type)
         mlir::Value idxValue = builder.create<mlir::arith::ConstantIntOp>(
-            loc, dimIndex, builder.getI64Type());
+            loc, builder.getI64Type(), static_cast<int64_t>(dimIndex));
         indices.push_back(idxValue);
       }
 
@@ -2398,7 +2408,8 @@ mlir::LogicalResult MLIRCodeGenContext::lowerDeclaration(VariableDeclarationAST*
         }
       } else {
         // Default offset = 0
-        offsetArg = builder.create<mlir::arith::ConstantIntOp>(loc, 0, builder.getI64Type());
+        // In LLVM 21, ConstantIntOp signature is (Type, value)
+        offsetArg = builder.create<mlir::arith::ConstantIntOp>(loc, builder.getI64Type(), 0);
       }
 
       // Create tensor_from_array operation with explicit result type
@@ -2477,7 +2488,7 @@ mlir::LogicalResult MLIRCodeGenContext::lowerDeclaration(VariableDeclarationAST*
   }
 
   // Also track dimensions for tensor types (from tensor operations)
-  auto tensorType = initValue.getType().dyn_cast<mlir::simp::SimpTensorType>();
+  auto tensorType = mlir::dyn_cast<mlir::simp::SimpTensorType>(initValue.getType());
   if (tensorType) {
     auto shape = tensorType.getShape();
     if (shape.size() > 1) {
@@ -2504,15 +2515,15 @@ mlir::LogicalResult MLIRCodeGenContext::lowerReturn(ReturnAST* ret) {
 
   // Check if we need to cast to match function return type
   if (currentFunction) {
-    mlir::Type expectedType = currentFunction.getType().getResult(0);
+    mlir::Type expectedType = currentFunction.getFunctionType().getResult(0);
     mlir::Type actualType = returnValue.getType();
 
     if (expectedType != actualType) {
       // Need to cast - handle float type mismatches (f32 <-> f64, f16, bf16)
-      if (expectedType.isa<mlir::FloatType>() && actualType.isa<mlir::FloatType>()) {
+      if (mlir::isa<mlir::FloatType>(expectedType) && mlir::isa<mlir::FloatType>(actualType)) {
         // Use fpext (extend) or fptrunc (truncate) based on bitwidths
-        auto expectedFloat = expectedType.cast<mlir::FloatType>();
-        auto actualFloat = actualType.cast<mlir::FloatType>();
+        auto expectedFloat = mlir::cast<mlir::FloatType>(expectedType);
+        auto actualFloat = mlir::cast<mlir::FloatType>(actualType);
 
         if (expectedFloat.getWidth() > actualFloat.getWidth()) {
           // Extend: f32 -> f64, f16 -> f32, etc.
@@ -2521,10 +2532,10 @@ mlir::LogicalResult MLIRCodeGenContext::lowerReturn(ReturnAST* ret) {
           // Truncate: f64 -> f32, f32 -> f16, etc.
           returnValue = builder.create<mlir::arith::TruncFOp>(loc, expectedType, returnValue);
         }
-      } else if (expectedType.isa<mlir::IntegerType>() && actualType.isa<mlir::IntegerType>()) {
+      } else if (mlir::isa<mlir::IntegerType>(expectedType) && mlir::isa<mlir::IntegerType>(actualType)) {
         // Integer conversions
-        auto expectedInt = expectedType.cast<mlir::IntegerType>();
-        auto actualInt = actualType.cast<mlir::IntegerType>();
+        auto expectedInt = mlir::cast<mlir::IntegerType>(expectedType);
+        auto actualInt = mlir::cast<mlir::IntegerType>(actualType);
 
         if (expectedInt.getWidth() > actualInt.getWidth()) {
           // Sign extend for now (could check signedness)
@@ -2539,7 +2550,7 @@ mlir::LogicalResult MLIRCodeGenContext::lowerReturn(ReturnAST* ret) {
   }
 
   // Create return operation (Standard dialect in MLIR 14)
-  builder.create<mlir::ReturnOp>(loc, returnValue);
+  builder.create<mlir::func::ReturnOp>(loc, returnValue);
 
   return mlir::success();
 }
@@ -2734,7 +2745,7 @@ mlir::LogicalResult MLIRCodeGenContext::lowerWhile(WhileAST* whileLoop) {
             if (hasArrayAccess) {
               // Array access involved - assume widest float type
               mlir::Type currentType = inferredTypes[varName];
-              if (currentType.isa<mlir::FloatType>()) {
+              if (mlir::isa<mlir::FloatType>(currentType)) {
                 inferredTypes[varName] = builder.getF64Type();
               }
             }
@@ -3052,7 +3063,7 @@ void MLIRCodeGenContext::updateSymbolTableWithResults(
 // Function Lowering
 //===----------------------------------------------------------------------===//
 
-mlir::FuncOp MLIRCodeGenContext::lowerFunction(FunctionAST* funcAst) {
+mlir::func::FuncOp MLIRCodeGenContext::lowerFunction(FunctionAST* funcAst) {
   auto loc = getLocation(funcAst->getLine(), funcAst->getColumn());
 
   // Save the current insertion point (should be at module level)
@@ -3079,7 +3090,7 @@ mlir::FuncOp MLIRCodeGenContext::lowerFunction(FunctionAST* funcAst) {
 
   // Create the function (Standard dialect in MLIR 14)
   // Note: builder.create() automatically inserts at the current insertion point
-  auto func = builder.create<mlir::FuncOp>(loc, funcAst->getName(), funcType);
+  auto func = builder.create<mlir::func::FuncOp>(loc, funcAst->getName(), funcType);
 
   // Create entry block
   auto* entryBlock = func.addEntryBlock();
@@ -3124,10 +3135,10 @@ mlir::FuncOp MLIRCodeGenContext::lowerFunction(FunctionAST* funcAst) {
   return func;
 }
 
-mlir::FuncOp MLIRCodeGenContext::getOrCreateFunction(const std::string& name,
+mlir::func::FuncOp MLIRCodeGenContext::getOrCreateFunction(const std::string& name,
                                                      mlir::FunctionType funcType) {
   // Look for existing function in module
-  if (auto func = module.lookupSymbol<mlir::FuncOp>(name)) {
+  if (auto func = module.lookupSymbol<mlir::func::FuncOp>(name)) {
     return func;
   }
 
@@ -3135,7 +3146,7 @@ mlir::FuncOp MLIRCodeGenContext::getOrCreateFunction(const std::string& name,
   // Note: builder.create() automatically inserts at the current insertion point
   // Use module-level location for external function declarations
   auto loc = getLocation(0, 0);
-  auto func = builder.create<mlir::FuncOp>(loc, name, funcType);
+  auto func = builder.create<mlir::func::FuncOp>(loc, name, funcType);
 
   return func;
 }

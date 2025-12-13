@@ -4,7 +4,7 @@
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/raw_ostream.h>
-#include <llvm/Support/Host.h>
+#include <llvm/TargetParser/Host.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/Transforms/Scalar.h>
 #include <llvm/Transforms/Utils.h>
@@ -23,7 +23,8 @@ CodeGenContext::CodeGenContext() : builder(context) {
     
     // Initialize target machine first
     targetTriple = llvm::sys::getDefaultTargetTriple();
-    module->setTargetTriple(targetTriple);
+    // LLVM 21: setTargetTriple takes llvm::Triple, not string
+    module->setTargetTriple(llvm::Triple(targetTriple));
     
     std::string error;
     const llvm::Target* target = llvm::TargetRegistry::lookupTarget(targetTriple, error);
@@ -33,7 +34,7 @@ CodeGenContext::CodeGenContext() : builder(context) {
     }
 
     llvm::TargetOptions opt;
-    auto RM = llvm::Optional<llvm::Reloc::Model>();
+    auto RM = std::optional<llvm::Reloc::Model>();
     targetMachine = std::unique_ptr<llvm::TargetMachine>(
         target->createTargetMachine(
             targetTriple,
@@ -87,7 +88,7 @@ void CodeGenContext::initializeRuntimeFunctions() {
     initializeSimpBLASFunctions();
     
     // Always declare error function
-    std::vector<llvm::Type*> errorArgs = {llvm::Type::getInt8PtrTy(context)};
+    std::vector<llvm::Type*> errorArgs = {llvm::PointerType::get(context, 0)};
     llvm::FunctionType* errorType = llvm::FunctionType::get(
         llvm::Type::getVoidTy(context),
         errorArgs,
@@ -176,28 +177,27 @@ llvm::Value* CodeGenContext::createSliceWithCap(SliceType type, llvm::Value* len
     // Allocate slice struct
     llvm::Value* slice = builder.CreateAlloca(sliceTy, nullptr, "slice");
     
-    // Get data pointer type based on slice type
+    // Get vector type for size calculation
     llvm::Type* vecTy = getVectorType(type == SliceType::SSE_SLICE ? 4 : 8);
-    llvm::Type* ptrTy = vecTy->getPointerTo();
-    
+
     // Calculate allocation size (capacity * vector_size)
-    llvm::Value* vecSize = llvm::ConstantInt::get(cap->getType(), 
+    llvm::Value* vecSize = llvm::ConstantInt::get(cap->getType(),
         module->getDataLayout().getTypeAllocSize(vecTy));
     llvm::Value* allocSize = builder.CreateMul(cap, vecSize);
-    
-    // Allocate data buffer
+
+    // LLVM 21: Use opaque pointer type for aligned_alloc
     auto allocFunc = module->getOrInsertFunction("aligned_alloc",
         llvm::FunctionType::get(
-            builder.getInt8PtrTy(),
+            llvm::PointerType::get(context, 0),
             {builder.getInt64Ty(), builder.getInt64Ty()},
             false
         ));
-    
-    llvm::Value* alignment = llvm::ConstantInt::get(builder.getInt64Ty(), 
+
+    llvm::Value* alignment = llvm::ConstantInt::get(builder.getInt64Ty(),
         type == SliceType::SSE_SLICE ? 32 : 64);
-    
+
+    // LLVM 21: No bitcast needed with opaque pointers
     llvm::Value* data = builder.CreateCall(allocFunc, {alignment, allocSize});
-    data = builder.CreateBitCast(data, ptrTy);
     
     // Store fields
     builder.CreateStore(data, 
@@ -221,8 +221,14 @@ void CodeGenContext::declareVariable(const std::string& name, llvm::Value* value
 
         // Track the variable in memory tracker if available
         if (memoryTracker && value) {
-            llvm::Type* varType = value->getType()->getPointerElementType();
-            trackVariable(name, value, varType);
+            // LLVM 21: Opaque pointers - get type from AllocaInst
+            llvm::Type* varType = nullptr;
+            if (auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(value)) {
+                varType = alloca->getAllocatedType();
+            }
+            if (varType) {
+                trackVariable(name, value, varType);
+            }
         }
     } else {
         std::cerr << "Error: No active block for variable declaration" << std::endl;
@@ -293,27 +299,36 @@ void CodeGenContext::trackVariable(const std::string& name, llvm::Value* value, 
 
 void CodeGenContext::updateVariableValue(const std::string& name, llvm::Value* value) {
     if (!value || !memoryTracker) return;
-    
+
     auto* type = value->getType();
     if (auto* loadInst = llvm::dyn_cast<llvm::LoadInst>(value)) {
         value = loadInst->getPointerOperand();
-        type = value->getType()->getPointerElementType();
+        // LLVM 21: Opaque pointers - get type from LoadInst, not pointer
+        type = loadInst->getType();
     }
-    
+
     size_t size = module->getDataLayout().getTypeAllocSize(type);
     memoryTracker->trackAccess(value, size, true);
 }
 
 void CodeGenContext::registerVariableWrite(llvm::Value* ptr, const std::string& name) {
     if (!ptr || !memoryTracker) return;
-    trackMemoryAccess(ptr, module->getDataLayout().getTypeAllocSize(
-        ptr->getType()->getPointerElementType()), true);
+    // LLVM 21: Opaque pointers - try to get type from AllocaInst
+    size_t size = 0;
+    if (auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(ptr)) {
+        size = module->getDataLayout().getTypeAllocSize(alloca->getAllocatedType());
+    }
+    if (size > 0) trackMemoryAccess(ptr, size, true);
 }
 
 void CodeGenContext::registerVariableRead(llvm::Value* ptr, const std::string& name) {
     if (!ptr || !memoryTracker) return;
-    trackMemoryAccess(ptr, module->getDataLayout().getTypeAllocSize(
-        ptr->getType()->getPointerElementType()), false);
+    // LLVM 21: Opaque pointers - try to get type from AllocaInst
+    size_t size = 0;
+    if (auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(ptr)) {
+        size = module->getDataLayout().getTypeAllocSize(alloca->getAllocatedType());
+    }
+    if (size > 0) trackMemoryAccess(ptr, size, false);
 }
 
 void CodeGenContext::trackMemoryAccess(llvm::Value* ptr, size_t size, bool isWrite) {
@@ -324,8 +339,12 @@ void CodeGenContext::trackMemoryAccess(llvm::Value* ptr, size_t size, bool isWri
 
 void CodeGenContext::addMemoryAccess(llvm::Value* ptr, bool isWrite) {
     if (!ptr || !memoryTracker) return;
-    trackMemoryAccess(ptr, module->getDataLayout().getTypeAllocSize(
-        ptr->getType()->getPointerElementType()), isWrite);
+    // LLVM 21: Opaque pointers - try to get type from AllocaInst
+    size_t size = 0;
+    if (auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(ptr)) {
+        size = module->getDataLayout().getTypeAllocSize(alloca->getAllocatedType());
+    }
+    if (size > 0) trackMemoryAccess(ptr, size, isWrite);
 }
 
 // Debug Information
@@ -433,62 +452,82 @@ void CodeGenContext::emitError(const std::string& message) {
     builder.CreateCall(errorFunc, {strPtr});
 }
 
+// LLVM 21: Helper to get slice struct type from alloca or use default
+llvm::StructType* CodeGenContext::getSliceStructType(llvm::Value* slice) {
+    if (auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(slice)) {
+        if (auto* structTy = llvm::dyn_cast<llvm::StructType>(alloca->getAllocatedType())) {
+            return structTy;
+        }
+    }
+    // Default to sseSliceType if we can't determine
+    return sseSliceType;
+}
+
 llvm::Value* CodeGenContext::getSliceData(llvm::Value* slice) {
+    // LLVM 21: Get struct type for opaque pointer GEP
+    llvm::StructType* sliceType = getSliceStructType(slice);
     llvm::Value* dataPtr = builder.CreateStructGEP(
-        slice->getType()->getPointerElementType(), 
-        slice, 
-        0, 
+        sliceType,
+        slice,
+        0,
         "data.ptr");
     return builder.CreateLoad(
-        dataPtr->getType()->getPointerElementType(),
+        sliceType->getElementType(0),
         dataPtr,
         "slice.data");
 }
 
 llvm::Value* CodeGenContext::getSliceLen(llvm::Value* slice) {
+    // LLVM 21: Get struct type for opaque pointer GEP
+    llvm::StructType* sliceType = getSliceStructType(slice);
     llvm::Value* lenPtr = builder.CreateStructGEP(
-        slice->getType()->getPointerElementType(), 
-        slice, 
-        1, 
+        sliceType,
+        slice,
+        1,
         "len.ptr");
     return builder.CreateLoad(
-        lenPtr->getType()->getPointerElementType(),
+        sliceType->getElementType(1),
         lenPtr,
         "slice.len");
 }
 
 llvm::Value* CodeGenContext::getSliceCap(llvm::Value* slice) {
+    // LLVM 21: Get struct type for opaque pointer GEP
+    llvm::StructType* sliceType = getSliceStructType(slice);
     llvm::Value* capPtr = builder.CreateStructGEP(
-        slice->getType()->getPointerElementType(), 
-        slice, 
-        2, 
+        sliceType,
+        slice,
+        2,
         "cap.ptr");
     return builder.CreateLoad(
-        capPtr->getType()->getPointerElementType(),
+        sliceType->getElementType(2),
         capPtr,
         "slice.cap");
 }
 
 void CodeGenContext::setSliceData(llvm::Value* slice, llvm::Value* data) {
+    llvm::StructType* sliceType = getSliceStructType(slice);
     llvm::Value* dataPtr = builder.CreateStructGEP(
-        slice->getType()->getPointerElementType(), 
-        slice, 
+        sliceType,
+        slice,
         0);
     builder.CreateStore(data, dataPtr);
 }
 
 void CodeGenContext::setSliceLen(llvm::Value* slice, llvm::Value* len) {
+    llvm::StructType* sliceType = getSliceStructType(slice);
     llvm::Value* lenPtr = builder.CreateStructGEP(
-        slice->getType()->getPointerElementType(), 
-        slice, 
+        sliceType,
+        slice,
         1);
     builder.CreateStore(len, lenPtr);
 }
 
 void CodeGenContext::setSliceCap(llvm::Value* slice, llvm::Value* cap) {
+    llvm::StructType* sliceType = getSliceStructType(slice);
     llvm::Value* capPtr = builder.CreateStructGEP(
-        slice->getType()->getPointerElementType(), 
-        slice, 
+        sliceType,
+        slice,
         2);
     builder.CreateStore(cap, capPtr);
 }
@@ -499,26 +538,27 @@ void CodeGenContext::generateCode(BlockAST& root) {
     }
 
     // Set target triple if not already set
-    if (module->getTargetTriple().empty()) {
-        module->setTargetTriple(llvm::sys::getDefaultTargetTriple());
+    // LLVM 21: getTargetTriple returns llvm::Triple, use str() for string
+    if (module->getTargetTriple().str().empty()) {
+        module->setTargetTriple(llvm::Triple(llvm::sys::getDefaultTargetTriple()));
     }
 
     // Initialize target machine if not already done
     if (!targetMachine) {
         std::string error;
         const llvm::Target* target = llvm::TargetRegistry::lookupTarget(
-            module->getTargetTriple(), error);
-        
+            module->getTargetTriple().str(), error);
+
         if (!target) {
             std::cerr << "Target lookup failed: " << error << std::endl;
             return;
         }
 
         llvm::TargetOptions opt;
-        auto RM = llvm::Optional<llvm::Reloc::Model>();
+        auto RM = std::optional<llvm::Reloc::Model>();
         targetMachine = std::unique_ptr<llvm::TargetMachine>(
             target->createTargetMachine(
-                module->getTargetTriple(),
+                module->getTargetTriple().str(),
                 "generic",  // CPU
                 "",        // Features
                 opt,
@@ -695,10 +735,11 @@ llvm::Function* CodeGenContext::createFunction(const std::string& name,
     
     // Special case for kernel_main
     if (name == "kernel_main") {
-        // Use slice types directly for kernel_main
+        // LLVM 21: Use opaque pointer type for slice pointers
+        auto* ptrTy = llvm::PointerType::get(context, 0);
         argTypes = {
-            sseSliceType->getPointerTo(),  // out_sse: SSESlice*
-            avxSliceType->getPointerTo()   // out_avx: AVXSlice*
+            ptrTy,  // out_sse: SSESlice*
+            ptrTy   // out_avx: AVXSlice*
         };
     } else {
         // For other functions, use the provided types
@@ -736,7 +777,7 @@ void CodeGenContext::initializeMallocFree() {
     // Malloc function
     std::vector<llvm::Type*> mallocArgs = {llvm::Type::getInt64Ty(context)};
     llvm::FunctionType* mallocType = llvm::FunctionType::get(
-        llvm::Type::getInt8PtrTy(context),
+        llvm::PointerType::get(context, 0),
         mallocArgs,
         false
     );
@@ -748,7 +789,7 @@ void CodeGenContext::initializeMallocFree() {
     );
 
     // Free function
-    std::vector<llvm::Type*> freeArgs = {llvm::Type::getInt8PtrTy(context)};
+    std::vector<llvm::Type*> freeArgs = {llvm::PointerType::get(context, 0)};
     llvm::FunctionType* freeType = llvm::FunctionType::get(
         llvm::Type::getVoidTy(context),
         freeArgs,
@@ -781,11 +822,11 @@ void CodeGenContext::initializeSimpBLASFunctions() {
         llvm::Type::getInt32Ty(context),          // M
         llvm::Type::getInt32Ty(context),          // N
         llvm::Type::getInt32Ty(context),          // K
-        llvm::Type::getFloatPtrTy(context),       // A
+        llvm::PointerType::get(context, 0),       // A
         llvm::Type::getInt32Ty(context),          // lda
-        llvm::Type::getFloatPtrTy(context),       // B
+        llvm::PointerType::get(context, 0),       // B
         llvm::Type::getInt32Ty(context),          // ldb
-        llvm::Type::getFloatPtrTy(context),       // C
+        llvm::PointerType::get(context, 0),       // C
         llvm::Type::getInt32Ty(context)           // ldc
     };
     llvm::FunctionType* gemmType = llvm::FunctionType::get(
@@ -804,14 +845,14 @@ void CodeGenContext::initializeSimpBLASFunctions() {
 void CodeGenContext::generateGemmCall(llvm::Value* M, llvm::Value* N, llvm::Value* K,
                                      llvm::Value* A, llvm::Value* B, llvm::Value* C) {
     // Cast float arrays to f32* if needed
-    if (A->getType() != llvm::Type::getFloatPtrTy(context)) {
-        A = builder.CreateBitCast(A, llvm::Type::getFloatPtrTy(context));
+    if (A->getType() != llvm::PointerType::get(context, 0)) {
+        A = builder.CreateBitCast(A, llvm::PointerType::get(context, 0));
     }
-    if (B->getType() != llvm::Type::getFloatPtrTy(context)) {
-        B = builder.CreateBitCast(B, llvm::Type::getFloatPtrTy(context));
+    if (B->getType() != llvm::PointerType::get(context, 0)) {
+        B = builder.CreateBitCast(B, llvm::PointerType::get(context, 0));
     }
-    if (C->getType() != llvm::Type::getFloatPtrTy(context)) {
-        C = builder.CreateBitCast(C, llvm::Type::getFloatPtrTy(context));
+    if (C->getType() != llvm::PointerType::get(context, 0)) {
+        C = builder.CreateBitCast(C, llvm::PointerType::get(context, 0));
     }
     
     // Leading dimensions (assume row-major, packed)

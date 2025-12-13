@@ -32,7 +32,7 @@ include "SimpBase.td"
 // - Lowers to memref.alloc in lowering pass
 //
 def Simp_ArrayType : DialectType<Simp_Dialect,
-    CPred<"$_self.isa<::mlir::simp::ArrayType>()">,
+    CPred<"::mlir::isa<::mlir::simp::ArrayType>($_self)">,
     "Simp array type",
     "::mlir::Type"> {
 
@@ -80,7 +80,7 @@ def Simp_AnyArray : Type<Simp_ArrayType.predicate, "any simp array">;
 // - Phase 2+: Full tensor support with shape inference
 //
 def Simp_SimpTensorType : DialectType<Simp_Dialect,
-    CPred<"$_self.isa<::mlir::simp::SimpTensorType>()">,
+    CPred<"::mlir::isa<::mlir::simp::SimpTensorType>($_self)">,
     "Simp tensor type",
     "::mlir::Type"> {
 

@@ -6,15 +6,16 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
+// LLVM 21: Updated header paths
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"
-#include "mlir/Dialect/SCF/SCF.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Verifier.h"
-#include "mlir/Parser.h"
+#include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/simp_dialect.hpp"
 #include "mlir/simp_ops.hpp"
@@ -33,8 +34,11 @@ static OwningOpRef<ModuleOp> loadMLIRModule(const std::string& filename, MLIRCon
     "../../../" + filename
   };
 
+  // LLVM 21: parseSourceFile now requires ParserConfig
+  ParserConfig config(&context);
+
   for (const auto& path : paths) {
-    auto module = parseSourceFile(path, &context);
+    auto module = parseSourceFile<ModuleOp>(path, config);
     if (module) {
       // Verify before lowering
       if (failed(verify(*module))) {
@@ -54,8 +58,8 @@ static bool testConstantLowering() {
   MLIRContext context;
   context.getOrLoadDialect<simp::SimpDialect>();
   context.getOrLoadDialect<memref::MemRefDialect>();
-  context.getOrLoadDialect<arith::ArithmeticDialect>();
-  context.getOrLoadDialect<StandardOpsDialect>();
+  context.getOrLoadDialect<arith::ArithDialect>();
+  context.getOrLoadDialect<func::FuncDialect>();
 
   // Create a simple module with a constant
   OpBuilder builder(&context);
@@ -64,7 +68,7 @@ static bool testConstantLowering() {
 
   // Create function with constant
   auto funcType = builder.getFunctionType({}, {builder.getF64Type()});
-  auto func = builder.create<FuncOp>(builder.getUnknownLoc(), "test_constant", funcType);
+  auto func = builder.create<func::FuncOp>(builder.getUnknownLoc(), "test_constant", funcType);
   auto* entryBlock = func.addEntryBlock();
   builder.setInsertionPointToStart(entryBlock);
 
@@ -73,7 +77,7 @@ static bool testConstantLowering() {
       builder.getUnknownLoc(), builder.getF64Type(),
       builder.getF64FloatAttr(42.0));
 
-  builder.create<ReturnOp>(builder.getUnknownLoc(), constOp.getResult());
+  builder.create<func::ReturnOp>(builder.getUnknownLoc(), constOp.getResult());
 
   // Run lowering pass
   PassManager pm(&context);
@@ -100,8 +104,8 @@ static bool testArrayLowering() {
   MLIRContext context;
   context.getOrLoadDialect<simp::SimpDialect>();
   context.getOrLoadDialect<memref::MemRefDialect>();
-  context.getOrLoadDialect<arith::ArithmeticDialect>();
-  context.getOrLoadDialect<StandardOpsDialect>();
+  context.getOrLoadDialect<arith::ArithDialect>();
+  context.getOrLoadDialect<func::FuncDialect>();
 
   OpBuilder builder(&context);
   auto module = ModuleOp::create(builder.getUnknownLoc());
@@ -109,7 +113,7 @@ static bool testArrayLowering() {
 
   // Create function with array operations
   auto funcType = builder.getFunctionType({}, {builder.getF64Type()});
-  auto func = builder.create<FuncOp>(builder.getUnknownLoc(), "test_arrays", funcType);
+  auto func = builder.create<func::FuncOp>(builder.getUnknownLoc(), "test_arrays", funcType);
   auto* entryBlock = func.addEntryBlock();
   builder.setInsertionPointToStart(entryBlock);
 
@@ -139,7 +143,7 @@ static bool testArrayLowering() {
       builder.getUnknownLoc(), builder.getF64Type(),
       setOp.getResult(), idxConst.getResult());
 
-  builder.create<ReturnOp>(builder.getUnknownLoc(), getOp.getResult());
+  builder.create<func::ReturnOp>(builder.getUnknownLoc(), getOp.getResult());
 
   // Run lowering pass
   PassManager pm(&context);
@@ -181,8 +185,8 @@ static bool testArithmeticLowering() {
   MLIRContext context;
   context.getOrLoadDialect<simp::SimpDialect>();
   context.getOrLoadDialect<memref::MemRefDialect>();
-  context.getOrLoadDialect<arith::ArithmeticDialect>();
-  context.getOrLoadDialect<StandardOpsDialect>();
+  context.getOrLoadDialect<arith::ArithDialect>();
+  context.getOrLoadDialect<func::FuncDialect>();
 
   auto module = loadMLIRModule("tests/mlir/integration/test_arithmetic.mlir", context);
   if (!module) {
@@ -215,8 +219,8 @@ static bool testControlFlowLowering() {
   MLIRContext context;
   context.getOrLoadDialect<simp::SimpDialect>();
   context.getOrLoadDialect<memref::MemRefDialect>();
-  context.getOrLoadDialect<arith::ArithmeticDialect>();
-  context.getOrLoadDialect<StandardOpsDialect>();
+  context.getOrLoadDialect<arith::ArithDialect>();
+  context.getOrLoadDialect<func::FuncDialect>();
   context.getOrLoadDialect<scf::SCFDialect>();
 
   auto module = loadMLIRModule("tests/mlir/integration/test_value_passing.mlir", context);
@@ -250,8 +254,8 @@ static bool testTypeConversion() {
   MLIRContext context;
   context.getOrLoadDialect<simp::SimpDialect>();
   context.getOrLoadDialect<memref::MemRefDialect>();
-  context.getOrLoadDialect<arith::ArithmeticDialect>();
-  context.getOrLoadDialect<StandardOpsDialect>();
+  context.getOrLoadDialect<arith::ArithDialect>();
+  context.getOrLoadDialect<func::FuncDialect>();
 
   OpBuilder builder(&context);
   auto module = ModuleOp::create(builder.getUnknownLoc());
@@ -259,7 +263,7 @@ static bool testTypeConversion() {
 
   // Create function with chained array operations
   auto funcType = builder.getFunctionType({builder.getI64Type()}, {builder.getF64Type()});
-  auto func = builder.create<FuncOp>(builder.getUnknownLoc(), "test_type_chain", funcType);
+  auto func = builder.create<func::FuncOp>(builder.getUnknownLoc(), "test_type_chain", funcType);
   auto* entryBlock = func.addEntryBlock();
   builder.setInsertionPointToStart(entryBlock);
 
@@ -289,7 +293,7 @@ static bool testTypeConversion() {
       builder.getUnknownLoc(), builder.getF64Type(),
       setOp.getResult(), idx.getResult());
 
-  builder.create<ReturnOp>(builder.getUnknownLoc(), getOp.getResult());
+  builder.create<func::ReturnOp>(builder.getUnknownLoc(), getOp.getResult());
 
   // Dump IR before conversion
   llvm::errs() << "\n=== Test 5: IR before conversion ===\n";
@@ -340,8 +344,8 @@ static bool testModuloLowering() {
   MLIRContext context;
   context.getOrLoadDialect<simp::SimpDialect>();
   context.getOrLoadDialect<memref::MemRefDialect>();
-  context.getOrLoadDialect<arith::ArithmeticDialect>();
-  context.getOrLoadDialect<StandardOpsDialect>();
+  context.getOrLoadDialect<arith::ArithDialect>();
+  context.getOrLoadDialect<func::FuncDialect>();
 
   OpBuilder builder(&context);
   auto module = ModuleOp::create(builder.getUnknownLoc());
@@ -349,7 +353,7 @@ static bool testModuloLowering() {
 
   // Create function with modulo operations (both float and integer)
   auto funcType = builder.getFunctionType({}, {builder.getF64Type()});
-  auto func = builder.create<FuncOp>(builder.getUnknownLoc(), "test_modulo", funcType);
+  auto func = builder.create<func::FuncOp>(builder.getUnknownLoc(), "test_modulo", funcType);
   auto* entryBlock = func.addEntryBlock();
   builder.setInsertionPointToStart(entryBlock);
 
@@ -377,7 +381,7 @@ static bool testModuloLowering() {
 
   // Convert integer result to float for return
   // (We'll just return the float modulo result for simplicity)
-  builder.create<ReturnOp>(builder.getUnknownLoc(), modF.getResult());
+  builder.create<func::ReturnOp>(builder.getUnknownLoc(), modF.getResult());
 
   // Run lowering pass
   PassManager pm(&context);

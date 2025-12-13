@@ -59,7 +59,7 @@ fn llama2_forward(
             xb2[rw] = rms_att_w[layer_offset + rw];
             rw = rw + 1i;
         }
-        xb = rmsnorm(x, xb2, xb, dim, 0.00001);
+        xb = rmsnorm(x, xb2, xb, dim, 0.00001, 0i);
 
         // QKV projections
         var qkv_i = 0i;
@@ -169,7 +169,7 @@ fn llama2_forward(
                 att_soft[a_init] = 0.0;
                 a_init = a_init + 1i;
             }
-            att_soft = softmax(att_tmp, att_soft, att_len);
+            att_soft = softmax(att_tmp, att_soft, att_len, 0i, 0i);
 
             // Weighted sum of values
             var hs2 = 0i;
@@ -223,7 +223,7 @@ fn llama2_forward(
             xb2[rw2] = rms_ffn_w[layer_offset + rw2];
             rw2 = rw2 + 1i;
         }
-        xb = rmsnorm(x, xb2, xb, dim, 0.00001);
+        xb = rmsnorm(x, xb2, xb, dim, 0.00001, 0i);
 
         // SwiGLU FFN
         var w1_off = layer * hidden_dim * dim;
@@ -316,7 +316,7 @@ fn llama2_forward(
         xb[f] = 0.0;
         f = f + 1i;
     }
-    xb = rmsnorm(x, rms_final_w, xb, dim, 0.00001);
+    xb = rmsnorm(x, rms_final_w, xb, dim, 0.00001, 0i);
 
     // 4. Classifier: logits = wcls @ xb  (vocab_size x dim) @ (dim x 1) -> (vocab_size x 1)
     var l_init = 0i;
