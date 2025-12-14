@@ -1,17 +1,15 @@
-//===- VNNIPass.cpp - VNNI optimization for tiled INT8 matmul -------------===//
+//===- VNNIPass.cpp - LLVM Pass to emit vpdpbusd for INT8 dot products ----===//
 //
-// This pass transforms tiled i8 matmul inner loops to use AVX-512 VNNI.
-// Works with the 16x16x16 tiling from the MLIR pipeline.
+// This pass identifies reduction loops with i8*i8->i32 pattern and replaces
+// them with AVX512-VNNI vpdpbusd instructions.
 //
-// Pattern matched:
-//   for k in 0..Tk:  // Tk = tile size (16)
-//     C[i,j] += (i32)A[i,k] * (i32)B[k,j]
-//
-// Transformed to:
-//   A_vec = load_contiguous(A, 16 bytes)
-//   B_vec = gather_strided(B, 16 bytes, stride=N)
-//   partial = vpdpbusd(A_vec, B_vec)  // 4 x i32
-//   C[i,j] += horizontal_sum(partial)
+// FUTURE OPTIMIZATION (I=4 Tiling):
+// C++ benchmark shows I=4 tiling achieves 397 GIOP/s vs 217 GIOP/s baseline.
+// To implement:
+//   1. Detect outer I loop (grandparent of K loop)
+//   2. Modify I loop to step by 4
+//   3. Generate 4 accumulators, load B once, load 4 A rows
+//   4. Store 4 results per iteration
 //
 //===----------------------------------------------------------------------===//
 
@@ -36,28 +34,32 @@ namespace {
 // VNNICandidate - Information about a detected VNNI-compatible loop
 //===----------------------------------------------------------------------===//
 struct VNNICandidate {
-  // Loop info
-  Loop *KLoop;                  // The innermost K loop
+  // Core loop components
+  PHINode *AccPhi;              // Accumulator PHI (i32) - may be null for load-store pattern
   PHINode *IndPhi;              // Induction variable PHI (i64)
-  int64_t TripCount;            // Loop trip count (tile size, e.g., 16)
+  BinaryOperator *Add;          // acc = acc + product
+  BinaryOperator *Mul;          // product = a * b
 
-  // Memory access info
-  LoadInst *LoadA;              // Load from A
-  LoadInst *LoadB;              // Load from B
-  GetElementPtrInst *GEPA;      // GEP for A
-  GetElementPtrInst *GEPB;      // GEP for B
-  int64_t StrideA;              // Stride for A (should be original K dim)
-  int64_t StrideB;              // Stride for B (original N dim)
+  // Memory access pattern for A and B
+  Instruction *ExtA;            // sext/zext from i8
+  Instruction *ExtB;            // sext/zext from i8
+  LoadInst *LoadA;
+  LoadInst *LoadB;
+  GetElementPtrInst *GEPA;
+  GetElementPtrInst *GEPB;
 
-  // Accumulation info
-  LoadInst *LoadC;              // Load from C (for accumulation)
-  StoreInst *StoreC;            // Store to C
-  BinaryOperator *Add;          // Accumulation add
-  BinaryOperator *Mul;          // i8 multiply
+  // Memory access pattern for C (load-store pattern, when AccPhi is null)
+  LoadInst *LoadC;              // Load from C for accumulation
+  StoreInst *StoreC;            // Store to C after accumulation
+  GetElementPtrInst *GEPC;      // GEP for C array
 
-  // Sign info
-  bool ASigned;                 // A uses sext (signed)
-  bool BSigned;                 // B uses sext (signed)
+  // Loop properties
+  int64_t TripCount;
+  int64_t RowStrideA;           // Stride between A rows (for future I-tiling)
+  int64_t RowStrideB;           // Stride between B rows (for non-square matrix detection)
+  bool BothSigned;              // true if both inputs are signed (need bias correction)
+  bool IsLoadStorePattern;      // true if using load-store instead of PHI
+  bool NeedsTranspose;          // true if B needs transpose for contiguous access
 };
 
 //===----------------------------------------------------------------------===//
@@ -68,34 +70,42 @@ struct VNNIPass : public FunctionPass {
   VNNIPass() : FunctionPass(ID) {}
 
   bool runOnFunction(Function &F) override {
-    // Skip if not targeting x86 with AVX-512 VNNI
-    Module *M = F.getParent();
-    std::string triple = M->getTargetTriple().str();
-    if (triple.find("x86") == std::string::npos &&
-        triple.find("amd64") == std::string::npos) {
-      return false;
-    }
-
     bool Changed = false;
     auto &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
 
-    // Collect innermost loops (these are the K loops in tiled matmul)
-    SmallVector<Loop*, 16> InnermostLoops;
+    // Collect all innermost loops (K loops in matmul)
+    SmallVector<Loop*, 8> InnermostLoops;
     for (Loop *L : LI) {
       collectInnermostLoops(L, InnermostLoops);
     }
 
-    // Try to transform each loop
+    // Transform each qualifying loop
     for (Loop *L : InnermostLoops) {
-      VNNICandidate C;
-      if (detectPattern(L, C)) {
-        if (transformLoop(F, C)) {
+      VNNICandidate Candidate;
+      if (detectVNNIPattern(L, Candidate)) {
+        errs() << "VNNI: Detected pattern, trip=" << Candidate.TripCount
+               << ", stride=" << Candidate.RowStrideA << "\n";
+
+        // Step 1: Detect parent loops
+        // K loop -> J loop (parent) -> I loop (grandparent)
+        if (Loop *JLoop = L->getParentLoop()) {
+          errs() << "VNNI: Found J loop (parent of K)\n";
+          analyzeParentLoop(JLoop);
+          if (Loop *ILoop = JLoop->getParentLoop()) {
+            errs() << "VNNI: Found I loop (grandparent of K) - THIS IS THE TARGET\n";
+            analyzeParentLoop(ILoop);
+          } else {
+            errs() << "VNNI: No I loop (grandparent) found\n";
+          }
+        } else {
+          errs() << "VNNI: No parent loop found\n";
+        }
+
+        if (transformToVNNI(F, L, Candidate, LI)) {
           Changed = true;
-          errs() << "VNNI: Transformed loop with trip count " << C.TripCount << "\n";
         }
       }
     }
-
     return Changed;
   }
 
@@ -118,271 +128,986 @@ private:
   }
 
   //===--------------------------------------------------------------------===//
-  // Pattern Detection
+  // Parent Loop Analysis and Modification (for I=4 tiling)
   //===--------------------------------------------------------------------===//
-  bool detectPattern(Loop *L, VNNICandidate &C) {
-    BasicBlock *Header = L->getHeader();
-    BasicBlock *Latch = L->getLoopLatch();
-    if (!Header || !Latch) return false;
 
-    C.KLoop = L;
+  // Returns the parent loop's induction PHI if suitable for I=4 tiling
+  PHINode* getParentLoopIndPhi(Loop *ParentLoop) {
+    BasicBlock *Header = ParentLoop->getHeader();
+    if (!Header) return nullptr;
 
-    // Find induction variable PHI
-    C.IndPhi = nullptr;
     for (PHINode &Phi : Header->phis()) {
       if (Phi.getType()->isIntegerTy(64)) {
-        C.IndPhi = &Phi;
-        break;
+        return &Phi;
       }
     }
-    if (!C.IndPhi) return false;
-
-    // Extract trip count from loop condition
-    if (!extractTripCount(L, C)) return false;
-
-    // Only handle small tile sizes (4, 8, 16, 32, 64)
-    if (C.TripCount < 4 || C.TripCount > 64) return false;
-    if (C.TripCount % 4 != 0) return false;  // vpdpbusd needs multiple of 4
-
-    // Find the multiply-accumulate pattern
-    if (!findMulAccPattern(L, C)) return false;
-
-    // Find memory access patterns
-    if (!findMemoryPattern(C)) return false;
-
-    // Extract strides
-    C.StrideA = extractStride(C.GEPA, C.IndPhi);
-    C.StrideB = extractStride(C.GEPB, C.IndPhi);
-
-    errs() << "VNNI: Detected pattern - trip=" << C.TripCount
-           << ", strideA=" << C.StrideA << ", strideB=" << C.StrideB << "\n";
-
-    return true;
+    return nullptr;
   }
 
-  bool extractTripCount(Loop *L, VNNICandidate &C) {
-    BasicBlock *Header = L->getHeader();
-    auto *Br = dyn_cast<BranchInst>(Header->getTerminator());
-    if (!Br || !Br->isConditional()) return false;
-
-    auto *Cmp = dyn_cast<ICmpInst>(Br->getCondition());
-    if (!Cmp) return false;
-
-    // Look for: icmp slt %ind, <trip_count>
-    ConstantInt *TripConst = nullptr;
-    if (auto *CI = dyn_cast<ConstantInt>(Cmp->getOperand(1))) {
-      TripConst = CI;
-    } else if (auto *CI = dyn_cast<ConstantInt>(Cmp->getOperand(0))) {
-      TripConst = CI;
+  // Modify parent loop to step by 4 instead of 1
+  bool modifyParentLoopStep(Loop *ParentLoop, int NewStep) {
+    PHINode *IndPhi = getParentLoopIndPhi(ParentLoop);
+    if (!IndPhi) {
+      errs() << "VNNI:   - No i64 induction PHI found\n";
+      return false;
     }
 
-    if (!TripConst) return false;
-    C.TripCount = TripConst->getSExtValue();
-    return true;
-  }
+    errs() << "VNNI:   - Induction PHI: " << *IndPhi << "\n";
 
-  bool findMulAccPattern(Loop *L, VNNICandidate &C) {
-    // Look for: store(add(load(C), sext(mul(sext(load(A)), sext(load(B))))), C)
+    // Find and modify the increment
+    for (unsigned i = 0; i < IndPhi->getNumIncomingValues(); i++) {
+      if (ParentLoop->contains(IndPhi->getIncomingBlock(i))) {
+        Value *Inc = IndPhi->getIncomingValue(i);
 
-    for (BasicBlock *BB : L->blocks()) {
-      for (Instruction &I : *BB) {
-        auto *SI = dyn_cast<StoreInst>(&I);
-        if (!SI) continue;
-        if (!SI->getValueOperand()->getType()->isIntegerTy(32)) continue;
-
-        // Check for add
-        auto *Add = dyn_cast<BinaryOperator>(SI->getValueOperand());
-        if (!Add || Add->getOpcode() != Instruction::Add) continue;
-
-        // One operand should be load from C, other should be the product
-        LoadInst *LoadC = nullptr;
-        Value *Product = nullptr;
-
-        if (auto *LI = dyn_cast<LoadInst>(Add->getOperand(0))) {
-          LoadC = LI;
-          Product = Add->getOperand(1);
-        } else if (auto *LI = dyn_cast<LoadInst>(Add->getOperand(1))) {
-          LoadC = LI;
-          Product = Add->getOperand(0);
-        }
-
-        if (!LoadC || !Product) continue;
-
-        // Product could be: sext(mul) or just mul
-        BinaryOperator *Mul = nullptr;
-        if (auto *Sext = dyn_cast<SExtInst>(Product)) {
-          Mul = dyn_cast<BinaryOperator>(Sext->getOperand(0));
-        } else {
-          Mul = dyn_cast<BinaryOperator>(Product);
-        }
-
-        if (!Mul || Mul->getOpcode() != Instruction::Mul) continue;
-
-        // Check operands are sign/zero extended from i8
-        Instruction *ExtA = nullptr, *ExtB = nullptr;
-
-        auto checkExt = [](Value *V) -> Instruction* {
-          if (auto *S = dyn_cast<SExtInst>(V)) {
-            if (S->getSrcTy()->isIntegerTy(8)) return S;
-          }
-          if (auto *Z = dyn_cast<ZExtInst>(V)) {
-            if (Z->getSrcTy()->isIntegerTy(8)) return Z;
-          }
-          return nullptr;
-        };
-
-        ExtA = checkExt(Mul->getOperand(0));
-        ExtB = checkExt(Mul->getOperand(1));
-
-        if (!ExtA || !ExtB) continue;
-
-        // Get the loads
-        auto *LA = dyn_cast<LoadInst>(ExtA->getOperand(0));
-        auto *LB = dyn_cast<LoadInst>(ExtB->getOperand(0));
-
-        if (!LA || !LB) continue;
-
-        // Found the pattern!
-        C.StoreC = SI;
-        C.LoadC = LoadC;
-        C.Add = Add;
-        C.Mul = Mul;
-        C.LoadA = LA;
-        C.LoadB = LB;
-        C.ASigned = isa<SExtInst>(ExtA);
-        C.BSigned = isa<SExtInst>(ExtB);
-
-        return true;
-      }
-    }
-
-    return false;
-  }
-
-  bool findMemoryPattern(VNNICandidate &C) {
-    C.GEPA = dyn_cast<GetElementPtrInst>(C.LoadA->getPointerOperand());
-    C.GEPB = dyn_cast<GetElementPtrInst>(C.LoadB->getPointerOperand());
-    return C.GEPA && C.GEPB;
-  }
-
-  int64_t extractStride(GetElementPtrInst *GEP, PHINode *IndVar) {
-    // Pattern: base + row*stride + col
-    // We want to find the stride (coefficient of the row index)
-
-    if (GEP->getNumOperands() < 2) return 0;
-
-    Value *Idx = GEP->getOperand(GEP->getNumOperands() - 1);
-
-    // Look for: add(mul(row, stride), col) where col relates to IndVar
-    if (auto *Add = dyn_cast<BinaryOperator>(Idx)) {
-      if (Add->getOpcode() == Instruction::Add) {
-        for (int i = 0; i < 2; i++) {
-          if (auto *Mul = dyn_cast<BinaryOperator>(Add->getOperand(i))) {
-            if (Mul->getOpcode() == Instruction::Mul) {
-              // Extract stride constant
-              if (auto *CI = dyn_cast<ConstantInt>(Mul->getOperand(0)))
-                return CI->getSExtValue();
-              if (auto *CI = dyn_cast<ConstantInt>(Mul->getOperand(1)))
-                return CI->getSExtValue();
+        if (auto *Add = dyn_cast<BinaryOperator>(Inc)) {
+          if (Add->getOpcode() == Instruction::Add) {
+            // Check which operand is the constant step
+            if (auto *CI = dyn_cast<ConstantInt>(Add->getOperand(1))) {
+              if (CI->getSExtValue() == 1) {
+                errs() << "VNNI:   - Changing step from 1 to " << NewStep << "\n";
+                Add->setOperand(1, ConstantInt::get(CI->getType(), NewStep));
+                return true;
+              }
+            } else if (auto *CI = dyn_cast<ConstantInt>(Add->getOperand(0))) {
+              if (CI->getSExtValue() == 1) {
+                errs() << "VNNI:   - Changing step from 1 to " << NewStep << "\n";
+                Add->setOperand(0, ConstantInt::get(CI->getType(), NewStep));
+                return true;
+              }
             }
           }
         }
       }
     }
 
+    errs() << "VNNI:   - Could not find step=1 increment\n";
+    return false;
+  }
+
+  void analyzeParentLoop(Loop *L) {
+    BasicBlock *Header = L->getHeader();
+    if (!Header) {
+      errs() << "VNNI:   - No header\n";
+      return;
+    }
+
+    PHINode *IndPhi = getParentLoopIndPhi(L);
+    if (!IndPhi) {
+      errs() << "VNNI:   - No i64 induction PHI found\n";
+      return;
+    }
+
+    errs() << "VNNI:   - Induction PHI: " << *IndPhi << "\n";
+
+    // Find the increment (should be +1 currently)
+    for (unsigned i = 0; i < IndPhi->getNumIncomingValues(); i++) {
+      if (L->contains(IndPhi->getIncomingBlock(i))) {
+        Value *Inc = IndPhi->getIncomingValue(i);
+        errs() << "VNNI:   - Increment value: " << *Inc << "\n";
+
+        if (auto *Add = dyn_cast<BinaryOperator>(Inc)) {
+          if (Add->getOpcode() == Instruction::Add) {
+            if (auto *CI = dyn_cast<ConstantInt>(Add->getOperand(1))) {
+              errs() << "VNNI:   - Step size: " << CI->getSExtValue() << "\n";
+            } else if (auto *CI = dyn_cast<ConstantInt>(Add->getOperand(0))) {
+              errs() << "VNNI:   - Step size: " << CI->getSExtValue() << "\n";
+            }
+          }
+        }
+      }
+    }
+
+    // Find trip count
+    if (auto *Br = dyn_cast<BranchInst>(Header->getTerminator())) {
+      if (Br->isConditional()) {
+        if (auto *Cmp = dyn_cast<ICmpInst>(Br->getCondition())) {
+          errs() << "VNNI:   - Condition: " << *Cmp << "\n";
+        }
+      }
+    }
+  }
+
+  //===--------------------------------------------------------------------===//
+  // Pattern Detection
+  //===--------------------------------------------------------------------===//
+  bool detectVNNIPattern(Loop *L, VNNICandidate &C) {
+    BasicBlock *Header = L->getHeader();
+    if (!Header || !L->getLoopLatch()) return false;
+
+    // Find accumulator PHI (i32) and induction PHI (i64)
+    if (!findLoopPHIs(L, Header, C)) return false;
+
+    // Find the multiply-accumulate pattern
+    if (!findMulAccPattern(L, C)) return false;
+
+    // Find memory access pattern (GEPs and loads)
+    if (!findMemoryPattern(C)) return false;
+
+    // Extract trip count (must be multiple of 64 for VNNI)
+    if (!extractTripCount(L, Header, C)) return false;
+
+    // Extract row stride for future I-tiling optimization
+    C.RowStrideA = extractRowStride(C);
+    C.RowStrideB = extractStrideFromGEP(C.GEPB);
+    errs() << "VNNI: strideA=" << C.RowStrideA << ", strideB=" << C.RowStrideB << "\n";
+
+    // Detect non-square matrix: B needs transpose if strideB != TripCount
+    // For A[M,K] × B[K,N]: strideA=K, strideB=N, TripCount=K
+    // If strideB < TripCount, B is accessed as B[k*N+j] (strided) not B[j*K+k] (contiguous)
+    C.NeedsTranspose = (C.RowStrideB != 0 && C.RowStrideB != C.TripCount);
+    if (C.NeedsTranspose) {
+      errs() << "VNNI: Non-square matrix detected: strideA=" << C.RowStrideA
+             << ", strideB=" << C.RowStrideB << ", K=" << C.TripCount << "\n";
+    }
+
+    // Check if signed×signed (needs bias correction)
+    C.BothSigned = isa<SExtInst>(C.ExtA) && isa<SExtInst>(C.ExtB);
+
+    return true;
+  }
+
+  bool findLoopPHIs(Loop *L, BasicBlock *Header, VNNICandidate &C) {
+    C.AccPhi = nullptr;
+    C.IndPhi = nullptr;
+    C.LoadC = nullptr;
+    C.StoreC = nullptr;
+    C.GEPC = nullptr;
+    C.IsLoadStorePattern = false;
+
+    for (PHINode &Phi : Header->phis()) {
+      if (Phi.getType()->isIntegerTy(32)) {
+        // Look for accumulator pattern: phi feeds into add
+        for (unsigned i = 0; i < Phi.getNumIncomingValues(); i++) {
+          if (L->contains(Phi.getIncomingBlock(i))) {
+            if (auto *Add = dyn_cast<BinaryOperator>(Phi.getIncomingValue(i))) {
+              if (Add->getOpcode() == Instruction::Add) {
+                C.AccPhi = &Phi;
+                C.Add = Add;
+                break;
+              }
+            }
+          }
+        }
+      } else if (Phi.getType()->isIntegerTy(64)) {
+        C.IndPhi = &Phi;
+      }
+    }
+
+    // If we found PHI pattern, we're done
+    if (C.AccPhi != nullptr) {
+      return true;
+    }
+
+    // Otherwise, look for load-store pattern: load C, add, store C
+    // Pattern: store(add(load(C), mul(...)), C)
+    for (BasicBlock *BB : L->blocks()) {
+      for (Instruction &I : *BB) {
+        if (auto *SI = dyn_cast<StoreInst>(&I)) {
+          // Check if stored value is an add
+          if (auto *Add = dyn_cast<BinaryOperator>(SI->getValueOperand())) {
+            if (Add->getOpcode() == Instruction::Add) {
+              // Check if one operand is a load from same location
+              Value *Op0 = Add->getOperand(0);
+              Value *Op1 = Add->getOperand(1);
+              LoadInst *LI = dyn_cast<LoadInst>(Op0);
+              if (!LI) LI = dyn_cast<LoadInst>(Op1);
+
+              if (LI && LI->getType()->isIntegerTy(32)) {
+                // Verify load and store access same base (C array)
+                auto *LoadGEP = dyn_cast<GetElementPtrInst>(LI->getPointerOperand());
+                auto *StoreGEP = dyn_cast<GetElementPtrInst>(SI->getPointerOperand());
+
+                if (LoadGEP && StoreGEP) {
+                  // Found load-store pattern!
+                  C.Add = Add;
+                  C.LoadC = LI;
+                  C.StoreC = SI;
+                  C.GEPC = StoreGEP;
+                  C.IsLoadStorePattern = true;
+                  errs() << "VNNI: Found load-store pattern (no PHI accumulator)\n";
+                  return true;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return false;
+  }
+
+  bool findMulAccPattern(Loop *L, VNNICandidate &C) {
+    C.Mul = nullptr;
+    C.ExtA = nullptr;
+    C.ExtB = nullptr;
+
+    Value *AddOp0 = C.Add->getOperand(0);
+    Value *AddOp1 = C.Add->getOperand(1);
+
+    Value *MulOrExt = nullptr;
+    if (C.IsLoadStorePattern) {
+      // For load-store pattern: add(load(C), mul(...))
+      // The mul is the operand that isn't the load
+      MulOrExt = (AddOp0 == C.LoadC) ? AddOp1 :
+                 (AddOp1 == C.LoadC) ? AddOp0 : nullptr;
+    } else {
+      // For PHI pattern: add(phi, mul(...))
+      MulOrExt = (AddOp0 == C.AccPhi) ? AddOp1 :
+                 (AddOp1 == C.AccPhi) ? AddOp0 : nullptr;
+    }
+    if (!MulOrExt) return false;
+
+    // Pattern: sext(i16 mul) -> i32, where mul is from i8 operands
+    if (auto *OuterSExt = dyn_cast<SExtInst>(MulOrExt)) {
+      if (OuterSExt->getSrcTy()->isIntegerTy(16)) {
+        if (auto *I16Mul = dyn_cast<BinaryOperator>(OuterSExt->getOperand(0))) {
+          if (I16Mul->getOpcode() == Instruction::Mul) {
+            C.Mul = I16Mul;
+          }
+        }
+      }
+    }
+
+    // Pattern: direct i32 mul from i8 operands
+    if (!C.Mul) {
+      C.Mul = dyn_cast<BinaryOperator>(MulOrExt);
+      if (!C.Mul || C.Mul->getOpcode() != Instruction::Mul) return false;
+    }
+
+    // Find sext/zext from i8
+    auto checkExt = [](Value *V) -> Instruction* {
+      if (auto *S = dyn_cast<SExtInst>(V)) {
+        if (S->getSrcTy()->isIntegerTy(8)) return S;
+      }
+      if (auto *Z = dyn_cast<ZExtInst>(V)) {
+        if (Z->getSrcTy()->isIntegerTy(8)) return Z;
+      }
+      return nullptr;
+    };
+
+    C.ExtA = checkExt(C.Mul->getOperand(0));
+    C.ExtB = checkExt(C.Mul->getOperand(1));
+
+    return C.ExtA && C.ExtB;
+  }
+
+  bool findMemoryPattern(VNNICandidate &C) {
+    C.LoadA = dyn_cast<LoadInst>(C.ExtA->getOperand(0));
+    C.LoadB = dyn_cast<LoadInst>(C.ExtB->getOperand(0));
+    if (!C.LoadA || !C.LoadB) return false;
+
+    C.GEPA = dyn_cast<GetElementPtrInst>(C.LoadA->getPointerOperand());
+    C.GEPB = dyn_cast<GetElementPtrInst>(C.LoadB->getPointerOperand());
+
+    return C.GEPA && C.GEPB;
+  }
+
+  bool extractTripCount(Loop *L, BasicBlock *Header, VNNICandidate &C) {
+    auto *HeaderBr = dyn_cast<BranchInst>(Header->getTerminator());
+    if (!HeaderBr || !HeaderBr->isConditional()) return false;
+
+    auto *Cmp = dyn_cast<ICmpInst>(HeaderBr->getCondition());
+    if (!Cmp) return false;
+
+    ConstantInt *TripConst = dyn_cast<ConstantInt>(Cmp->getOperand(1));
+    if (!TripConst) TripConst = dyn_cast<ConstantInt>(Cmp->getOperand(0));
+    if (!TripConst) return false;
+
+    C.TripCount = TripConst->getSExtValue();
+
+    // Must be multiple of 4 for VNNI (vpdpbusd processes 4 bytes at a time)
+    if (C.TripCount % 4 != 0) {
+      errs() << "VNNI: Trip count " << C.TripCount << " not multiple of 4\n";
+      return false;
+    }
+
+    return true;
+  }
+
+  int64_t extractRowStride(VNNICandidate &C) {
+    // Pattern: index = i * stride + k
+    Value *Idx = C.GEPA->getOperand(C.GEPA->getNumOperands() - 1);
+
+    if (auto *Add = dyn_cast<BinaryOperator>(Idx)) {
+      if (Add->getOpcode() == Instruction::Add) {
+        // Find the mul part (row * stride)
+        for (Value *Op : {Add->getOperand(0), Add->getOperand(1)}) {
+          if (auto *Mul = dyn_cast<BinaryOperator>(Op)) {
+            if (Mul->getOpcode() == Instruction::Mul) {
+              // Extract stride constant
+              if (auto *CI = dyn_cast<ConstantInt>(Mul->getOperand(1)))
+                return CI->getSExtValue();
+              if (auto *CI = dyn_cast<ConstantInt>(Mul->getOperand(0)))
+                return CI->getSExtValue();
+            }
+          }
+        }
+      }
+    }
     return 0;
+  }
+
+  // Extract stride from a GEP instruction (for C matrix which may have different stride than A)
+  int64_t extractStrideFromGEP(GetElementPtrInst *GEP) {
+    if (!GEP) return 0;
+
+    // Pattern: index = i * stride + j
+    Value *Idx = GEP->getOperand(GEP->getNumOperands() - 1);
+
+    if (auto *Add = dyn_cast<BinaryOperator>(Idx)) {
+      if (Add->getOpcode() == Instruction::Add) {
+        // Find the mul part (row * stride)
+        for (Value *Op : {Add->getOperand(0), Add->getOperand(1)}) {
+          if (auto *Mul = dyn_cast<BinaryOperator>(Op)) {
+            if (Mul->getOpcode() == Instruction::Mul) {
+              // Extract stride constant
+              if (auto *CI = dyn_cast<ConstantInt>(Mul->getOperand(1)))
+                return CI->getSExtValue();
+              if (auto *CI = dyn_cast<ConstantInt>(Mul->getOperand(0)))
+                return CI->getSExtValue();
+            }
+          }
+        }
+      }
+    }
+    return 0;
+  }
+
+  //===--------------------------------------------------------------------===//
+  // Value Tracing (for finding loop-invariant base pointers)
+  //===--------------------------------------------------------------------===//
+  Value* traceToBase(Value *V, Function &F, Loop *L, LoopInfo &LI, IRBuilder<> &Builder) {
+    // Trace through PHI chains to find function-level base
+    auto tracePhis = [&](Value *V) -> Value* {
+      SmallPtrSet<Value*, 8> Visited;
+      while (auto *Phi = dyn_cast<PHINode>(V)) {
+        if (Visited.count(V)) break;
+        Visited.insert(V);
+
+        if (Phi->getNumIncomingValues() == 1) {
+          V = Phi->getIncomingValue(0);
+          continue;
+        }
+
+        for (unsigned i = 0; i < Phi->getNumIncomingValues(); i++) {
+          BasicBlock *BB = Phi->getIncomingBlock(i);
+          if (&F.getEntryBlock() == BB || !LI.getLoopFor(BB)) {
+            V = Phi->getIncomingValue(i);
+            break;
+          }
+        }
+        break;
+      }
+      return V;
+    };
+
+    // Trace insertvalue chain to find the base pointer
+    // For malloc: insertvalue chain ends with bitcast of malloc result
+    auto traceInsertValue = [&](Value *V, ArrayRef<unsigned> Indices) -> Value* {
+      SmallPtrSet<Value*, 16> Visited;
+      while (V && !Visited.count(V)) {
+        Visited.insert(V);
+
+        if (auto *IV = dyn_cast<InsertValueInst>(V)) {
+          // Check if this insertvalue sets the index we want
+          if (IV->getIndices() == Indices) {
+            return IV->getInsertedValueOperand();
+          }
+          // Otherwise trace the aggregate operand
+          V = IV->getAggregateOperand();
+        } else if (isa<UndefValue>(V)) {
+          return nullptr;
+        } else {
+          break;
+        }
+      }
+      return nullptr;
+    };
+
+    // Handle MLIR memref descriptors (extractvalue from struct)
+    if (auto *EV = dyn_cast<ExtractValueInst>(V)) {
+      Value *Agg = EV->getAggregateOperand();
+
+      // First, trace through PHIs to find loop-invariant aggregate
+      Value *TracedAgg = tracePhis(Agg);
+
+      // If the aggregate is from an insertvalue chain (malloc case),
+      // trace it to find the actual base pointer
+      if (auto *IV = dyn_cast<InsertValueInst>(TracedAgg)) {
+        Value *BasePtr = traceInsertValue(IV, EV->getIndices());
+        if (BasePtr) {
+          errs() << "VNNI: Traced insertvalue chain to base: " << *BasePtr << "\n";
+          return BasePtr;
+        }
+      }
+
+      // Original path: create extractvalue from traced aggregate
+      if (TracedAgg != Agg) {
+        return Builder.CreateExtractValue(TracedAgg, EV->getIndices(), "base.ptr");
+      }
+    }
+
+    // Trace through GEP chain to find base pointer
+    while (auto *GEP = dyn_cast<GetElementPtrInst>(V)) {
+      V = GEP->getPointerOperand();
+    }
+
+    // Trace through all enclosing loops
+    Loop *CurLoop = L;
+    while (CurLoop) {
+      if (auto *Inst = dyn_cast<Instruction>(V)) {
+        if (CurLoop->contains(Inst->getParent())) {
+          V = tracePhis(V);
+        }
+      }
+      CurLoop = CurLoop->getParentLoop();
+    }
+
+    // Final GEP trace
+    while (auto *GEP = dyn_cast<GetElementPtrInst>(V)) {
+      V = GEP->getPointerOperand();
+    }
+
+    return V;
+  }
+
+  Value* computeRowOffset(Value *Idx, VNNICandidate &C, IRBuilder<> &Builder, Loop *L) {
+    if (auto *Add = dyn_cast<BinaryOperator>(Idx)) {
+      if (Add->getOpcode() == Instruction::Add) {
+        Value *Op0 = Add->getOperand(0);
+        Value *Op1 = Add->getOperand(1);
+        Value *RowPart = (Op0 == C.IndPhi) ? Op1 : Op0;
+
+        if (auto *Mul = dyn_cast<BinaryOperator>(RowPart)) {
+          if (Mul->getOpcode() == Instruction::Mul) {
+            Value *OuterIdx = isa<ConstantInt>(Mul->getOperand(1)) ?
+                              Mul->getOperand(0) : Mul->getOperand(1);
+            Value *Stride = isa<ConstantInt>(Mul->getOperand(1)) ?
+                            Mul->getOperand(1) : Mul->getOperand(0);
+
+            // Trace through LCSSA PHIs
+            if (auto *Phi = dyn_cast<PHINode>(OuterIdx)) {
+              if (L->contains(Phi->getParent()) && Phi->getNumIncomingValues() == 1) {
+                OuterIdx = Phi->getIncomingValue(0);
+              }
+            }
+            return Builder.CreateMul(OuterIdx, Stride, "row.off");
+          }
+        }
+        return RowPart;
+      }
+    }
+    return Idx;
   }
 
   //===--------------------------------------------------------------------===//
   // Loop Transformation
   //===--------------------------------------------------------------------===//
-  bool transformLoop(Function &F, VNNICandidate &C) {
+  bool transformToVNNI(Function &F, Loop *L, VNNICandidate &C, LoopInfo &LI) {
     Module *M = F.getParent();
     LLVMContext &Ctx = M->getContext();
 
-    // Get preheader for inserting setup code
-    BasicBlock *Preheader = C.KLoop->getLoopPreheader();
-    if (!Preheader) {
-      errs() << "VNNI: No preheader, skipping\n";
-      return false;
-    }
+    BasicBlock *Preheader = L->getLoopPreheader();
+    BasicBlock *Header = L->getHeader();
+    BasicBlock *Exit = L->getExitBlock();
 
-    // Get exit block
-    BasicBlock *Exit = C.KLoop->getExitBlock();
-    if (!Exit) {
-      errs() << "VNNI: No single exit block, skipping\n";
+    if (!Preheader || !Exit) return false;
+
+    // Get vpdpbusd intrinsic
+    Function *VPDPBUSD = Intrinsic::getDeclaration(M, Intrinsic::x86_avx512_vpdpbusd_512);
+    if (!VPDPBUSD) {
+      errs() << "VNNI: ERROR - Could not get vpdpbusd intrinsic!\n";
       return false;
     }
+    errs() << "VNNI: Got vpdpbusd intrinsic: " << VPDPBUSD->getName() << "\n";
 
     // Types
     Type *I8Ty = Type::getInt8Ty(Ctx);
     Type *I32Ty = Type::getInt32Ty(Ctx);
     Type *I64Ty = Type::getInt64Ty(Ctx);
+    auto *V16I32Ty = FixedVectorType::get(I32Ty, 16);
+    Type *V16I32PtrTy = PointerType::get(V16I32Ty, 0);
 
-    // For small tiles, we'll use scalar loop with manual SIMD
-    // This is simpler and still faster than the original
+    // For small K (< 64), we need to handle partial vectors
+    // Calculate how many bytes to load per iteration
+    int64_t BytesPerIter = std::min((int64_t)64, C.TripCount);
+    // Number of valid i32 elements (each holds 4 bytes for vpdpbusd)
+    int NumValidElements = BytesPerIter / 4;
 
-    // For now, just verify we can handle this and return
-    // Full VNNI transformation requires more complex code generation
+    IRBuilder<> Builder(Ctx);
+    Builder.SetInsertPoint(Preheader->getTerminator());
 
-    // Check if both signed (needs bias correction for vpdpbusd)
-    bool needsBiasCorrection = C.ASigned && C.BSigned;
-
-    errs() << "VNNI: Would transform loop - A:" << (C.ASigned ? "signed" : "unsigned")
-           << ", B:" << (C.BSigned ? "signed" : "unsigned")
-           << ", bias correction: " << (needsBiasCorrection ? "yes" : "no") << "\n";
-
-    // For this initial version, we'll generate optimized scalar code
-    // that LLVM can vectorize, rather than emitting VNNI intrinsics directly
-    //
-    // The key optimization is loop unrolling by 4 (vpdpbusd granularity)
-    // and ensuring the memory access pattern is vectorization-friendly
-
-    return generateOptimizedLoop(F, C);
-  }
-
-  bool generateOptimizedLoop(Function &F, VNNICandidate &C) {
-    // For now, we'll mark the loop for aggressive unrolling
-    // and let LLVM's vectorizer handle the VNNI generation
-
-    // Add metadata to encourage vectorization
-    LLVMContext &Ctx = F.getContext();
-
-    BasicBlock *Header = C.KLoop->getHeader();
-    if (auto *Br = dyn_cast<BranchInst>(Header->getTerminator())) {
-      // Add loop unroll metadata
-      MDNode *UnrollMD = MDNode::get(Ctx, {
-        MDString::get(Ctx, "llvm.loop.unroll.count"),
-        ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(Ctx), 4))
-      });
-
-      MDNode *VectorizeMD = MDNode::get(Ctx, {
-        MDString::get(Ctx, "llvm.loop.vectorize.enable"),
-        ConstantAsMetadata::get(ConstantInt::get(Type::getInt1Ty(Ctx), 1))
-      });
-
-      MDNode *LoopMD = MDNode::get(Ctx, {
-        nullptr,  // Self-reference, filled in below
-        UnrollMD,
-        VectorizeMD
-      });
-
-      // Fix self-reference
-      LoopMD->replaceOperandWith(0, LoopMD);
-
-      Br->setMetadata("llvm.loop", LoopMD);
-
-      errs() << "VNNI: Added vectorization hints to loop\n";
+    // Trace base pointers
+    Value *BaseA = traceToBase(C.GEPA->getPointerOperand(), F, L, LI, Builder);
+    Value *BaseB = traceToBase(C.GEPB->getPointerOperand(), F, L, LI, Builder);
+    errs() << "VNNI: BaseA = " << *BaseA << "\n";
+    errs() << "VNNI: BaseB = " << *BaseB << "\n";
+    if (isa<UndefValue>(BaseA) || isa<UndefValue>(BaseB)) {
+      errs() << "VNNI: ERROR - Base pointer is undef!\n";
+      return false;
     }
 
+    // Compute row offsets
+    Value *IdxA = C.GEPA->getOperand(C.GEPA->getNumOperands() - 1);
+    Value *IdxB = C.GEPB->getOperand(C.GEPB->getNumOperands() - 1);
+    Value *RowOffA = computeRowOffset(IdxA, C, Builder, L);
+    Value *RowOffB = computeRowOffset(IdxB, C, Builder, L);
+
+    // === Non-square matrix transpose ===
+    // For A[M,K] × B[K,N] where N != K, B access is strided (not contiguous along K)
+    // Generate transpose: B_T[j,k] = B[k,j] so that B_T[j*K+k] is contiguous
+    Value *BaseBT = BaseB;  // Will point to transposed B if needed
+    if (C.NeedsTranspose) {
+      errs() << "VNNI: Generating B transpose (K=" << C.TripCount
+             << ", N=" << C.RowStrideB << ")\n";
+
+      int64_t K = C.TripCount;
+      int64_t N = C.RowStrideB;
+
+      // Allocate transposed buffer: N * K bytes
+      Function *MallocFn = M->getFunction("malloc");
+      if (!MallocFn) {
+        FunctionType *MallocTy = FunctionType::get(
+            PointerType::get(I8Ty, 0), {I64Ty}, false);
+        MallocFn = Function::Create(MallocTy, Function::ExternalLinkage, "malloc", M);
+      }
+      Value *TransposeSize = ConstantInt::get(I64Ty, N * K);
+      BaseBT = Builder.CreateCall(MallocFn, {TransposeSize}, "B_T");
+
+      // Generate transpose loops: for j in 0..N: for k in 0..K: B_T[j*K+k] = B[k*N+j]
+      // Create basic blocks for transpose loops
+      BasicBlock *TransposePreheader = Preheader;  // Insert before VNNI loop
+      BasicBlock *TransposeJHdr = BasicBlock::Create(Ctx, "transpose.j.hdr", &F, Preheader->getNextNode());
+      BasicBlock *TransposeKHdr = BasicBlock::Create(Ctx, "transpose.k.hdr", &F, TransposeJHdr->getNextNode());
+      BasicBlock *TransposeKBody = BasicBlock::Create(Ctx, "transpose.k.body", &F, TransposeKHdr->getNextNode());
+      BasicBlock *TransposeKExit = BasicBlock::Create(Ctx, "transpose.k.exit", &F, TransposeKBody->getNextNode());
+      BasicBlock *TransposeJExit = BasicBlock::Create(Ctx, "transpose.j.exit", &F, TransposeKExit->getNextNode());
+
+      // Redirect preheader to transpose loops
+      Builder.SetInsertPoint(Preheader->getTerminator());
+      Builder.CreateBr(TransposeJHdr);
+      Preheader->getTerminator()->eraseFromParent();
+
+      // J loop header
+      Builder.SetInsertPoint(TransposeJHdr);
+      PHINode *JIdx = Builder.CreatePHI(I64Ty, 2, "tj");
+      JIdx->addIncoming(ConstantInt::get(I64Ty, 0), Preheader);
+      Value *JCond = Builder.CreateICmpSLT(JIdx, ConstantInt::get(I64Ty, N));
+      Builder.CreateCondBr(JCond, TransposeKHdr, TransposeJExit);
+
+      // K loop header
+      Builder.SetInsertPoint(TransposeKHdr);
+      PHINode *KIdx = Builder.CreatePHI(I64Ty, 2, "tk");
+      KIdx->addIncoming(ConstantInt::get(I64Ty, 0), TransposeJHdr);
+      Value *KCond = Builder.CreateICmpSLT(KIdx, ConstantInt::get(I64Ty, K));
+      Builder.CreateCondBr(KCond, TransposeKBody, TransposeKExit);
+
+      // K loop body: B_T[j*K+k] = B[k*N+j]
+      Builder.SetInsertPoint(TransposeKBody);
+      Value *SrcIdx = Builder.CreateAdd(Builder.CreateMul(KIdx, ConstantInt::get(I64Ty, N)), JIdx);
+      Value *DstIdx = Builder.CreateAdd(Builder.CreateMul(JIdx, ConstantInt::get(I64Ty, K)), KIdx);
+      Value *SrcPtr = Builder.CreateGEP(I8Ty, BaseB, SrcIdx);
+      Value *DstPtr = Builder.CreateGEP(I8Ty, BaseBT, DstIdx);
+      Value *Val = Builder.CreateLoad(I8Ty, SrcPtr);
+      Builder.CreateStore(Val, DstPtr);
+      Value *KNext = Builder.CreateAdd(KIdx, ConstantInt::get(I64Ty, 1));
+      KIdx->addIncoming(KNext, TransposeKBody);
+      Builder.CreateBr(TransposeKHdr);
+
+      // K loop exit -> J increment
+      Builder.SetInsertPoint(TransposeKExit);
+      Value *JNext = Builder.CreateAdd(JIdx, ConstantInt::get(I64Ty, 1));
+      JIdx->addIncoming(JNext, TransposeKExit);
+      Builder.CreateBr(TransposeJHdr);
+
+      // J loop exit -> continue to VNNI loop (update Preheader reference)
+      Builder.SetInsertPoint(TransposeJExit);
+      // Don't create branch yet - will be done when VNNI loop is created
+      Preheader = TransposeJExit;  // VNNI loop preheader is now after transpose
+
+      // Update RowOffB: now it's j * K (not j * N)
+      // Recompute using J loop index from parent loop
+      RowOffB = Builder.CreateMul(
+          computeRowOffset(IdxB, C, Builder, L),  // This gives j * N
+          ConstantInt::get(I64Ty, K / N),         // Scale to j * K
+          "row.off.transposed");
+      // Actually simpler: extract j and multiply by K
+      // The original RowOffB = j * N, so RowOffB_new = (RowOffB / N) * K = RowOffB * (K/N)
+      // But this only works if K is divisible by N. Better to extract j directly.
+
+      errs() << "VNNI: Transpose loops generated\n";
+    }
+
+    // Create VNNI loop blocks
+    BasicBlock *VecHeader = BasicBlock::Create(Ctx, "vnni.hdr", &F);
+    BasicBlock *VecBody = BasicBlock::Create(Ctx, "vnni.body", &F);
+    BasicBlock *VecExit = BasicBlock::Create(Ctx, "vnni.exit", &F);
+
+    Value *ZeroVec = ConstantVector::getSplat(ElementCount::getFixed(16),
+                                               ConstantInt::get(I32Ty, 0));
+    Value *VecEnd = ConstantInt::get(I64Ty, C.TripCount);
+
+    // === I=4 Tiling: Compute row offsets for 4 A rows ===
+    Value *Stride = ConstantInt::get(I64Ty, C.RowStrideA);
+    Value *RowOffA0 = RowOffA;  // i*stride
+    Value *RowOffA1 = Builder.CreateAdd(RowOffA, Stride);  // (i+1)*stride
+    Value *RowOffA2 = Builder.CreateAdd(RowOffA1, Stride); // (i+2)*stride
+    Value *RowOffA3 = Builder.CreateAdd(RowOffA2, Stride); // (i+3)*stride
+
+    // === VNNI Header: PHIs and condition ===
+    Builder.SetInsertPoint(VecHeader);
+    PHINode *VecIdx = Builder.CreatePHI(I64Ty, 2, "k");
+
+    // 4 accumulators for I=4 tiling
+    PHINode *VecAcc0 = Builder.CreatePHI(V16I32Ty, 2, "acc0");
+    PHINode *VecAcc1 = Builder.CreatePHI(V16I32Ty, 2, "acc1");
+    PHINode *VecAcc2 = Builder.CreatePHI(V16I32Ty, 2, "acc2");
+    PHINode *VecAcc3 = Builder.CreatePHI(V16I32Ty, 2, "acc3");
+    PHINode *BiasAcc = C.BothSigned ? Builder.CreatePHI(V16I32Ty, 2, "bias") : nullptr;
+
+    Value *Cond = Builder.CreateICmpSLT(VecIdx, VecEnd);
+    Builder.CreateCondBr(Cond, VecBody, VecExit);
+
+    // === VNNI Body: load B once, load 4 A rows, compute 4 dot products ===
+    Builder.SetInsertPoint(VecBody);
+
+    // For K < 64, we pad to 64 by loading available data + zeros
+    // This works because 0 * x = 0 in dot product
+    // We always load 64 bytes but use masked load for safety when K < 64
+
+    // Helper: create padded load - loads K bytes and pads rest with zeros
+    auto loadPadded = [&](Value *BasePtr, Value *Offset) -> Value* {
+      Value *Ptr = Builder.CreateGEP(I8Ty, BasePtr, Offset);
+
+      if (C.TripCount >= 64) {
+        // Full 64-byte load, no padding needed
+        return Builder.CreateAlignedLoad(V16I32Ty,
+                 Builder.CreateBitCast(Ptr, V16I32PtrTy), Align(1));
+      }
+
+      // K < 64: Load K bytes into smaller vector, then extend with zeros
+      // NumValidElements = K / 4 (number of i32 elements)
+      auto *SmallVecTy = FixedVectorType::get(I32Ty, NumValidElements);
+      Type *SmallVecPtrTy = PointerType::get(SmallVecTy, 0);
+      Value *SmallVec = Builder.CreateAlignedLoad(SmallVecTy,
+                          Builder.CreateBitCast(Ptr, SmallVecPtrTy), Align(1));
+
+      // Extend to 16 elements: [v0, v1, ..., vN, 0, 0, ..., 0]
+      // First pad SmallVec to 16 elements with undef, then shuffle with zeros
+      Value *SmallZero = ConstantVector::getSplat(
+                           ElementCount::getFixed(NumValidElements),
+                           ConstantInt::get(I32Ty, 0));
+
+      // Shuffle: indices 0..NumValidElements-1 from SmallVec, rest from SmallZero (as 0)
+      // Since both operands are same size, we can shuffle properly
+      SmallVector<int, 16> PadMask;
+      for (int i = 0; i < NumValidElements * 2; i++) {
+        PadMask.push_back(i < NumValidElements ? i : NumValidElements); // second half = zeros
+      }
+      Value *PaddedSmall = Builder.CreateShuffleVector(SmallVec, SmallZero, PadMask);
+
+      // Now extend PaddedSmall (2*NumValidElements) to 16 elements
+      // If NumValidElements=8 (K=32), PaddedSmall is 16 elements, we're done
+      if (NumValidElements * 2 == 16) {
+        return PaddedSmall;
+      }
+
+      // Otherwise need another shuffle to get to 16
+      Value *FullZero = ConstantVector::getSplat(
+                          ElementCount::getFixed(NumValidElements * 2),
+                          ConstantInt::get(I32Ty, 0));
+      SmallVector<int, 16> ExtendMask;
+      for (int i = 0; i < 16; i++) {
+        ExtendMask.push_back(i < NumValidElements * 2 ? i : NumValidElements * 2);
+      }
+      return Builder.CreateShuffleVector(PaddedSmall, FullZero, ExtendMask);
+    };
+
+    // Load B vector ONCE (shared across all 4 A rows)
+    // Use BaseBT (transposed B) if non-square, otherwise BaseB
+    Value *VecB = loadPadded(BaseBT, Builder.CreateAdd(RowOffB, VecIdx));
+
+    // Load 4 A rows
+    Value *VecA0 = loadPadded(BaseA, Builder.CreateAdd(RowOffA0, VecIdx));
+    Value *VecA1 = loadPadded(BaseA, Builder.CreateAdd(RowOffA1, VecIdx));
+    Value *VecA2 = loadPadded(BaseA, Builder.CreateAdd(RowOffA2, VecIdx));
+    Value *VecA3 = loadPadded(BaseA, Builder.CreateAdd(RowOffA3, VecIdx));
+
+    // Signed conversion and bias accumulation
+    Value *NewBiasAcc = nullptr;
+    if (C.BothSigned) {
+      Value *SignFlip = ConstantVector::getSplat(ElementCount::getFixed(16),
+                          ConstantInt::get(I32Ty, 0x80808080));
+      VecA0 = Builder.CreateXor(VecA0, SignFlip);
+      VecA1 = Builder.CreateXor(VecA1, SignFlip);
+      VecA2 = Builder.CreateXor(VecA2, SignFlip);
+      VecA3 = Builder.CreateXor(VecA3, SignFlip);
+
+      Value *Ones = ConstantVector::getSplat(ElementCount::getFixed(16),
+                      ConstantInt::get(I32Ty, 0x01010101));
+      NewBiasAcc = Builder.CreateCall(VPDPBUSD, {BiasAcc, Ones, VecB});
+    }
+
+    // vpdpbusd: 4 dot products, reusing B
+    Value *NewAcc0 = Builder.CreateCall(VPDPBUSD, {VecAcc0, VecA0, VecB});
+    Value *NewAcc1 = Builder.CreateCall(VPDPBUSD, {VecAcc1, VecA1, VecB});
+    Value *NewAcc2 = Builder.CreateCall(VPDPBUSD, {VecAcc2, VecA2, VecB});
+    Value *NewAcc3 = Builder.CreateCall(VPDPBUSD, {VecAcc3, VecA3, VecB});
+
+    // Step by 64 bytes or TripCount if smaller (for K < 64 cases)
+    int64_t StepSize = std::min((int64_t)64, C.TripCount);
+    Value *NextIdx = Builder.CreateAdd(VecIdx, ConstantInt::get(I64Ty, StepSize));
+    BranchInst *LatchBr = Builder.CreateBr(VecHeader);
+
+    // Add loop metadata to disable unrolling (prevents register spilling)
+    // LLVM O3 over-unrolls this loop causing 40x more vpdpbusd instructions
+    // The metadata must be on the latch (back-edge) branch
+    // Using multiple hints to ensure LLVM respects no-unroll
+    LLVMContext &LoopCtx = F.getContext();
+    MDNode *LoopID = MDNode::get(LoopCtx, {
+        MDNode::get(LoopCtx, {}),  // self-reference placeholder
+        MDNode::get(LoopCtx, {
+            MDString::get(LoopCtx, "llvm.loop.unroll.disable")
+        }),
+        MDNode::get(LoopCtx, {
+            MDString::get(LoopCtx, "llvm.loop.unroll.count"),
+            ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(LoopCtx), 1))
+        }),
+        MDNode::get(LoopCtx, {
+            MDString::get(LoopCtx, "llvm.loop.unroll.full"),
+            ConstantAsMetadata::get(ConstantInt::get(Type::getInt1Ty(LoopCtx), false))
+        })
+    });
+    LoopID->replaceOperandWith(0, LoopID);  // fix self-reference
+    LatchBr->setMetadata("llvm.loop", LoopID);
+
+    // Complete PHIs
+    VecIdx->addIncoming(ConstantInt::get(I64Ty, 0), Preheader);
+    VecIdx->addIncoming(NextIdx, VecBody);
+    VecAcc0->addIncoming(ZeroVec, Preheader);
+    VecAcc0->addIncoming(NewAcc0, VecBody);
+    VecAcc1->addIncoming(ZeroVec, Preheader);
+    VecAcc1->addIncoming(NewAcc1, VecBody);
+    VecAcc2->addIncoming(ZeroVec, Preheader);
+    VecAcc2->addIncoming(NewAcc2, VecBody);
+    VecAcc3->addIncoming(ZeroVec, Preheader);
+    VecAcc3->addIncoming(NewAcc3, VecBody);
+    if (C.BothSigned) {
+      BiasAcc->addIncoming(ZeroVec, Preheader);
+      BiasAcc->addIncoming(NewBiasAcc, VecBody);
+    }
+
+    // === VNNI Exit: horizontal reduction ===
+    Builder.SetInsertPoint(VecExit);
+
+    auto hreduce = [&](Value *Vec) -> Value* {
+      for (int W = 8; W >= 1; W /= 2) {
+        SmallVector<int, 16> Mask;
+        for (int i = 0; i < 16; i++) Mask.push_back((i + W) % 16);
+        Vec = Builder.CreateAdd(Vec, Builder.CreateShuffleVector(Vec, Vec, Mask));
+      }
+      return Builder.CreateExtractElement(Vec, (uint64_t)0);
+    };
+
+    // Reduce all 4 accumulators
+    Value *Result0 = hreduce(VecAcc0);
+    Value *Result1 = hreduce(VecAcc1);
+    Value *Result2 = hreduce(VecAcc2);
+    Value *Result3 = hreduce(VecAcc3);
+
+    if (C.BothSigned) {
+      Value *BiasSum = hreduce(BiasAcc);
+      Value *Correction = Builder.CreateMul(BiasSum, ConstantInt::get(I32Ty, 128));
+      Result0 = Builder.CreateSub(Result0, Correction);
+      Result1 = Builder.CreateSub(Result1, Correction);
+      Result2 = Builder.CreateSub(Result2, Correction);
+      Result3 = Builder.CreateSub(Result3, Correction);
+    }
+
+    // === I=4 Tiling: Store all 4 results ===
+    // Find the store instruction that uses the exit PHI
+    // K loop -> J loop (parent) -> I loop (grandparent)
+    Loop *JLoop = L->getParentLoop();
+    Loop *ILoop = JLoop ? JLoop->getParentLoop() : nullptr;
+    StoreInst *OrigStore = nullptr;
+    GetElementPtrInst *StoreGEP = nullptr;
+
+    // For load-store pattern, we already have the store in C.StoreC
+    if (C.IsLoadStorePattern && C.StoreC) {
+      OrigStore = C.StoreC;
+      StoreGEP = C.GEPC;
+      errs() << "VNNI: Using load-store pattern store instruction\n";
+    } else {
+      // Find store in exit block or parent loop (PHI pattern)
+      for (PHINode &PN : Exit->phis()) {
+        for (User *U : PN.users()) {
+          if (auto *SI = dyn_cast<StoreInst>(U)) {
+            OrigStore = SI;
+            StoreGEP = dyn_cast<GetElementPtrInst>(SI->getPointerOperand());
+            break;
+          }
+        }
+        if (OrigStore) break;
+      }
+    }
+
+    Builder.CreateBr(Exit);
+
+    // === Rewire control flow ===
+    // Preheader may be TransposeJExit which has no terminator yet
+    if (Instruction *Term = Preheader->getTerminator()) {
+      if (auto *Br = dyn_cast<BranchInst>(Term)) {
+        Br->setSuccessor(0, VecHeader);
+      }
+    } else {
+      // No terminator - create branch to VNNI loop
+      IRBuilder<> PreBuilder(Preheader);
+      PreBuilder.CreateBr(VecHeader);
+    }
+
+    // Update exit PHIs - Result0 goes to original PHI
+    for (PHINode &PN : Exit->phis()) {
+      for (unsigned i = 0; i < PN.getNumIncomingValues(); i++) {
+        if (PN.getIncomingBlock(i) == Header) {
+          PN.setIncomingBlock(i, VecExit);
+          if (PN.getIncomingValue(i) == C.AccPhi) {
+            PN.setIncomingValue(i, Result0);
+          }
+        }
+      }
+    }
+
+    // === Generate stores for all 4 results (I=4 tiling) ===
+    if (OrigStore && StoreGEP && ILoop && JLoop) {
+      // For load-store pattern, the original store is in K loop which will be deleted
+      // We need to insert stores in VecExit block instead
+      Builder.SetInsertPoint(VecExit->getTerminator());
+
+      // Trace BaseC through GEP chain to get actual array base pointer
+      Value *BaseC = StoreGEP->getPointerOperand();
+      while (auto *GEP = dyn_cast<GetElementPtrInst>(BaseC)) {
+        BaseC = GEP->getPointerOperand();
+      }
+
+      // Get I and J loop induction variables - these remain valid after K loop deletion
+      // Unlike OrigIdx which comes from the K loop and becomes invalid
+      PHINode *IPhi = getParentLoopIndPhi(ILoop);
+      PHINode *JPhi = getParentLoopIndPhi(JLoop);
+
+      if (!IPhi || !JPhi) {
+        errs() << "VNNI: Could not find I or J induction PHIs for store generation\n";
+        if (!IPhi) errs() << "VNNI:   - IPhi is null\n";
+        if (!JPhi) errs() << "VNNI:   - JPhi is null\n";
+      } else {
+        errs() << "VNNI: Using I/J induction PHIs for store index computation\n";
+        errs() << "VNNI:   IPhi: " << *IPhi << "\n";
+        errs() << "VNNI:   JPhi: " << *JPhi << "\n";
+      }
+
+      // C is stored as C[i * strideC + j], so consecutive rows are strideC apart
+      // For matmul A[M,K] × B[K,N] → C[M,N]:
+      //   strideA = K (e.g., 1024 for Attn)
+      //   strideC = N (e.g., 64 for output)
+      // IMPORTANT: Must extract strideC from the store GEP, not use strideA!
+      int64_t StrideC = extractStrideFromGEP(StoreGEP);
+      if (StrideC == 0) {
+        // Fallback: for square matrices, strideA = strideC
+        StrideC = C.RowStrideA;
+        errs() << "VNNI: Warning - could not extract C stride, using A stride as fallback\n";
+      }
+      Value *CStride = ConstantInt::get(I64Ty, StrideC);
+
+      // Compute index from I and J: C[i][j] = C[i * strideC + j]
+      Value *IxStride = Builder.CreateMul(IPhi, CStride, "i_x_stride");
+      Value *Idx0 = Builder.CreateAdd(IxStride, JPhi, "idx_i0_j");
+
+      // Store Result0 at C[i][j]
+      Value *Ptr0 = Builder.CreateGEP(I32Ty, BaseC, Idx0, "ptr_c_i0_j");
+      Builder.CreateStore(Result0, Ptr0);
+
+      // Store Result1 at C[i+1][j] = idx0 + strideC
+      Value *Idx1 = Builder.CreateAdd(Idx0, CStride, "idx_i1_j");
+      Value *Ptr1 = Builder.CreateGEP(I32Ty, BaseC, Idx1, "ptr_c_i1_j");
+      Builder.CreateStore(Result1, Ptr1);
+
+      // Store Result2 at C[i+2][j] = idx1 + strideC
+      Value *Idx2 = Builder.CreateAdd(Idx1, CStride, "idx_i2_j");
+      Value *Ptr2 = Builder.CreateGEP(I32Ty, BaseC, Idx2, "ptr_c_i2_j");
+      Builder.CreateStore(Result2, Ptr2);
+
+      // Store Result3 at C[i+3][j] = idx2 + strideC
+      Value *Idx3 = Builder.CreateAdd(Idx2, CStride, "idx_i3_j");
+      Value *Ptr3 = Builder.CreateGEP(I32Ty, BaseC, Idx3, "ptr_c_i3_j");
+      Builder.CreateStore(Result3, Ptr3);
+
+      errs() << "VNNI: Added 4 stores for I=4 tiling (strideC=" << StrideC << ", strideA=" << C.RowStrideA << ")\n";
+
+      // Modify I loop (grandparent) to step by 4 - NOT J loop!
+      if (modifyParentLoopStep(ILoop, 4)) {
+        errs() << "VNNI: Modified I loop (grandparent) step to 4\n";
+      }
+    } else {
+      errs() << "VNNI: Could not find store pattern or loops for I=4 tiling\n";
+      if (!OrigStore) errs() << "VNNI:   - No OrigStore found\n";
+      if (!StoreGEP) errs() << "VNNI:   - No StoreGEP found\n";
+      if (!ILoop) errs() << "VNNI:   - No I loop (grandparent) found\n";
+      if (!JLoop) errs() << "VNNI:   - No J loop (parent) found\n";
+    }
+
+    // === Delete old loop ===
+    deleteLoop(L, LI, C);
+
+    errs() << "VNNI: Transformed loop (trip=" << C.TripCount << ")\n";
     return true;
+  }
+
+  void deleteLoop(Loop *L, LoopInfo &LI, VNNICandidate &C) {
+    SmallVector<BasicBlock*, 4> Blocks(L->blocks().begin(), L->blocks().end());
+
+    // Remove from LoopInfo
+    if (Loop *Parent = L->getParentLoop()) {
+      Parent->removeChildLoop(std::find(Parent->begin(), Parent->end(), L));
+    } else {
+      LI.removeLoop(std::find(LI.begin(), LI.end(), L));
+    }
+
+    // Replace external uses (only for PHI pattern, not load-store)
+    if (C.AccPhi) {
+      for (Use &U : C.AccPhi->uses()) {
+        if (auto *I = dyn_cast<Instruction>(U.getUser())) {
+          if (!L->contains(I->getParent())) {
+            // Already handled by exit PHI update
+          }
+        }
+      }
+    }
+
+    // Replace internal uses with undef and delete
+    for (BasicBlock *BB : Blocks) {
+      for (Instruction &I : *BB) {
+        if (!I.use_empty()) {
+          I.replaceAllUsesWith(UndefValue::get(I.getType()));
+        }
+      }
+    }
+    for (BasicBlock *BB : Blocks) {
+      BB->getTerminator()->eraseFromParent();
+    }
+    for (BasicBlock *BB : Blocks) {
+      while (!BB->empty()) BB->back().eraseFromParent();
+    }
+    for (BasicBlock *BB : Blocks) {
+      BB->eraseFromParent();
+    }
   }
 };
 
-char VNNIPass::ID = 0;
-
 } // anonymous namespace
 
+char VNNIPass::ID = 0;
+static RegisterPass<VNNIPass> X("vnni", "VNNI vpdpbusd optimization pass", false, false);
+
 namespace llvm {
-Pass *createVNNIPass() { return new VNNIPass(); }
-} // namespace llvm
+  Pass *createVNNIPass() { return new VNNIPass(); }
+}

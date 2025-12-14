@@ -330,8 +330,14 @@ int main(int argc, char** argv) {
             const auto& srcVars = mlirContext.getFunctionVariables();
             std::map<std::string, std::vector<mlir::simp::MLIRCompilationPipeline::VarDebugInfo>> dstVars;
             for (const auto& [funcName, vars] : srcVars) {
+                if (debugBuild) {
+                    std::cerr << "DEBUG: Function '" << funcName << "' has " << vars.size() << " variables:\n";
+                }
                 for (const auto& v : vars) {
                     dstVars[funcName].push_back({v.name, v.line, v.col, v.isArg, v.argNo});
+                    if (debugBuild) {
+                        std::cerr << "DEBUG:   - " << v.name << " (line " << v.line << ", isArg=" << v.isArg << ")\n";
+                    }
                 }
             }
             pipeline.setFunctionVariables(dstVars);
@@ -467,6 +473,14 @@ int main(int argc, char** argv) {
         // Run VNNI optimization pass BEFORE O3 to identify and transform i8 dot product loops
         // Only run when --llvm-vectorize is enabled (for INT8/INT4 workloads)
         if (llvmVectorize) {
+            // Dump IR before VNNI pass
+            {
+                std::error_code EC;
+                llvm::raw_fd_ostream preFile("/tmp/before_vnni.ll", EC);
+                llvmModule->print(preFile, nullptr);
+                std::cout << "Pre-VNNI IR written to: /tmp/before_vnni.ll" << std::endl;
+            }
+
             LOG_INFO("Running VNNI optimization pass...");
             llvm::legacy::PassManager vnniPM;
             // First simplify loops to create proper preheaders
@@ -475,6 +489,14 @@ int main(int argc, char** argv) {
             // Now run VNNI pass
             vnniPM.add(llvm::createVNNIPass());
             vnniPM.run(*llvmModule);
+
+            // Dump IR after VNNI pass
+            {
+                std::error_code EC;
+                llvm::raw_fd_ostream vnniFile("/tmp/after_vnni.ll", EC);
+                llvmModule->print(vnniFile, nullptr);
+                std::cout << "VNNI IR written to: /tmp/after_vnni.ll" << std::endl;
+            }
         }
 
         // RUN LLVM OPTIMIZATION PASSES (Critical for performance!)

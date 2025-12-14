@@ -79,6 +79,7 @@
 #include "llvm/IR/DebugLoc.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -659,6 +660,7 @@ void MLIRCompilationPipeline::addDebugInfoToModule(llvm::Module* llvmModule) {
 
   // If MLIR already generated debug info from our source locations,
   // enhance it with argument/variable debug info
+  llvm::errs() << "DEBUG-PIPELINE: hasExistingDebugInfo=" << hasExistingDebugInfo << "\n";
   if (hasExistingDebugInfo) {
     // The MLIR translation already added DICompileUnit and DISubprograms.
     // We need to get the existing compile unit to add variable debug info.
@@ -739,13 +741,16 @@ void MLIRCompilationPipeline::addDebugInfoToModule(llvm::Module* llvmModule) {
       // Add debug info for local variables
       // Look up variable info for this function
       std::string funcName = func.getName().str();
+      llvm::errs() << "DEBUG-PIPELINE: Processing function '" << funcName << "'\n";
       auto varIt = functionVariables.find(funcName);
       if (varIt != functionVariables.end()) {
+        llvm::errs() << "DEBUG-PIPELINE: Found " << varIt->second.size() << " variables for function\n";
         // Collect non-argument variables in declaration order
         std::vector<VarDebugInfo> localVars;
         for (const auto& varInfo : varIt->second) {
           if (!varInfo.isArg) {
             localVars.push_back(varInfo);
+            llvm::errs() << "DEBUG-PIPELINE:   Local var: " << varInfo.name << "\n";
           }
         }
 
@@ -772,11 +777,13 @@ void MLIRCompilationPipeline::addDebugInfoToModule(llvm::Module* llvmModule) {
 
         // Match local variables to instructions by order
         // This assumes variables are declared in the same order as their values appear
+        llvm::errs() << "DEBUG-PIPELINE: Matching " << localVars.size() << " local vars to " << valueInsts.size() << " instructions\n";
         size_t numToMatch = std::min(localVars.size(), valueInsts.size());
         for (size_t i = 0; i < numToMatch; ++i) {
           const auto& varInfo = localVars[i];
           llvm::Instruction* inst = valueInsts[i].first;
           llvm::Instruction* insertPoint = valueInsts[i].second;
+          llvm::errs() << "DEBUG-PIPELINE: Emitting debug for var '" << varInfo.name << "' -> " << *inst << "\n";
 
           // Create DIType for the variable
           llvm::DIType* varDIType = nullptr;
@@ -951,12 +958,203 @@ void MLIRCompilationPipeline::addDebugInfoToModule(llvm::Module* llvmModule) {
         );
       }
     }
+
+    // Add debug info for local variables using alloca + dbg.declare
+    // This creates proper DWARF variable entries that GDB can read
+    std::string funcName = func.getName().str();
+    auto varIt = functionVariables.find(funcName);
+    if (varIt != functionVariables.end()) {
+      // Collect non-argument variables
+      std::vector<VarDebugInfo> localVars;
+      for (const auto& varInfo : varIt->second) {
+        if (!varInfo.isArg) {
+          localVars.push_back(varInfo);
+        }
+      }
+
+      if (!localVars.empty() && !func.empty()) {
+        llvm::BasicBlock& entryBB = func.getEntryBlock();
+        llvm::IRBuilder<> irBuilder(&entryBB, entryBB.getFirstInsertionPt());
+
+        // Create allocas for ALL local variables
+        std::map<std::string, llvm::AllocaInst*> varAllocas;
+        std::map<std::string, llvm::DILocalVariable*> varDIVars;
+        std::map<std::string, llvm::DILocation*> varDebugLocs;
+
+        for (const auto& varInfo : localVars) {
+          // Default to i64 for all variables initially
+          llvm::Type* varType = llvm::Type::getInt64Ty(llvmModule->getContext());
+
+          // Create alloca at function entry
+          llvm::AllocaInst* alloca = irBuilder.CreateAlloca(
+              varType, nullptr, varInfo.name + ".addr");
+          varAllocas[varInfo.name] = alloca;
+
+          // Create DIType - use i64 for all to ensure compatibility
+          llvm::DIType* varDIType = dbuilder.createBasicType("long", 64, llvm::dwarf::DW_ATE_signed);
+
+          // Create DILocalVariable
+          llvm::DILocalVariable* localVar = dbuilder.createAutoVariable(
+              sp, varInfo.name, file, varInfo.line, varDIType, true);
+          varDIVars[varInfo.name] = localVar;
+
+          // Create debug location
+          llvm::DILocation* varDebugLoc = llvm::DILocation::get(
+              llvmModule->getContext(), varInfo.line, varInfo.col, sp);
+          varDebugLocs[varInfo.name] = varDebugLoc;
+
+          // Store initial value (0) to the alloca
+          irBuilder.SetInsertPoint(alloca->getNextNode() ? alloca->getNextNode() : alloca);
+          llvm::Value* zero = llvm::ConstantInt::get(varType, 0);
+          llvm::StoreInst* initStore = irBuilder.CreateStore(zero, alloca);
+
+          // Insert dbg.declare - this creates proper DWARF entries
+          dbuilder.insertDeclare(
+              alloca, localVar, dbuilder.createExpression(),
+              varDebugLoc, initStore->getIterator());
+        }
+
+        // Collect all value-producing instructions and their debug locations
+        // to find assignments to variables
+        std::vector<std::pair<llvm::Instruction*, unsigned>> valueInsts;
+        for (llvm::BasicBlock& bb : func) {
+          for (llvm::Instruction& inst : bb) {
+            if (inst.getType()->isVoidTy()) continue;
+            if (llvm::isa<llvm::DbgInfoIntrinsic>(&inst)) continue;
+            if (llvm::isa<llvm::AllocaInst>(&inst)) continue;
+
+            // Get line number from debug location if available
+            unsigned line = 0;
+            if (const llvm::DebugLoc& dl = inst.getDebugLoc()) {
+              line = dl.getLine();
+            }
+            valueInsts.push_back({&inst, line});
+          }
+        }
+
+        // Match instructions to variables by line number
+        for (auto& [inst, instLine] : valueInsts) {
+          if (instLine == 0) continue;
+
+          // Find variable declared on this line
+          for (const auto& varInfo : localVars) {
+            if (varInfo.line == instLine) {
+              auto allocaIt = varAllocas.find(varInfo.name);
+              if (allocaIt != varAllocas.end()) {
+                // Get or create insertion point after this instruction
+                llvm::Instruction* insertPt = inst->getNextNode();
+                if (insertPt && !llvm::isa<llvm::PHINode>(insertPt)) {
+                  llvm::IRBuilder<> storeBuilder(insertPt);
+
+                  // Convert value to i64 if needed
+                  llvm::Value* valToStore = inst;
+                  llvm::Type* allocaElemType = allocaIt->second->getAllocatedType();
+                  if (inst->getType() != allocaElemType) {
+                    if (inst->getType()->isIntegerTy() && allocaElemType->isIntegerTy()) {
+                      valToStore = storeBuilder.CreateIntCast(inst, allocaElemType, true);
+                    } else if (inst->getType()->isPointerTy()) {
+                      valToStore = storeBuilder.CreatePtrToInt(inst, allocaElemType);
+                    } else {
+                      continue; // Skip incompatible types
+                    }
+                  }
+                  storeBuilder.CreateStore(valToStore, allocaIt->second);
+                }
+              }
+              break;
+            }
+          }
+        }
+
+        // Also handle PHI nodes - store their values after all PHIs in the block
+        for (llvm::BasicBlock& bb : func) {
+          std::vector<llvm::PHINode*> blockPhis;
+          for (llvm::Instruction& inst : bb) {
+            if (auto* phi = llvm::dyn_cast<llvm::PHINode>(&inst)) {
+              blockPhis.push_back(phi);
+            }
+          }
+
+          if (!blockPhis.empty()) {
+            auto insertIt = bb.getFirstNonPHIIt();
+            if (insertIt != bb.end()) {
+              llvm::IRBuilder<> storeBuilder(&*insertIt);
+
+              // Try to match PHIs to variables by examining their use patterns
+              for (llvm::PHINode* phi : blockPhis) {
+                // Check if this PHI has a debug location matching a variable
+                unsigned phiLine = 0;
+                if (const llvm::DebugLoc& dl = phi->getDebugLoc()) {
+                  phiLine = dl.getLine();
+                }
+
+                for (const auto& varInfo : localVars) {
+                  auto allocaIt = varAllocas.find(varInfo.name);
+                  if (allocaIt == varAllocas.end()) continue;
+
+                  // Match by line or by being a loop variable (PHI in non-entry block)
+                  bool match = (phiLine == varInfo.line);
+                  if (!match && &bb != &entryBB) {
+                    // For loop variables, try to match by type
+                    if (phi->getType()->isIntegerTy()) {
+                      match = true; // Assume integer PHIs are loop counters
+                    }
+                  }
+
+                  if (match) {
+                    llvm::Value* valToStore = phi;
+                    llvm::Type* allocaElemType = allocaIt->second->getAllocatedType();
+                    if (phi->getType() != allocaElemType) {
+                      if (phi->getType()->isIntegerTy() && allocaElemType->isIntegerTy()) {
+                        valToStore = storeBuilder.CreateIntCast(phi, allocaElemType, true);
+                      } else {
+                        continue;
+                      }
+                    }
+                    storeBuilder.CreateStore(valToStore, allocaIt->second);
+                    break; // Only store to first matching variable
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
   }
 
-  // Add DWARF version and debug info version module flags
-  llvmModule->addModuleFlag(llvm::Module::Warning, "Dwarf Version", 4);
-  llvmModule->addModuleFlag(llvm::Module::Warning, "Debug Info Version",
-                            llvm::DEBUG_METADATA_VERSION);
+  // Add DWARF version and debug info version module flags (only if not already set)
+  // Use DWARF5 for better SSA variable tracking via location lists
+  if (!llvmModule->getModuleFlag("Dwarf Version")) {
+    llvmModule->addModuleFlag(llvm::Module::Warning, "Dwarf Version", 5);
+  }
+  if (!llvmModule->getModuleFlag("Debug Info Version")) {
+    llvmModule->addModuleFlag(llvm::Module::Warning, "Debug Info Version",
+                              llvm::DEBUG_METADATA_VERSION);
+  }
+
+  // Ensure all instructions in functions with debug info have debug locations
+  for (llvm::Function& func : *llvmModule) {
+    if (func.isDeclaration()) continue;
+    llvm::DISubprogram* sp = func.getSubprogram();
+    if (!sp) continue;
+
+    // Create a default location for instructions without one
+    llvm::DILocation* defaultLoc = llvm::DILocation::get(
+        llvmModule->getContext(), sp->getLine(), 0, sp);
+
+    for (llvm::BasicBlock& bb : func) {
+      for (llvm::Instruction& inst : bb) {
+        // Skip debug intrinsics
+        if (llvm::isa<llvm::DbgInfoIntrinsic>(&inst)) continue;
+
+        // If instruction doesn't have a debug location, add the default
+        if (!inst.getDebugLoc()) {
+          inst.setDebugLoc(defaultLoc);
+        }
+      }
+    }
+  }
 
   // Finalize the debug info
   dbuilder.finalize();
