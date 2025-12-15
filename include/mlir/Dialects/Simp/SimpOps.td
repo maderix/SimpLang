@@ -1210,4 +1210,40 @@ def Simp_TensorDotOp : Simp_Op<"tensor_dot", [Pure]> {
   }];
 }
 
+//===----------------------------------------------------------------------===//
+// TensorMatMulNTOp - Matrix multiplication with pre-transposed B (No Transpose)
+//===----------------------------------------------------------------------===//
+
+def Simp_TensorMatMulNTOp : Simp_Op<"tensor_matmul_nt", [Pure]> {
+  let summary = "Matrix multiplication with pre-transposed B matrix";
+
+  let description = [{
+    Matrix multiplication where B is already transposed: A[M,K] × B_T[N,K] → C[M,N]
+
+    This avoids runtime transpose overhead. The host should pre-transpose weights
+    once at model load time.
+
+    Usage:
+    ```simplang
+    // B_T is pre-transposed: shape [N, K] instead of [K, N]
+    i8<1, 2048> x = tensor_from_array(x_arr, 0i);
+    i8<2048, 2048> Wq_T = tensor_from_array(wq_transposed, 0i);  // [N, K]
+    var Q = tensor_matmul_nt(x, Wq_T);  // No transpose needed!
+    ```
+
+    For VNNI optimization, K-innermost loop is used directly on B_T.
+  }];
+
+  let arguments = (ins
+    Simp_SimpTensorType:$lhs,    // A: [M, K]
+    Simp_SimpTensorType:$rhs     // B_T: [N, K] (pre-transposed)
+  );
+
+  let results = (outs Simp_SimpTensorType:$result);  // C: [M, N]
+
+  let assemblyFormat = [{
+    $lhs `,` $rhs attr-dict `:` `(` type($lhs) `,` type($rhs) `)` `->` type($result)
+  }];
+}
+
 #endif // SIMP_OPS

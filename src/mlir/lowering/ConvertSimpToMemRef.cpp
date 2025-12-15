@@ -43,9 +43,23 @@ public:
       return MemRefType::get({ShapedType::kDynamic}, type.getElementType());
     });
 
-    // Convert !simp.tensor<shape x T> to memref<shape x T>
+    // Convert !simp.tensor<shape x T> to memref<shape x T, strided<..., offset: ?>>
+    // Using dynamic offset allows tensor_from_array to work with runtime offsets
     addConversion([](simp::SimpTensorType type) -> std::optional<Type> {
-      return MemRefType::get(type.getShape(), type.getElementType());
+      auto shape = type.getShape();
+      auto elemType = type.getElementType();
+
+      // Build row-major strides
+      SmallVector<int64_t, 4> strides;
+      int64_t stride = 1;
+      for (int i = shape.size() - 1; i >= 0; --i) {
+        strides.insert(strides.begin(), stride);
+        stride *= shape[i];
+      }
+
+      // Create strided layout with dynamic offset to support tensor_from_array
+      auto layout = StridedLayoutAttr::get(type.getContext(), ShapedType::kDynamic, strides);
+      return MemRefType::get(shape, elemType, layout);
     });
 
     // Add source materialization: converts memref back to simp.array when needed
@@ -318,30 +332,39 @@ struct TensorFromArrayOpLowering : public OpConversionPattern<simp::TensorFromAr
       totalElements *= dim;
     }
 
-    // Create the target memref type with static shape
-    auto targetMemRefType = MemRefType::get(targetShape, elemType);
-
     // Convert offset from i64 to index type
-    Value offset = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), offsetI64);
+    Value offsetIdx = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), offsetI64);
 
-    // Build sizes for the target shape
-    SmallVector<Value, 4> sizes;
-    for (int64_t dim : targetShape) {
-      sizes.push_back(rewriter.create<arith::ConstantIndexOp>(loc, dim));
-    }
-
-    // Build strides for row-major layout
-    SmallVector<Value, 4> strides;
+    // Build static strides for row-major layout
+    SmallVector<int64_t, 4> staticStrides;
     int64_t stride = 1;
     for (int i = targetShape.size() - 1; i >= 0; --i) {
-      strides.insert(strides.begin(), rewriter.create<arith::ConstantIndexOp>(loc, stride));
+      staticStrides.insert(staticStrides.begin(), stride);
       stride *= targetShape[i];
     }
 
-    // Create reinterpret_cast with offset - this stores offset in descriptor field [2]
-    // The memref.load lowering should extract and use this offset
+    // Create strided layout with DYNAMIC offset (ShapedType::kDynamic) but static strides
+    // This is required when we have a runtime-provided offset value
+    auto stridedLayout = StridedLayoutAttr::get(
+        rewriter.getContext(), ShapedType::kDynamic, staticStrides);
+    auto targetMemRefType = MemRefType::get(targetShape, elemType, stridedLayout);
+
+    // For LLVM 21: use OpFoldResult-based builder with static sizes/strides
+    SmallVector<OpFoldResult, 4> ofr_sizes;
+    SmallVector<OpFoldResult, 4> ofr_strides;
+    for (int64_t dim : targetShape) {
+      ofr_sizes.push_back(rewriter.getI64IntegerAttr(dim));
+    }
+    for (int64_t s : staticStrides) {
+      ofr_strides.push_back(rewriter.getI64IntegerAttr(s));
+    }
+
+    // Create reinterpret_cast with dynamic offset but static sizes/strides
     rewriter.replaceOpWithNewOp<memref::ReinterpretCastOp>(
-        op, targetMemRefType, arrayMemref, offset, sizes, strides);
+        op, targetMemRefType, arrayMemref,
+        /*offset=*/OpFoldResult(offsetIdx),
+        /*sizes=*/ofr_sizes,
+        /*strides=*/ofr_strides);
 
     return success();
   }
@@ -2715,14 +2738,18 @@ struct TensorMatMulOpLowering : public OpConversionPattern<simp::TensorMatMulOp>
     int64_t lhsRank = lhsShape.size();
     int64_t rhsRank = rhsShape.size();
 
-    // Allocate result tensor
-    Value result = rewriter.create<memref::AllocOp>(loc, resultType);
+    // Create simple memref type for allocation (no strided layout)
+    // The type converter returns strided memref with dynamic offset, but memref.alloc
+    // needs simple type. We allocate with simple type then cast.
+    auto allocType = MemRefType::get(resultType.getShape(), resultType.getElementType());
+    Value allocResult = rewriter.create<memref::AllocOp>(loc, allocType);
+    Value result = rewriter.create<memref::CastOp>(loc, resultType, allocResult);
 
     // Initialize result to zero (linalg.matmul accumulates into the output)
     auto elemType = resultType.getElementType();
     Value zero = rewriter.create<arith::ConstantOp>(
         loc, elemType, rewriter.getZeroAttr(elemType));
-    rewriter.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{result});
+    rewriter.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{allocResult});
 
     if (lhsRank == 2 && rhsRank == 2) {
       // Case 1: Standard 2D matrix multiplication (GEMM)
@@ -2740,7 +2767,7 @@ struct TensorMatMulOpLowering : public OpConversionPattern<simp::TensorMatMulOp>
         Value lhsVal = rewriter.create<memref::LoadOp>(loc, lhs, ValueRange{c0, c0});
         Value rhsVal = rewriter.create<memref::LoadOp>(loc, rhs, ValueRange{c0, c0});
         Value product = rewriter.create<arith::MulFOp>(loc, lhsVal, rhsVal);
-        rewriter.create<memref::StoreOp>(loc, product, result, ValueRange{c0, c0});
+        rewriter.create<memref::StoreOp>(loc, product, allocResult, ValueRange{c0, c0});
       } else if (elemType.isInteger(8) || elemType.isInteger(16)) {
         // Special case: i8/i16 matmul returns i32 result to prevent overflow
         // i8×i8 or i16×i16 matmul produces results that typically exceed narrow type range
@@ -2792,9 +2819,10 @@ struct TensorMatMulOpLowering : public OpConversionPattern<simp::TensorMatMulOp>
         rewriter.create<linalg::MatmulOp>(
             loc, ValueRange{lhsWide, rhsWide}, ValueRange(resultWide));
 
-        // Return i32 result directly - NO truncation
+        // Return i32 result - cast to expected strided type
         // User gets i32 tensor instead of i8/i16 to avoid overflow
-        rewriter.replaceOp(op, resultWide);
+        Value resultWideCast = rewriter.create<memref::CastOp>(loc, resultType, resultWide);
+        rewriter.replaceOp(op, resultWideCast);
 
         // Clean up temporary input buffers (result is returned, don't dealloc)
         rewriter.create<memref::DeallocOp>(loc, lhsWide);
@@ -2803,7 +2831,7 @@ struct TensorMatMulOpLowering : public OpConversionPattern<simp::TensorMatMulOp>
       } else {
         // General 2D matmul: Use linalg.matmul for optimal performance
         rewriter.create<linalg::MatmulOp>(
-            loc, ValueRange{lhs, rhs}, ValueRange(result));
+            loc, ValueRange{lhs, rhs}, ValueRange(allocResult));
       }
 
     } else if (lhsRank == 3 && rhsRank == 3) {
@@ -2811,7 +2839,7 @@ struct TensorMatMulOpLowering : public OpConversionPattern<simp::TensorMatMulOp>
       // A: BxMxK, B: BxKxN → C: BxMxN
       // Use linalg.batch_matmul
       rewriter.create<linalg::BatchMatmulOp>(
-          loc, ValueRange{lhs, rhs}, ValueRange(result));
+          loc, ValueRange{lhs, rhs}, ValueRange(allocResult));
 
     } else if (lhsRank == 4 && rhsRank == 2) {
       // Case 3: 4D NHWC input with 2D weight matrix (fully connected layer)
@@ -2878,7 +2906,7 @@ struct TensorMatMulOpLowering : public OpConversionPattern<simp::TensorMatMulOp>
           loc, resultType, tempResult, resultReassoc);
 
       // Copy expanded result to final output
-      rewriter.create<memref::CopyOp>(loc, resultExpanded, result);
+      rewriter.create<memref::CopyOp>(loc, resultExpanded, allocResult);
 
     } else {
       return rewriter.notifyMatchFailure(op, "Unsupported tensor dimensions for matmul");
@@ -2941,6 +2969,139 @@ struct TensorDotOpLowering : public OpConversionPattern<simp::TensorDotOp> {
 
     // Replace with the final sum
     rewriter.replaceOp(op, loopResult.getResult(0));
+    return success();
+  }
+};
+
+// TensorMatMulNT: Matrix multiplication with pre-transposed B (No Transpose)
+// A[M,K] × B_T[N,K] → C[M,N]
+// K-innermost loop for VNNI optimization on INT8
+struct TensorMatMulNTOpLowering : public OpConversionPattern<simp::TensorMatMulNTOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      simp::TensorMatMulNTOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+
+    auto loc = op.getLoc();
+    auto lhs = adaptor.getLhs();      // A[M, K]
+    auto rhs = adaptor.getRhs();      // B_T[N, K] - already transposed!
+    auto lhsType = mlir::cast<MemRefType>(lhs.getType());
+    auto rhsType = mlir::cast<MemRefType>(rhs.getType());
+    auto resultType = mlir::cast<MemRefType>(getTypeConverter()->convertType(op.getType()));
+
+    auto lhsShape = lhsType.getShape();
+    auto rhsShape = rhsType.getShape();
+
+    // A[M, K] × B_T[N, K] → C[M, N]
+    int64_t M = lhsShape[0];
+    int64_t K = lhsShape[1];
+    int64_t N = rhsShape[0];
+
+    auto elemType = lhsType.getElementType();
+
+    // For INT8 matmul, result is i32
+    Type resultElemType = elemType;
+    if (elemType.isInteger(8)) {
+      resultElemType = rewriter.getI32Type();
+    }
+
+    // Create a simple memref type for allocation (no strided layout, offset=0)
+    // The type converter returns strided memref with dynamic offset, but we can't
+    // allocate with dynamic offset - we need static offset=0 for fresh allocations
+    SmallVector<int64_t, 2> resultShape = {M, N};
+    auto allocType = MemRefType::get(resultShape, resultElemType);
+
+    // Allocate result with simple type
+    Value allocResult = rewriter.create<memref::AllocOp>(loc, allocType);
+
+    // Cast to expected strided type with dynamic offset
+    // memref.cast can handle layout changes when shapes are compatible
+    Value result = rewriter.create<memref::CastOp>(loc, resultType, allocResult);
+
+    // INT8 path: i8 × i8 → i32, K-innermost loop (VNNI-friendly)
+    if (elemType.isInteger(8)) {
+      auto i32Type = rewriter.getIntegerType(32);
+
+      // Initialize result to zero (use allocResult - the actual memory)
+      Value zero32 = rewriter.create<arith::ConstantOp>(
+          loc, i32Type, rewriter.getZeroAttr(i32Type));
+      rewriter.create<linalg::FillOp>(loc, zero32, allocResult);
+
+      Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+      Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+      Value M_val = rewriter.create<arith::ConstantIndexOp>(loc, M);
+      Value N_val = rewriter.create<arith::ConstantIndexOp>(loc, N);
+      Value K_val = rewriter.create<arith::ConstantIndexOp>(loc, K);
+
+      // i-j-k matmul loop (K innermost for VNNI)
+      // NO TRANSPOSE - B_T is already [N, K] with K contiguous!
+      rewriter.create<scf::ForOp>(
+          loc, c0, M_val, c1, ValueRange{},
+          [&](OpBuilder &b1, Location loc, Value i, ValueRange) {
+            b1.create<scf::ForOp>(
+                loc, c0, N_val, c1, ValueRange{},
+                [&](OpBuilder &b2, Location loc, Value j, ValueRange) {
+                  Value acc = b2.create<arith::ConstantOp>(loc, i32Type, b2.getZeroAttr(i32Type));
+                  auto kLoop = b2.create<scf::ForOp>(
+                      loc, c0, K_val, c1, ValueRange{acc},
+                      [&](OpBuilder &b3, Location loc, Value k, ValueRange args) {
+                        Value accIn = args[0];
+                        // A[i, k] - row-major access
+                        Value aVal = b3.create<memref::LoadOp>(loc, lhs, ValueRange{i, k});
+                        // B_T[j, k] - already transposed, K is contiguous!
+                        Value bVal = b3.create<memref::LoadOp>(loc, rhs, ValueRange{j, k});
+                        Value aExt = b3.create<arith::ExtSIOp>(loc, i32Type, aVal);
+                        Value bExt = b3.create<arith::ExtSIOp>(loc, i32Type, bVal);
+                        Value prod = b3.create<arith::MulIOp>(loc, aExt, bExt);
+                        Value accOut = b3.create<arith::AddIOp>(loc, accIn, prod);
+                        b3.create<scf::YieldOp>(loc, ValueRange{accOut});
+                      });
+                  Value accResult = kLoop.getResult(0);
+                  b2.create<memref::StoreOp>(loc, accResult, allocResult, ValueRange{i, j});
+                  b2.create<scf::YieldOp>(loc);
+                });
+            b1.create<scf::YieldOp>(loc);
+          });
+
+    } else {
+      // Float path
+      Value zero = rewriter.create<arith::ConstantOp>(
+          loc, elemType, rewriter.getZeroAttr(elemType));
+      rewriter.create<linalg::FillOp>(loc, zero, allocResult);
+
+      Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+      Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+      Value M_val = rewriter.create<arith::ConstantIndexOp>(loc, M);
+      Value N_val = rewriter.create<arith::ConstantIndexOp>(loc, N);
+      Value K_val = rewriter.create<arith::ConstantIndexOp>(loc, K);
+
+      rewriter.create<scf::ForOp>(
+          loc, c0, M_val, c1, ValueRange{},
+          [&](OpBuilder &b1, Location loc, Value i, ValueRange) {
+            b1.create<scf::ForOp>(
+                loc, c0, N_val, c1, ValueRange{},
+                [&](OpBuilder &b2, Location loc, Value j, ValueRange) {
+                  Value acc = b2.create<arith::ConstantOp>(loc, elemType, b2.getZeroAttr(elemType));
+                  auto kLoop = b2.create<scf::ForOp>(
+                      loc, c0, K_val, c1, ValueRange{acc},
+                      [&](OpBuilder &b3, Location loc, Value k, ValueRange args) {
+                        Value accIn = args[0];
+                        Value aVal = b3.create<memref::LoadOp>(loc, lhs, ValueRange{i, k});
+                        Value bVal = b3.create<memref::LoadOp>(loc, rhs, ValueRange{j, k});
+                        Value prod = b3.create<arith::MulFOp>(loc, aVal, bVal);
+                        Value accOut = b3.create<arith::AddFOp>(loc, accIn, prod);
+                        b3.create<scf::YieldOp>(loc, ValueRange{accOut});
+                      });
+                  Value accResult = kLoop.getResult(0);
+                  b2.create<memref::StoreOp>(loc, accResult, allocResult, ValueRange{i, j});
+                  b2.create<scf::YieldOp>(loc);
+                });
+            b1.create<scf::YieldOp>(loc);
+          });
+    }
+
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
@@ -3214,6 +3375,7 @@ struct ConvertSimpToMemRefPass
         TensorGatherOpLowering,
         TensorScatterOpLowering,
         TensorMatMulOpLowering,
+        TensorMatMulNTOpLowering,
         TensorDotOpLowering
     >(typeConverter, &getContext());
 

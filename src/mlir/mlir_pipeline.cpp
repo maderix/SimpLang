@@ -23,7 +23,9 @@
 #include "mlir/Dialect/Affine/LoopUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Transforms/Passes.h"
+#include "mlir/Dialect/Arith/Transforms/BufferDeallocationOpInterfaceImpl.h"
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
+#include "mlir/Dialect/SCF/Transforms/BufferDeallocationOpInterfaceImpl.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"  // For LinalgTilingLoopType
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -105,6 +107,15 @@ bool MLIRCompilationPipeline::runPasses() {
   if (!module) {
     llvm::errs() << "Error: Cannot run passes on null module\n";
     return false;
+  }
+
+  // Register BufferDeallocationOpInterface external models for dialects
+  // This is required for ownership-based buffer deallocation pass
+  {
+    mlir::DialectRegistry registry;
+    mlir::arith::registerBufferDeallocationOpInterfaceExternalModels(registry);
+    mlir::scf::registerBufferDeallocationOpInterfaceExternalModels(registry);
+    module.getContext()->appendDialectRegistry(registry);
   }
 
   // Disable multi-threading if IR dumping is enabled (required by MLIR)
