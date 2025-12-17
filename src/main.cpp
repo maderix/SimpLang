@@ -30,6 +30,7 @@
 #include "mlir/ExecutionEngine/OptUtils.h"
 #include "mlir/PromoteLargeAllocaToHeap.h"
 #include "mlir/passes/VNNIPass.h"
+#include "mlir/passes/AnnotationRegistry.h"
 #include "ast/transforms/normalize_returns.hpp"
 #include <llvm/Transforms/Utils/LoopSimplify.h>
 #include <llvm/Transforms/Utils/LCSSA.h>
@@ -471,8 +472,25 @@ int main(int argc, char** argv) {
         llvmModule->setDataLayout(targetMachine->createDataLayout());
 
         // Run VNNI optimization pass BEFORE O3 to identify and transform i8 dot product loops
-        // Only run when --llvm-vectorize is enabled (for INT8/INT4 workloads)
-        if (llvmVectorize) {
+        // Triggered by:
+        //   1. Annotations with @lower("vnni.*") patterns (annotation-driven, preferred)
+        //   2. --llvm-vectorize flag (legacy fallback mode)
+        auto& annotRegistry = mlir::simp::AnnotationRegistry::instance();
+        bool hasVNNIAnnotations = false;
+        for (const auto& funcName : annotRegistry.getRegisteredFunctions()) {
+            if (annotRegistry.hasPatternWithPrefix(funcName, "vnni.")) {
+                hasVNNIAnnotations = true;
+                break;
+            }
+        }
+
+        if (hasVNNIAnnotations) {
+            LOG_INFO("VNNI annotations detected - enabling VNNI optimization pass");
+        } else if (llvmVectorize) {
+            LOG_INFO("Using LLVM vectorization + VNNI (legacy mode via --llvm-vectorize)");
+        }
+
+        if (hasVNNIAnnotations || llvmVectorize) {
             // Dump IR before VNNI pass
             {
                 std::error_code EC;

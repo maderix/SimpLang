@@ -60,6 +60,19 @@ public:
     func::FuncOp func = getOperation();
     MLIRContext *context = &getContext();
 
+    // Skip functions that have annotation-tiled ops - they manage their own tiling
+    bool hasAnnotationTiled = false;
+    func.walk([&](Operation *op) {
+      if (op->hasAttr("simp.annotation_tiled")) {
+        hasAnnotationTiled = true;
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+    if (hasAnnotationTiled) {
+      return;  // Function already has annotation-driven tiling
+    }
+
     // Determine loop type based on parallelization flag
     LinalgTilingLoopType loopType = options.parallelLoops
         ? LinalgTilingLoopType::ParallelLoops
@@ -79,6 +92,12 @@ public:
         // Skip if op is no longer valid (replaced by previous tiling)
         if (op->getParentOp() == nullptr)
           continue;
+
+        // Skip ops that have already been tiled by annotation-driven passes
+        // AnnotationLoweringPass sets simp.annotation_tiled for any backend (VNNI, ARM, GPU)
+        if (op->hasAttr("simp.annotation_tiled")) {
+          continue;
+        }
 
         rewriter.setInsertionPoint(op);
         FailureOr<TiledLinalgOp> tiledOp = tileLinalgOp(rewriter, op, tilingOptions);

@@ -45,6 +45,7 @@ class WhileAST;
 class ExpressionStmtAST;
 class FunctionAST;
 class TypeInfo;
+class AnnotatedBlockAST;
 
 namespace mlir {
 namespace simp {
@@ -178,6 +179,9 @@ public:
 
   /// Lower an expression statement
   mlir::LogicalResult lowerExpressionStmt(ExpressionStmtAST* exprStmt);
+
+  /// Lower an annotated block with VNNI/optimization annotations
+  mlir::LogicalResult lowerAnnotatedBlock(AnnotatedBlockAST* annotBlock);
 
   //===--------------------------------------------------------------------===//
   // Control Flow Helpers

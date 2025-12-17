@@ -2330,6 +2330,9 @@ mlir::LogicalResult MLIRCodeGenContext::lowerStatement(StmtAST* stmt) {
       llvm::errs() << "Warning: Statement kind not yet implemented in MLIR lowering\n";
       return mlir::success();
 
+    case ASTKind::AnnotatedBlockStmt:
+      return lowerAnnotatedBlock(static_cast<AnnotatedBlockAST*>(stmt));
+
     default:
       llvm::errs() << "Error: Unknown statement kind in MLIR lowering\n";
       return mlir::failure();
@@ -2610,6 +2613,100 @@ mlir::LogicalResult MLIRCodeGenContext::lowerExpressionStmt(ExpressionStmtAST* e
   // Just lower the expression (side effects will be captured)
   mlir::Value result = lowerExpression(exprStmt->getExpression());
   return result ? mlir::success() : mlir::failure();
+}
+
+mlir::LogicalResult MLIRCodeGenContext::lowerAnnotatedBlock(AnnotatedBlockAST* annotBlock) {
+  if (!annotBlock) {
+    return mlir::failure();
+  }
+
+  auto loc = getLocation(annotBlock->getLine(), annotBlock->getColumn());
+
+  LOG_DEBUG("Lowering annotated block with ", annotBlock->getAnnotations().size(), " annotations");
+
+  // Collect annotation metadata for later passes
+  // For now, we store them as named attributes that will be propagated
+  llvm::SmallVector<mlir::NamedAttribute, 4> annotAttrs;
+
+  for (const auto& annot : annotBlock->getAnnotations()) {
+    const std::string& name = annot->getName();
+    LOG_DEBUG("  Processing annotation: @", name);
+
+    if (name == "tile") {
+      // @tile(M, K, N) or @tile(M=64, K=64, N=64)
+      llvm::SmallVector<int64_t, 3> tileSizes;
+      auto sizes = annotBlock->getTileSizes();
+      for (auto s : sizes) {
+        tileSizes.push_back(s);
+      }
+      if (!tileSizes.empty()) {
+        annotAttrs.push_back(builder.getNamedAttr(
+            "simp.tile_sizes",
+            builder.getI64ArrayAttr(tileSizes)));
+        LOG_DEBUG("    Tile sizes: [", tileSizes[0], ", ",
+                  tileSizes.size() > 1 ? tileSizes[1] : 0, ", ",
+                  tileSizes.size() > 2 ? tileSizes[2] : 0, "]");
+      }
+    }
+    else if (name == "align") {
+      // @align(64)
+      int64_t alignment = annotBlock->getAlignment();
+      if (alignment > 0) {
+        annotAttrs.push_back(builder.getNamedAttr(
+            "simp.alignment",
+            builder.getI64IntegerAttr(alignment)));
+        LOG_DEBUG("    Alignment: ", alignment);
+      }
+    }
+    else if (name == "lower") {
+      // @lower("vnni.i8_matmul")
+      std::string pattern = annotBlock->getLowerPattern();
+      if (!pattern.empty()) {
+        annotAttrs.push_back(builder.getNamedAttr(
+            "simp.lower_pattern",
+            builder.getStringAttr(pattern)));
+        LOG_DEBUG("    Lower pattern: ", pattern);
+      }
+    }
+  }
+
+  // Lower the body of the annotated block
+  // The annotations will be attached to operations within via MLIR pass attributes
+  StmtAST* body = annotBlock->getBody();
+  if (!body) {
+    return mlir::success();  // Empty annotated block is valid
+  }
+
+  // Handle different body types
+  if (body->getKind() == ASTKind::BlockStmt) {
+    // It's a block with multiple statements
+    BlockAST* block = static_cast<BlockAST*>(body);
+    for (auto* stmt : block->statements) {
+      if (mlir::failed(lowerStatement(stmt))) {
+        return mlir::failure();
+      }
+    }
+  } else {
+    // It's a single statement
+    if (mlir::failed(lowerStatement(body))) {
+      return mlir::failure();
+    }
+  }
+
+  // Store annotation metadata on the current function for later passes
+  // This allows the VNNI pass to find annotated regions
+  if (currentFunction && !annotAttrs.empty()) {
+    // Create a unique attribute name for this annotated region
+    static int regionCounter = 0;
+    std::string attrName = "simp.annotated_region_" + std::to_string(regionCounter++);
+
+    // Combine all annotations into a dictionary attribute
+    currentFunction->setAttr(attrName, builder.getDictionaryAttr(annotAttrs));
+
+    LOG_DEBUG("  Attached annotations as attribute: ", attrName);
+  }
+
+  return mlir::success();
 }
 
 mlir::LogicalResult MLIRCodeGenContext::lowerIf(IfAST* ifStmt) {

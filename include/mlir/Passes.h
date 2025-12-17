@@ -50,6 +50,13 @@ void registerSimpLinalgTilingPass();
 /// Create a pass that inserts prefetch operations into tiled loops
 std::unique_ptr<Pass> createInsertPrefetchPass();
 
+/// Create a pass that processes annotation attributes and applies optimization patterns
+/// Patterns: vnni.i8_matmul, vnni.i8_dot_product, transpose_b, scalar
+std::unique_ptr<Pass> createAnnotationLoweringPass();
+
+/// Register the AnnotationLowering pass for command-line usage
+void registerAnnotationLoweringPass();
+
 /// Register all Simp dialect passes for command-line usage
 void registerSimpPasses();
 

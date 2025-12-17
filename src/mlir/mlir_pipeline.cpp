@@ -282,6 +282,10 @@ std::unique_ptr<llvm::Module> MLIRCompilationPipeline::translateToLLVMIR(
 void MLIRCompilationPipeline::buildPhase1_SimpLowering(mlir::OpPassManager& pm) {
   // Add our custom Simp → MemRef + Arith + Linalg lowering pass
   pm.addPass(mlir::simp::createConvertSimpToMemRefPass());
+
+  // Phase 1.5: Process annotation attributes (VNNI patterns)
+  // This reads simp.annotated_region_* attributes and applies optimization patterns
+  pm.addNestedPass<mlir::func::FuncOp>(mlir::simp::createAnnotationLoweringPass());
 }
 
 //===----------------------------------------------------------------------===//

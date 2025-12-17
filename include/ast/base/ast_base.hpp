@@ -35,7 +35,11 @@ enum class ASTKind {
     BlockStmt,
     IfStmt,
     WhileStmt,
-    IncludeStmt
+    IncludeStmt,
+
+    // Annotation kinds
+    AnnotationStmt,
+    AnnotatedBlockStmt
 };
 
 // Source location tracking for debug info

@@ -55,6 +55,7 @@ add_mlir_dialect_library(simp_dialect
   passes/Pipelines.cpp
   passes/InsertPrefetch.cpp
   passes/VNNIPass.cpp
+  passes/AnnotationLoweringPass.cpp
   PromoteLargeAllocaToHeap.cpp
 
   ADDITIONAL_HEADER_DIRS

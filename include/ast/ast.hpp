@@ -32,5 +32,6 @@
 #include "stmt/function_stmt.hpp"
 #include "stmt/return_stmt.hpp"
 #include "stmt/include_stmt.hpp"
+#include "stmt/annotation_stmt.hpp"
 
 #endif // AST_AST_HPP

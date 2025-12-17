@@ -50,6 +50,16 @@ void buildSimpLoweringPipeline(OpPassManager &pm) {
 }
 
 //===----------------------------------------------------------------------===//
+// Pipeline Builder: Annotation Processing (Phase 1.5)
+//===----------------------------------------------------------------------===//
+
+/// Build the annotation processing pipeline
+/// Processes simp.annotated_region_* attributes and applies VNNI patterns
+void buildAnnotationProcessingPipeline(OpPassManager &pm) {
+  pm.addNestedPass<func::FuncOp>(createAnnotationLoweringPass());
+}
+
+//===----------------------------------------------------------------------===//
 // Pipeline Builder: Linalg Optimization (Phase 2)
 //===----------------------------------------------------------------------===//
 
@@ -155,6 +165,9 @@ void registerSimpDefaultPipeline() {
       [](OpPassManager &pm) {
         // Phase 1: Simp lowering
         buildSimpLoweringPipeline(pm);
+
+        // Phase 1.5: Annotation processing (VNNI patterns)
+        buildAnnotationProcessingPipeline(pm);
 
         // Phase 2: Linalg optimization
         LinalgOptOptions opts;

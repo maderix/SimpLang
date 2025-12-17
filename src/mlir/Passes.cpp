@@ -20,8 +20,7 @@ void registerSimpPasses() {
 
   // Register optimization passes
   registerSimpLinalgTilingPass();
-
-  // Future passes will be registered here as needed
+  registerAnnotationLoweringPass();
 }
 
 } // namespace simp

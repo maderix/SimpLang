@@ -116,6 +116,8 @@ static int yycolumn = 1;
 "|"                   { return TOK_OR; }
 "^"                   { return TOK_XOR; }
 
+"@"                   { return TAT; }
+
 .                     { printf("Unknown token: %s\n", yytext); yyterminate(); }
 
 %%

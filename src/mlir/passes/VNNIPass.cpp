@@ -25,6 +25,7 @@
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "mlir/passes/AnnotationRegistry.h"
 
 using namespace llvm;
 
@@ -218,6 +219,23 @@ struct VNNIPass : public FunctionPass {
 
     VNNI_LOG("=== Starting VNNI pass on function: " << F.getName() << " ===");
     VNNI_BREAK("runOnFunction entry");
+
+    // Check if this function has annotation-guided VNNI optimization
+    std::string funcName = F.getName().str();
+    auto& annotRegistry = mlir::simp::AnnotationRegistry::instance();
+    bool guidedMode = annotRegistry.hasPatternWithPrefix(funcName, "vnni.");
+
+    if (guidedMode) {
+      auto info = annotRegistry.getInfo(funcName);
+      VNNI_LOG("GUIDED MODE: Function '" << funcName << "' has pattern '" << info.lowerPattern << "'");
+      if (!info.tileSizes.empty()) {
+        VNNI_LOG("  Tile sizes: [" << info.tileSizes[0]
+                 << (info.tileSizes.size() > 1 ? ", " + std::to_string(info.tileSizes[1]) : "")
+                 << (info.tileSizes.size() > 2 ? ", " + std::to_string(info.tileSizes[2]) : "") << "]");
+      }
+      // In guided mode, the loop structure is already correct from MLIR tiling
+      // We trust the structure and just need to emit vpdpbusd intrinsics
+    }
 
     // Collect all innermost loops (K loops in matmul)
     SmallVector<Loop*, 8> InnermostLoops;

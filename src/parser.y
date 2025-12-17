@@ -93,6 +93,10 @@
     SliceTypeAST *slice_type;
     TypeInfo *type_info;
     int token;
+    // Annotation support
+    AnnotationAST *annotation;
+    std::vector<AnnotationAST*> *annotvec;
+    AnnotatedBlockAST *annotated_block;
 }
 
 %token <string> TIDENTIFIER TINTEGER TFLOAT TINTLIT TSTRING
@@ -106,6 +110,7 @@
 %token TMAKE TARRAY TSSESLICE TAVXSLICE TLBRACKET TRBRACKET TMATMUL
 %token UNARY_MINUS  /* Add this token for unary minus */
 %token TOK_MOD TOK_AND TOK_OR TOK_XOR TOK_LSHIFT TOK_RSHIFT
+%token TAT  /* @ symbol for annotations */
 %token <string> IDENTIFIER
 %token <double> NUMBER
 %token SSE AVX
@@ -134,6 +139,9 @@
 %type <type_info> type_spec array_type tensor_type
 %type <expr> array_expr array_access
 %type <token> simd_option
+%type <annotation> annotation
+%type <annotvec> annotations
+%type <annotated_block> annotated_block
 
 %%
 
@@ -151,6 +159,7 @@ stmt : var_decl TSEMICOLON { $$ = $1; }
      | if_stmt
      | while_stmt
      | include_stmt
+     | annotated_block { $$ = $1; }
      ;
 
 expr : expr '+' expr   { $$ = new BinaryExprAST(static_cast<BinaryOp>('+'), makeUnique($1), makeUnique($3)); }
@@ -448,6 +457,57 @@ return_stmt : TRETURN expr TSEMICOLON { $$ = new ReturnAST($2); $$->setLocation(
 include_stmt : TINCLUDE TSTRING TSEMICOLON { $$ = new IncludeStmtAST(*$2); }
              | TIMPORT TSTRING TSEMICOLON { $$ = new IncludeStmtAST(*$2); }
              ;
+
+/* Block-scoped annotations: @tile(64, 64, 64) @lower("vnni.i8_matmul") { ... } */
+annotation : TAT TIDENTIFIER TLPAREN call_args TRPAREN {
+               $$ = new AnnotationAST(*$2);
+               for (auto* arg : *$4) {
+                   $$->addPositionalParam(arg);
+               }
+               delete $4;
+               delete $2;
+             }
+           | TAT TIDENTIFIER TLPAREN TSTRING TRPAREN {
+               $$ = new AnnotationAST(*$2);
+               // Remove quotes from string
+               std::string s = *$4;
+               if (s.size() >= 2 && s.front() == '"' && s.back() == '"') {
+                   s = s.substr(1, s.size() - 2);
+               }
+               $$->setStringParam(s);
+               delete $2;
+               delete $4;
+             }
+           | TAT TIDENTIFIER {
+               $$ = new AnnotationAST(*$2);
+               delete $2;
+             }
+           ;
+
+annotations : annotation {
+              $$ = new std::vector<AnnotationAST*>();
+              $$->push_back($1);
+            }
+            | annotations annotation {
+              $1->push_back($2);
+              $$ = $1;
+            }
+            ;
+
+/* Annotated block applies annotations to following block or statement */
+annotated_block : annotations block {
+                    $$ = new AnnotatedBlockAST($1, $2);
+                    $$->setLocation(@1.first_line);
+                  }
+                | annotations var_decl TSEMICOLON {
+                    $$ = new AnnotatedBlockAST($1, $2);
+                    $$->setLocation(@1.first_line);
+                  }
+                | annotations expr TSEMICOLON {
+                    $$ = new AnnotatedBlockAST($1, new ExpressionStmtAST($2));
+                    $$->setLocation(@1.first_line);
+                  }
+                ;
 
 call_args : /* empty */ { $$ = new std::vector<ExprAST*>(); }
           | expr { $$ = new std::vector<ExprAST*>(); $$->push_back($1); }
