@@ -1,6 +1,9 @@
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Add diagnostics library
+add_subdirectory(diagnostics)
+
 # Generate lexer and parser
 BISON_TARGET(Parser parser.y ${CMAKE_CURRENT_BINARY_DIR}/parser.cpp
              DEFINES_FILE ${CMAKE_CURRENT_BINARY_DIR}/parser.hpp)
@@ -84,7 +87,7 @@ if(TCMALLOC_FOUND)
     target_link_libraries(simplang ${TCMALLOC_LIBRARY})
 endif()
 
-target_link_libraries(simplang ${llvm_libs} simplang_runtime)
+target_link_libraries(simplang ${llvm_libs} simplang_runtime simplang_diagnostics)
 
 # Add MLIR support if enabled
 if(USE_MLIR)

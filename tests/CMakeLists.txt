@@ -597,3 +597,24 @@ endif()
 if(USE_MLIR)
     add_subdirectory(mlir)
 endif()
+# ============================================================================
+# Diagnostics Tests
+# ============================================================================
+
+add_executable(test_diagnostics
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_diagnostics.cpp
+)
+
+target_include_directories(test_diagnostics
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+)
+
+target_link_libraries(test_diagnostics
+    PRIVATE
+        simplang_diagnostics
+)
+
+target_compile_features(test_diagnostics PUBLIC cxx_std_17)
+
+add_test(NAME diagnostics_test COMMAND test_diagnostics)
