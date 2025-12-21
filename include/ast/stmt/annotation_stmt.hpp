@@ -154,6 +154,53 @@ public:
         }
         return "";
     }
+
+    // ========================================================================
+    // New annotation helpers for composable transforms
+    // ========================================================================
+
+    // Get unroll factor if @unroll annotation present
+    int64_t getUnrollFactor() const {
+        if (auto* unroll = findAnnotation("unroll")) {
+            return unroll->getIntParam(0);
+        }
+        return 0;
+    }
+
+    // Get vectorize width if @vectorize annotation present
+    int64_t getVectorizeWidth() const {
+        if (auto* vec = findAnnotation("vectorize")) {
+            return vec->getIntParam(0);
+        }
+        return 0;
+    }
+
+    // Get prefetch distance if @prefetch annotation present
+    int64_t getPrefetchDistance() const {
+        if (auto* pf = findAnnotation("prefetch")) {
+            return pf->getIntParam(0);
+        }
+        return 0;
+    }
+
+    // Check if @parallel annotation present
+    bool isParallel() const {
+        return hasAnnotation("parallel");
+    }
+
+    // Check if @fuse annotation present
+    bool shouldFuse() const {
+        return hasAnnotation("fuse");
+    }
+
+    // Get all annotation names in order (for composability)
+    std::vector<std::string> getAnnotationOrder() const {
+        std::vector<std::string> order;
+        for (const auto& a : annotations) {
+            order.push_back(a->getName());
+        }
+        return order;
+    }
 };
 
 #endif // AST_STMT_ANNOTATION_STMT_HPP

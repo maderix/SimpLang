@@ -73,8 +73,14 @@ public:
       return;  // Function already has annotation-driven tiling
     }
 
-    // Determine loop type based on parallelization flag
-    LinalgTilingLoopType loopType = options.parallelLoops
+    // Determine loop type based on parallelization flag OR @parallel annotation
+    bool useParallel = options.parallelLoops;
+    if (func->hasAttr("simp.parallel")) {
+      useParallel = true;
+      llvm::outs() << "[Parallel] Using parallel loops for " << func.getName()
+                   << " (@parallel annotation)\n";
+    }
+    LinalgTilingLoopType loopType = useParallel
         ? LinalgTilingLoopType::ParallelLoops
         : LinalgTilingLoopType::Loops;
 

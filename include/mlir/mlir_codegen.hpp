@@ -42,6 +42,7 @@ class VariableDeclarationAST;
 class ReturnAST;
 class IfAST;
 class WhileAST;
+class ForAST;
 class ExpressionStmtAST;
 class FunctionAST;
 class TypeInfo;
@@ -176,6 +177,9 @@ public:
 
   /// Lower a while loop
   mlir::LogicalResult lowerWhile(WhileAST* whileLoop);
+
+  /// Lower a for loop (generates scf.for directly)
+  mlir::LogicalResult lowerFor(ForAST* forLoop);
 
   /// Lower an expression statement
   mlir::LogicalResult lowerExpressionStmt(ExpressionStmtAST* exprStmt);

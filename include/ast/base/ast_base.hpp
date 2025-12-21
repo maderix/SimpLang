@@ -35,6 +35,7 @@ enum class ASTKind {
     BlockStmt,
     IfStmt,
     WhileStmt,
+    ForStmt,
     IncludeStmt,
 
     // Annotation kinds

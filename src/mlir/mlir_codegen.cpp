@@ -2319,6 +2319,9 @@ mlir::LogicalResult MLIRCodeGenContext::lowerStatement(StmtAST* stmt) {
     case ASTKind::WhileStmt:
       return lowerWhile(static_cast<WhileAST*>(stmt));
 
+    case ASTKind::ForStmt:
+      return lowerFor(static_cast<ForAST*>(stmt));
+
     case ASTKind::FunctionDecl:
       // Functions are handled at top level, not as statements
       llvm::errs() << "Warning: Function declarations should be lowered at module level\n";
@@ -2668,6 +2671,64 @@ mlir::LogicalResult MLIRCodeGenContext::lowerAnnotatedBlock(AnnotatedBlockAST* a
         LOG_DEBUG("    Lower pattern: ", pattern);
       }
     }
+    // ================================================================
+    // New annotation support for composable transforms
+    // ================================================================
+    else if (name == "unroll") {
+      // @unroll(4) - loop unrolling factor
+      int64_t unrollFactor = annotBlock->getUnrollFactor();
+      if (unrollFactor > 0) {
+        annotAttrs.push_back(builder.getNamedAttr(
+            "simp.unroll_factor",
+            builder.getI64IntegerAttr(unrollFactor)));
+        LOG_DEBUG("    Unroll factor: ", unrollFactor);
+      }
+    }
+    else if (name == "vectorize") {
+      // @vectorize(256) - force SIMD width
+      int64_t vectorizeWidth = annotBlock->getVectorizeWidth();
+      if (vectorizeWidth > 0) {
+        annotAttrs.push_back(builder.getNamedAttr(
+            "simp.vectorize_width",
+            builder.getI64IntegerAttr(vectorizeWidth)));
+        LOG_DEBUG("    Vectorize width: ", vectorizeWidth);
+      }
+    }
+    else if (name == "prefetch") {
+      // @prefetch(8) - prefetch distance
+      int64_t prefetchDistance = annotBlock->getPrefetchDistance();
+      if (prefetchDistance > 0) {
+        annotAttrs.push_back(builder.getNamedAttr(
+            "simp.prefetch_distance",
+            builder.getI64IntegerAttr(prefetchDistance)));
+        LOG_DEBUG("    Prefetch distance: ", prefetchDistance);
+      }
+    }
+    else if (name == "parallel") {
+      // @parallel - enable outer loop parallelization
+      annotAttrs.push_back(builder.getNamedAttr(
+          "simp.parallel",
+          builder.getUnitAttr()));
+      LOG_DEBUG("    Parallel: enabled");
+    }
+    else if (name == "fuse") {
+      // @fuse - enable loop fusion
+      annotAttrs.push_back(builder.getNamedAttr(
+          "simp.fuse",
+          builder.getUnitAttr()));
+      LOG_DEBUG("    Fuse: enabled");
+    }
+  }
+
+  // Store the order of annotations for composable transform ordering
+  llvm::SmallVector<mlir::Attribute, 8> orderAttrs;
+  for (const auto& annot : annotBlock->getAnnotations()) {
+    orderAttrs.push_back(builder.getStringAttr(annot->getName()));
+  }
+  if (!orderAttrs.empty()) {
+    annotAttrs.push_back(builder.getNamedAttr(
+        "simp.transform_order",
+        builder.getArrayAttr(orderAttrs)));
   }
 
   // Lower the body of the annotated block
@@ -3064,6 +3125,168 @@ mlir::LogicalResult MLIRCodeGenContext::lowerWhile(WhileAST* whileLoop) {
   return mlir::success();
 }
 
+mlir::LogicalResult MLIRCodeGenContext::lowerFor(ForAST* forLoop) {
+  auto loc = getLocation(forLoop->getLine(), forLoop->getColumn());
+
+  // Push a new scope for the loop variable
+  pushScope();
+
+  // Lower the init declaration (var i = 0i)
+  if (failed(lowerDeclaration(forLoop->getInit()))) {
+    popScope();
+    return mlir::failure();
+  }
+
+  // Get the loop variable
+  std::string loopVarName = forLoop->getInit()->getName();
+  mlir::Value loopVarInit = lookupVariable(loopVarName);
+
+  if (!loopVarInit) {
+    llvm::errs() << "Error: Loop variable not found after init\n";
+    popScope();
+    return mlir::failure();
+  }
+
+  // Analyze the condition to extract upper bound
+  // Expecting pattern: i < N (BinaryExpr with OpLT)
+  ExprAST* condition = forLoop->getCondition();
+  mlir::Value upperBound;
+
+  if (condition->getKind() == ASTKind::BinaryExpr) {
+    auto* binExpr = static_cast<BinaryExprAST*>(condition);
+    if (binExpr->getOp() == BinaryOp::OpLT) {
+      // RHS is the upper bound
+      upperBound = lowerExpression(binExpr->getRight());
+    }
+  }
+
+  if (!upperBound) {
+    llvm::errs() << "Error: Could not extract upper bound from for condition\n";
+    popScope();
+    return mlir::failure();
+  }
+
+  // Create step value (1)
+  mlir::Value step;
+  if (loopVarInit.getType().isIndex()) {
+    step = builder.create<mlir::arith::ConstantIndexOp>(loc, 1);
+  } else if (loopVarInit.getType().isInteger(64)) {
+    step = builder.create<mlir::arith::ConstantIntOp>(loc, 1, 64);
+  } else {
+    step = builder.create<mlir::arith::ConstantIntOp>(loc, 1, 32);
+  }
+
+  // Convert bounds to index type for scf.for
+  mlir::Type indexType = builder.getIndexType();
+  mlir::Value lb, ub, stepIdx;
+
+  if (loopVarInit.getType() != indexType) {
+    lb = builder.create<mlir::arith::IndexCastOp>(loc, indexType, loopVarInit);
+  } else {
+    lb = loopVarInit;
+  }
+
+  if (upperBound.getType() != indexType) {
+    ub = builder.create<mlir::arith::IndexCastOp>(loc, indexType, upperBound);
+  } else {
+    ub = upperBound;
+  }
+
+  if (step.getType() != indexType) {
+    stepIdx = builder.create<mlir::arith::IndexCastOp>(loc, indexType, step);
+  } else {
+    stepIdx = step;
+  }
+
+  // Track variables modified in the loop body (excluding the loop variable itself)
+  auto existingVars = getCurrentVariableNames();
+  auto modifiedVars = trackModifiedVariables(forLoop->getBody(), existingVars);
+  modifiedVars.erase(loopVarName);  // Loop var is handled by scf.for
+
+  // Collect initial values of loop-carried variables
+  std::vector<mlir::Value> initArgs = collectVariableValues(modifiedVars);
+  llvm::SmallVector<mlir::Type> iterArgTypes;
+  for (auto& val : initArgs) {
+    iterArgTypes.push_back(val.getType());
+  }
+
+  // Create scf.for operation
+  auto forOp = builder.create<mlir::scf::ForOp>(loc, lb, ub, stepIdx, initArgs);
+
+  // Mark for parallelization if function has @parallel annotation
+  if (currentFunction && currentFunction->hasAttr("simp.parallel")) {
+    forOp->setAttr("simp.parallel_loop", builder.getUnitAttr());
+    forOp->setAttr("simp.parallel_dim", builder.getI64IntegerAttr(0));
+    currentFunction->setAttr("simp.needs_openmp", builder.getUnitAttr());
+    llvm::errs() << "[ForLoop] Marked for parallelization\n";
+  }
+
+  // Build the loop body
+  {
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    mlir::Block* bodyBlock = forOp.getBody();
+    builder.setInsertionPointToStart(bodyBlock);
+
+    // Push scope for loop body
+    pushScope();
+
+    // The loop induction variable (index type)
+    mlir::Value iv = forOp.getInductionVar();
+
+    // Convert back to original type if needed
+    if (loopVarInit.getType() != indexType) {
+      iv = builder.create<mlir::arith::IndexCastOp>(loc, loopVarInit.getType(), iv);
+    }
+
+    // Register the loop variable in symbol table
+    declareVariable(loopVarName, iv);
+
+    // Map iter_args to variables
+    auto regionIterArgs = forOp.getRegionIterArgs();
+    size_t i = 0;
+    for (const auto& varName : modifiedVars) {
+      declareVariable(varName, regionIterArgs[i]);
+      i++;
+    }
+
+    // Lower the loop body
+    BlockAST* body = forLoop->getBody();
+    if (body) {
+      for (auto* stmt : body->statements) {
+        if (failed(lowerStatement(stmt))) {
+          popScope();
+          popScope();
+          return mlir::failure();
+        }
+      }
+    }
+
+    // Collect yield values
+    llvm::SmallVector<mlir::Value> yieldVals;
+    for (const auto& varName : modifiedVars) {
+      mlir::Value val = lookupVariable(varName);
+      yieldVals.push_back(val);
+    }
+
+    // Create yield if not already terminated
+    if (bodyBlock->empty() || !bodyBlock->back().hasTrait<mlir::OpTrait::IsTerminator>()) {
+      builder.create<mlir::scf::YieldOp>(loc, yieldVals);
+    }
+
+    popScope();
+  }
+
+  // Pop the loop variable scope first, returning to parent scope
+  popScope();
+
+  // Now update symbol table with loop results in the parent scope
+  if (!modifiedVars.empty()) {
+    updateSymbolTableWithResults(modifiedVars, forOp.getResults());
+  }
+
+  return mlir::success();
+}
+
 //===----------------------------------------------------------------------===//
 // Control Flow Helpers
 //===----------------------------------------------------------------------===//
@@ -3158,6 +3381,25 @@ std::set<std::string> MLIRCodeGenContext::trackModifiedVariables(
         auto* whileStmt = static_cast<WhileAST*>(stmt);
         auto bodyVars = trackModifiedVariables(whileStmt->getBody(), existingVars);
         modifiedVars.insert(bodyVars.begin(), bodyVars.end());
+        break;
+      }
+
+      case ASTKind::ForStmt: {
+        // For loops have their own scope - the loop variable is local
+        auto* forStmt = static_cast<ForAST*>(stmt);
+        auto bodyVars = trackModifiedVariables(forStmt->getBody(), existingVars);
+        modifiedVars.insert(bodyVars.begin(), bodyVars.end());
+        break;
+      }
+
+      case ASTKind::AnnotatedBlockStmt: {
+        // Track modified vars in annotated blocks (@parallel, @tile, etc.)
+        auto* annotBlock = static_cast<AnnotatedBlockAST*>(stmt);
+        StmtAST* body = annotBlock->getBody();
+        if (body && body->getKind() == ASTKind::BlockStmt) {
+          auto bodyVars = trackModifiedVariables(static_cast<BlockAST*>(body), existingVars);
+          modifiedVars.insert(bodyVars.begin(), bodyVars.end());
+        }
         break;
       }
 

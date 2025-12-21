@@ -1,4 +1,6 @@
 #include "ast/stmt/control_flow_stmt.hpp"
+#include "ast/expr/variable_expr.hpp"
+#include "ast/stmt/declaration_stmt.hpp"
 #include "logger.hpp"
 #include "codegen.hpp"
 #include <llvm/IR/Value.h>
@@ -142,6 +144,80 @@ llvm::Value* WhileAST::codeGen(CodeGenContext& context) {
 
     // Move to after block
     context.getBuilder().SetInsertPoint(afterBB);
+
+    return llvm::ConstantFP::get(context.getContext(), llvm::APFloat(0.0));
+}
+
+// ForAST implementation
+llvm::Value* ForAST::codeGen(CodeGenContext& context) {
+    llvm::Function* function = context.getBuilder().GetInsertBlock()->getParent();
+
+    // Push a new scope for the loop variable
+    context.pushBlock();
+
+    // Execute init (var i = 0)
+    llvm::Value* initVal = init->codeGen(context);
+    if (!initVal)
+        return nullptr;
+
+    // Create blocks for the loop
+    llvm::BasicBlock* condBB = llvm::BasicBlock::Create(context.getContext(), "for.cond", function);
+    llvm::BasicBlock* loopBB = llvm::BasicBlock::Create(context.getContext(), "for.body", function);
+    llvm::BasicBlock* updateBB = llvm::BasicBlock::Create(context.getContext(), "for.update", function);
+    llvm::BasicBlock* afterBB = llvm::BasicBlock::Create(context.getContext(), "for.end", function);
+
+    // Branch to condition block
+    context.getBuilder().CreateBr(condBB);
+
+    // Emit condition block
+    context.getBuilder().SetInsertPoint(condBB);
+    llvm::Value* condValue = condition->codeGen(context);
+    if (!condValue)
+        return nullptr;
+
+    // Convert condition to bool if needed
+    if (condValue->getType()->isDoubleTy()) {
+        condValue = context.getBuilder().CreateFCmpONE(
+            condValue,
+            llvm::ConstantFP::get(context.getContext(), llvm::APFloat(0.0)),
+            "forcond"
+        );
+    }
+
+    // Create conditional branch
+    context.getBuilder().CreateCondBr(condValue, loopBB, afterBB);
+
+    // Emit loop body
+    context.getBuilder().SetInsertPoint(loopBB);
+    llvm::Value* bodyVal = body->codeGen(context);
+    if (!bodyVal)
+        return nullptr;
+
+    // Branch to update block if no terminator
+    if (!context.getBuilder().GetInsertBlock()->getTerminator()) {
+        context.getBuilder().CreateBr(updateBB);
+    }
+
+    // Emit update block (i = i + 1)
+    context.getBuilder().SetInsertPoint(updateBB);
+    llvm::Value* updateVal = updateExpr->codeGen(context);
+    if (!updateVal)
+        return nullptr;
+
+    // Store the updated value back to the loop variable
+    llvm::Value* varPtr = context.getSymbolValue(updateVar->getName());
+    if (varPtr) {
+        context.getBuilder().CreateStore(updateVal, varPtr);
+    }
+
+    // Branch back to condition
+    context.getBuilder().CreateBr(condBB);
+
+    // Move to after block
+    context.getBuilder().SetInsertPoint(afterBB);
+
+    // Pop the loop scope
+    context.popBlock();
 
     return llvm::ConstantFP::get(context.getContext(), llvm::APFloat(0.0));
 }

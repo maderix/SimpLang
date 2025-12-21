@@ -50,12 +50,29 @@ void registerSimpLinalgTilingPass();
 /// Create a pass that inserts prefetch operations into tiled loops
 std::unique_ptr<Pass> createInsertPrefetchPass();
 
+/// Create a pass that applies loop unrolling based on @unroll annotations
+std::unique_ptr<Pass> createAnnotationUnrollPass();
+
 /// Create a pass that processes annotation attributes and applies optimization patterns
 /// Patterns: vnni.i8_matmul, vnni.i8_dot_product, transpose_b, scalar
 std::unique_ptr<Pass> createAnnotationLoweringPass();
 
 /// Register the AnnotationLowering pass for command-line usage
 void registerAnnotationLoweringPass();
+
+/// Create a pass that analyzes loop dependencies and marks parallelization opportunities
+/// Produces metadata: simp.loop_type, simp.reduction_op, simp.loop_depth
+std::unique_ptr<Pass> createLoopDependencyAnalyzerPass();
+
+/// Register the LoopDependencyAnalyzer pass for command-line usage
+void registerLoopDependencyAnalyzerPass();
+
+/// Create a late-stage pass that converts marked loops to OpenMP
+/// This runs AFTER buffer management to avoid ops inside omp.wsloop
+std::unique_ptr<Pass> createConvertMarkedLoopsToOpenMPPass();
+
+/// Register the ConvertMarkedLoopsToOpenMP pass for command-line usage
+void registerConvertMarkedLoopsToOpenMPPass();
 
 /// Register all Simp dialect passes for command-line usage
 void registerSimpPasses();

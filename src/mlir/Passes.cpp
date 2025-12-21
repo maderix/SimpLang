@@ -21,6 +21,7 @@ void registerSimpPasses() {
   // Register optimization passes
   registerSimpLinalgTilingPass();
   registerAnnotationLoweringPass();
+  registerConvertMarkedLoopsToOpenMPPass();
 }
 
 } // namespace simp

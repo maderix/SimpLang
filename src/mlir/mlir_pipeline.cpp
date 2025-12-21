@@ -193,6 +193,29 @@ bool MLIRCompilationPipeline::runPasses() {
     }
   }
 
+  // Phase 2.6: Late-stage OpenMP conversion
+  // This runs AFTER buffer management so that deallocation ops don't end up
+  // inside omp.wsloop (which requires exactly one nested op - omp.loop_nest)
+  {
+    mlir::PassManager pm(module.getContext());
+    if (dumpIntermediateIR) pm.enableIRPrinting();
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::simp::createConvertMarkedLoopsToOpenMPPass());
+    if (!enableDebugInfo) pm.addPass(mlir::createCanonicalizerPass());
+
+    if (failed(pm.run(module))) {
+      llvm::errs() << "Error: Phase 2.6 (Late-stage OpenMP) failed\n";
+      module.dump();
+      return false;
+    }
+
+    // Check if any function uses OpenMP and enable translation
+    module.walk([&](mlir::func::FuncOp func) {
+      if (func->hasAttr("simp.uses_openmp")) {
+        enableOpenMP = true;
+      }
+    });
+  }
+
   // Phase 3: Lower to LLVM dialect (vector, control flow, arithmetic)
   {
     mlir::PassManager pm(module.getContext());
@@ -283,8 +306,14 @@ void MLIRCompilationPipeline::buildPhase1_SimpLowering(mlir::OpPassManager& pm) 
   // Add our custom Simp → MemRef + Arith + Linalg lowering pass
   pm.addPass(mlir::simp::createConvertSimpToMemRefPass());
 
-  // Phase 1.5: Process annotation attributes (VNNI patterns)
+  // Phase 1.3: Analyze loop dependencies for parallelization
+  // Marks linalg ops with iterator types (parallel/reduction) and
+  // scf loops with dependency info for @parallel annotation
+  pm.addNestedPass<mlir::func::FuncOp>(mlir::simp::createLoopDependencyAnalyzerPass());
+
+  // Phase 1.5: Process annotation attributes (@tile, @parallel, @lower, etc.)
   // This reads simp.annotated_region_* attributes and applies optimization patterns
+  // Uses dependency metadata from LoopDependencyAnalyzer to parallelize safely
   pm.addNestedPass<mlir::func::FuncOp>(mlir::simp::createAnnotationLoweringPass());
 }
 
@@ -386,9 +415,10 @@ void MLIRCompilationPipeline::buildPhase2_LinalgOptimization(mlir::OpPassManager
     }
   }
 
-  // PARALLELIZATION: Convert scf.parallel to OpenMP if enabled
+  // PARALLELIZATION: Convert any remaining scf.parallel to OpenMP
+  // Only run if enableOpenMP is already set (by Phase 2.6 late-stage conversion)
   if (enableOpenMP) {
-    llvm::outs() << "[OpenMP] Converting scf.parallel to omp.parallel\n";
+    llvm::errs() << "[OpenMP] Converting scf.parallel to omp.parallel\n";
     pm.addPass(mlir::createConvertSCFToOpenMPPass());
     if (!enableDebugInfo) pm.addPass(mlir::createCanonicalizerPass());
   }
@@ -430,8 +460,8 @@ void MLIRCompilationPipeline::buildPhase2_LinalgOptimization(mlir::OpPassManager
     // Apply loop invariant code motion to hoist invariant operations
     pm.addNestedPass<mlir::func::FuncOp>(mlir::createLoopInvariantCodeMotionPass());
 
-    // Apply loop unrolling for better ILP
-    pm.addNestedPass<mlir::func::FuncOp>(mlir::affine::createLoopUnrollPass(/*unrollFactor=*/4));
+    // Apply annotation-aware loop unrolling (reads @unroll(N) attribute)
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::simp::createAnnotationUnrollPass());
   }
 }
 

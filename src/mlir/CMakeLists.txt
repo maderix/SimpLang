@@ -56,6 +56,9 @@ add_mlir_dialect_library(simp_dialect
   passes/InsertPrefetch.cpp
   passes/VNNIPass.cpp
   passes/AnnotationLoweringPass.cpp
+  passes/AnnotationUnrollPass.cpp
+  passes/LoopDependencyAnalyzer.cpp
+  passes/ConvertMarkedLoopsToOpenMP.cpp
   PromoteLargeAllocaToHeap.cpp
 
   ADDITIONAL_HEADER_DIRS

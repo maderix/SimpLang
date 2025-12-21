@@ -40,6 +40,14 @@ public:
     func::FuncOp func = getOperation();
     OpBuilder builder(func.getContext());
 
+    // Read prefetch distance from annotation attribute (default: 2)
+    int64_t prefetchDistance = 2;
+    if (auto distAttr = func->getAttrOfType<IntegerAttr>("simp.prefetch_distance")) {
+      prefetchDistance = distAttr.getInt();
+      llvm::outs() << "[Prefetch] Using annotation distance=" << prefetchDistance
+                   << " for " << func.getName() << "\n";
+    }
+
     // Walk all scf.for loops
     func.walk([&](scf::ForOp forOp) {
       Block *body = forOp.getBody();
@@ -151,20 +159,17 @@ public:
             OpFoldResult firstOffset = subviewOffsets[0];
             if (auto firstOffsetVal = mlir::dyn_cast<Value>(firstOffset)) {
               if (firstOffsetVal == iv) {
-                // Deep prefetch: prefetch 2 iterations ahead for better latency hiding
-                // Iteration i+1
-                Value nextIV1 = builder.create<AddIOp>(loc, iv, step);
-                SmallVector<Value, 2> prefetchIdx1 = {nextIV1, builder.create<arith::ConstantIndexOp>(loc, 0)};
-                builder.create<memref::PrefetchOp>(
-                    loc, subviewOp.getSource(), prefetchIdx1,
-                    /*isWrite=*/false, /*localityHint=*/localityHint, /*isDataCache=*/true);
-
-                // Iteration i+2
-                Value nextIV2 = builder.create<AddIOp>(loc, nextIV1, step);
-                SmallVector<Value, 2> prefetchIdx2 = {nextIV2, builder.create<arith::ConstantIndexOp>(loc, 0)};
-                builder.create<memref::PrefetchOp>(
-                    loc, subviewOp.getSource(), prefetchIdx2,
-                    /*isWrite=*/false, /*localityHint=*/localityHint, /*isDataCache=*/true);
+                // Deep prefetch: prefetch N iterations ahead based on annotation
+                // Generate prefetch for iterations i+1 through i+prefetchDistance
+                Value currentIV = iv;
+                for (int64_t d = 1; d <= prefetchDistance; ++d) {
+                  Value nextIV = builder.create<AddIOp>(loc, currentIV, step);
+                  SmallVector<Value, 2> prefetchIdx = {nextIV, builder.create<arith::ConstantIndexOp>(loc, 0)};
+                  builder.create<memref::PrefetchOp>(
+                      loc, subviewOp.getSource(), prefetchIdx,
+                      /*isWrite=*/false, /*localityHint=*/localityHint, /*isDataCache=*/true);
+                  currentIV = nextIV;
+                }
               }
             }
 

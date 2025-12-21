@@ -101,7 +101,7 @@
 
 %token <string> TIDENTIFIER TINTEGER TFLOAT TINTLIT TSTRING
 %token TCEQ TCNE TCLE TCGE TARROW
-%token TVAR TFUNC TIF TELSE TWHILE TRETURN TINCLUDE TIMPORT TAS
+%token TVAR TFUNC TIF TELSE TWHILE TFOR TRETURN TINCLUDE TIMPORT TAS
 %token TF16 TBF16 TF32 TF64 TI8 TI16 TI32 TI64 TU8 TU16 TU32 TU64 TBOOL TVOID
 %token TSSE TAVX    /* Vector creation tokens */
 %token TSIMD TAUTO TAVX512 TNEON TSVE
@@ -128,7 +128,7 @@
 %left TAS  /* Type cast operator */
 
 %type <block> program stmts block
-%type <stmt> stmt func_decl if_stmt while_stmt return_stmt include_stmt
+%type <stmt> stmt func_decl if_stmt while_stmt for_stmt return_stmt include_stmt
 %type <expr> expr numeric slice_expr call_expr vector_expr matmul_expr
 %type <var_expr> ident
 %type <exprvec> call_args expr_list multi_index
@@ -158,6 +158,7 @@ stmt : var_decl TSEMICOLON { $$ = $1; }
      | return_stmt
      | if_stmt
      | while_stmt
+     | for_stmt
      | include_stmt
      | annotated_block { $$ = $1; }
      ;
@@ -450,6 +451,13 @@ if_stmt : TIF TLPAREN expr TRPAREN block { $$ = new IfAST($3, $5, nullptr); $$->
 
 while_stmt : TWHILE TLPAREN expr TRPAREN block { $$ = new WhileAST($3, $5); $$->setLocation(@$.first_line); }
            ;
+
+/* For loop: for (var i = 0i; i < N; i = i + 1i) { body } */
+for_stmt : TFOR TLPAREN var_decl TSEMICOLON expr TSEMICOLON ident '=' expr TRPAREN block {
+             $$ = new ForAST($3, $5, $7, $9, $11);
+             $$->setLocation(@$.first_line);
+           }
+         ;
 
 return_stmt : TRETURN expr TSEMICOLON { $$ = new ReturnAST($2); $$->setLocation(@$.first_line); }
             ;

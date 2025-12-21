@@ -41,6 +41,7 @@ static int yycolumn = 1;
 "if"                  { return TIF; }
 "else"                { return TELSE; }
 "while"               { return TWHILE; }
+"for"                 { return TFOR; }
 "var"                 { return TVAR; }
 "make"                { return TMAKE; }
 "array"               { return TARRAY; }

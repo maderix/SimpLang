@@ -25,17 +25,50 @@ namespace simp {
 
 /// Backend-agnostic annotation information for a function
 struct AnnotationInfo {
+  // Core annotations
   std::string lowerPattern;        // e.g., "vnni.i8_matmul", "cuda.tensor_core"
   std::vector<int64_t> tileSizes;  // Tile sizes from @tile annotation
   int64_t alignment = 0;           // Memory alignment from @align annotation
 
+  // Loop optimization annotations
+  int64_t unrollFactor = 0;        // @unroll(N) - loop unrolling factor
+  int64_t vectorizeWidth = 0;      // @vectorize(width) - force SIMD width
+  int64_t prefetchDistance = 0;    // @prefetch(N) - prefetch distance in iterations
+
+  // Parallel/fusion annotations
+  bool parallel = false;           // @parallel - enable outer loop parallelization
+  bool fuse = false;               // @fuse - enable loop fusion
+
+  // Transform ordering (for composability)
+  std::vector<std::string> transformOrder;  // Order of applied transforms
+
+  // Core checkers
   bool hasPattern() const { return !lowerPattern.empty(); }
   bool hasTileSizes() const { return !tileSizes.empty(); }
   bool hasAlignment() const { return alignment > 0; }
 
+  // New annotation checkers
+  bool hasUnroll() const { return unrollFactor > 0; }
+  bool hasVectorize() const { return vectorizeWidth > 0; }
+  bool hasPrefetch() const { return prefetchDistance > 0; }
+  bool hasParallel() const { return parallel; }
+  bool hasFuse() const { return fuse; }
+
+  /// Check if any optimization is specified
+  bool hasAnyOptimization() const {
+    return hasPattern() || hasTileSizes() || hasAlignment() ||
+           hasUnroll() || hasVectorize() || hasPrefetch() ||
+           hasParallel() || hasFuse();
+  }
+
   /// Check if pattern starts with a given prefix (for backend filtering)
   bool patternStartsWith(const std::string& prefix) const {
     return lowerPattern.compare(0, prefix.size(), prefix) == 0;
+  }
+
+  /// Add a transform to the ordering (for composability)
+  void addTransform(const std::string& name) {
+    transformOrder.push_back(name);
   }
 };
 

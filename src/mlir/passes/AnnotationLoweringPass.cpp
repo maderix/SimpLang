@@ -6,6 +6,18 @@
 // applies appropriate transformations. Uses simp::AnnotationInfo from
 // AnnotationRegistry.h as the single source of truth for annotation data.
 //
+// Supported annotations:
+//   @tile(M, K, N)      - Tile sizes for matrix operations
+//   @lower("pattern")   - Lowering pattern (e.g., "vnni.i8_matmul")
+//   @align(N)           - Memory alignment
+//   @unroll(N)          - Loop unrolling factor
+//   @vectorize(width)   - Force SIMD width (128, 256, 512)
+//   @prefetch(distance) - Memory prefetch distance
+//   @parallel           - Enable outer loop parallelization
+//   @fuse               - Enable loop fusion
+//
+// Composable transforms: Annotations are applied in order of appearance
+//
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -14,6 +26,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/OpenMP/OpenMPDialect.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -100,13 +113,36 @@ LogicalResult applyMatmulTilingPattern(func::FuncOp func,
       matmulOps.push_back(op);
   });
 
-  if (matmulOps.empty())
+  if (matmulOps.empty()) {
     return success();  // No matmul to transform
+  }
+
+  // Use errs() for thread-safe output (unbuffered) - outs() crashes with multithreading
+  llvm::errs() << "[Annotation] Tiling " << matmulOps.size() << " matmul(s) in "
+               << func.getName() << " with tile=[" << tileSizes[0] << ","
+               << tileSizes[1] << "," << tileSizes[2] << "]\n";
 
   // Configure and apply tiling
+  // NOTE: For matmul, we CANNOT use LinalgTilingLoopType::ParallelLoops because:
+  // - Matmul has 3 loops: M (rows), N (cols), K (reduction)
+  // - M and N are parallel iterators, K is a reduction iterator
+  // - ParallelLoops creates scf.parallel for M,N but scf.for for K inside
+  // - SCF-to-OpenMP conversion fails because scf.for is inside omp.loop_nest
+  //
+  // Instead, we tile with regular loops and mark for parallelization.
+  // The outer tile loops (over M and N tiles) can be parallelized later.
+  LinalgTilingLoopType loopType = LinalgTilingLoopType::Loops;
+
+  if (info.hasParallel()) {
+    llvm::errs() << "[Parallel] Marking " << func.getName()
+                 << " for parallelization (outer tile loops)\n";
+    // Set attribute for later passes to parallelize outer loops
+    func->setAttr("simp.parallelize_outer_tiles", rewriter.getUnitAttr());
+  }
+
   LinalgTilingOptions tilingOptions;
   tilingOptions.setTileSizes(tileSizes);
-  tilingOptions.setLoopType(LinalgTilingLoopType::Loops);
+  tilingOptions.setLoopType(loopType);
 
   for (LinalgOp op : matmulOps) {
     if (op->getParentOp() == nullptr) continue;
@@ -119,6 +155,45 @@ LogicalResult applyMatmulTilingPattern(func::FuncOp func,
       tiledOp->op->setAttr("simp.annotation_tiled", rewriter.getUnitAttr());
       tiledOp->op->setAttr("simp.tile_sizes", rewriter.getI64ArrayAttr(tileSizes));
       rewriter.eraseOp(op);
+
+      // If @parallel requested, mark the outer tile loops for late-stage
+      // OpenMP conversion. We DON'T generate OpenMP here because:
+      // 1. Buffer management passes run after this and insert ops
+      // 2. Those ops would end up inside omp.wsloop, violating its constraint
+      // 3. omp.wsloop MUST contain exactly one op (omp.loop_nest)
+      //
+      // Instead, we mark loops with attributes and a late-stage pass
+      // (after buffer management) will convert them to OpenMP.
+      //
+      // For matmul, the iterator types are [parallel, parallel, reduction]:
+      //   - Loop 0 (M tile): PARALLEL - can be parallelized
+      //   - Loop 1 (N tile): PARALLEL - can be parallelized
+      //   - Loop 2 (K tile): REDUCTION - must remain sequential
+      if (info.hasParallel() && tiledOp->loops.size() >= 2) {
+        auto mLoop = dyn_cast<scf::ForOp>(tiledOp->loops[0]);
+        auto nLoop = dyn_cast<scf::ForOp>(tiledOp->loops[1]);
+
+        if (mLoop && nLoop) {
+          // Mark both M and N loops for parallelization
+          mLoop->setAttr("simp.parallel_loop", rewriter.getUnitAttr());
+          mLoop->setAttr("simp.parallel_dim", rewriter.getI64IntegerAttr(0));
+          nLoop->setAttr("simp.parallel_loop", rewriter.getUnitAttr());
+          nLoop->setAttr("simp.parallel_dim", rewriter.getI64IntegerAttr(1));
+
+          // Mark function for late-stage OpenMP conversion
+          func->setAttr("simp.needs_openmp", rewriter.getUnitAttr());
+
+          llvm::errs() << "[Parallel] Marked M and N tile loops for OpenMP (late-stage)\n";
+        }
+      } else if (info.hasParallel() && tiledOp->loops.size() == 1) {
+        auto outerLoop = dyn_cast<scf::ForOp>(tiledOp->loops[0]);
+        if (outerLoop) {
+          outerLoop->setAttr("simp.parallel_loop", rewriter.getUnitAttr());
+          outerLoop->setAttr("simp.parallel_dim", rewriter.getI64IntegerAttr(0));
+          func->setAttr("simp.needs_openmp", rewriter.getUnitAttr());
+          llvm::errs() << "[Parallel] Marked outer loop for OpenMP (late-stage)\n";
+        }
+      }
     } else {
       llvm::errs() << "Warning: Failed to tile matmul in " << func.getName() << "\n";
     }
@@ -135,6 +210,107 @@ LogicalResult applyScalarPattern(func::FuncOp func,
   return success();
 }
 
+//===----------------------------------------------------------------------===//
+// New Annotation Pattern Implementations
+//===----------------------------------------------------------------------===//
+
+/// Apply loop unrolling annotation
+/// Marks loops for unrolling with the specified factor
+LogicalResult applyUnrollPattern(func::FuncOp func,
+                                 const AnnotationInfo& info,
+                                 IRRewriter& rewriter) {
+  if (!info.hasUnroll()) return success();
+
+  LLVM_DEBUG(llvm::dbgs() << "Applying unroll(" << info.unrollFactor
+                          << ") to " << func.getName() << "\n");
+
+  // Set attribute for later LLVM pass to process
+  func->setAttr("simp.unroll_factor",
+                rewriter.getI64IntegerAttr(info.unrollFactor));
+
+  // Also set on SCF loops within the function
+  func.walk([&](scf::ForOp forOp) {
+    forOp->setAttr("simp.unroll_factor",
+                   rewriter.getI64IntegerAttr(info.unrollFactor));
+  });
+
+  return success();
+}
+
+/// Apply vectorization annotation
+/// Sets preferred SIMD width for vectorization pass
+LogicalResult applyVectorizePattern(func::FuncOp func,
+                                    const AnnotationInfo& info,
+                                    IRRewriter& rewriter) {
+  if (!info.hasVectorize()) return success();
+
+  LLVM_DEBUG(llvm::dbgs() << "Applying vectorize(" << info.vectorizeWidth
+                          << ") to " << func.getName() << "\n");
+
+  // Validate width (must be 128, 256, or 512)
+  int64_t width = info.vectorizeWidth;
+  if (width != 128 && width != 256 && width != 512) {
+    llvm::errs() << "Warning: Invalid vectorize width " << width
+                 << ", must be 128, 256, or 512\n";
+    return failure();
+  }
+
+  func->setAttr("simp.vectorize_width", rewriter.getI64IntegerAttr(width));
+  return success();
+}
+
+/// Apply prefetch annotation
+/// Sets memory prefetch distance for cache optimization
+LogicalResult applyPrefetchPattern(func::FuncOp func,
+                                   const AnnotationInfo& info,
+                                   IRRewriter& rewriter) {
+  if (!info.hasPrefetch()) return success();
+
+  LLVM_DEBUG(llvm::dbgs() << "Applying prefetch(" << info.prefetchDistance
+                          << ") to " << func.getName() << "\n");
+
+  func->setAttr("simp.prefetch_distance",
+                rewriter.getI64IntegerAttr(info.prefetchDistance));
+  return success();
+}
+
+/// Apply parallel annotation
+/// Marks outer loops for OpenMP-style parallelization
+LogicalResult applyParallelPattern(func::FuncOp func,
+                                   const AnnotationInfo& info,
+                                   IRRewriter& rewriter) {
+  if (!info.hasParallel()) return success();
+
+  LLVM_DEBUG(llvm::dbgs() << "Applying @parallel to " << func.getName() << "\n");
+
+  func->setAttr("simp.parallel", rewriter.getUnitAttr());
+
+  // Mark outermost SCF loops for parallelization
+  bool firstLoop = true;
+  func.walk([&](scf::ForOp forOp) {
+    // Only mark the outermost loop(s)
+    if (firstLoop) {
+      forOp->setAttr("simp.parallel_loop", rewriter.getUnitAttr());
+      firstLoop = false;
+    }
+  });
+
+  return success();
+}
+
+/// Apply fuse annotation
+/// Enables loop fusion for adjacent operations
+LogicalResult applyFusePattern(func::FuncOp func,
+                               const AnnotationInfo& info,
+                               IRRewriter& rewriter) {
+  if (!info.hasFuse()) return success();
+
+  LLVM_DEBUG(llvm::dbgs() << "Applying @fuse to " << func.getName() << "\n");
+
+  func->setAttr("simp.fuse", rewriter.getUnitAttr());
+  return success();
+}
+
 /// Register all optimization patterns
 void registerPatterns(PatternRegistry& registry) {
   // VNNI patterns (x86)
@@ -144,6 +320,13 @@ void registerPatterns(PatternRegistry& registry) {
   // Generic patterns
   registry.registerPattern("tile", applyMatmulTilingPattern);
   registry.registerPattern("scalar", applyScalarPattern);
+
+  // New annotation patterns
+  registry.registerPattern("unroll", applyUnrollPattern);
+  registry.registerPattern("vectorize", applyVectorizePattern);
+  registry.registerPattern("prefetch", applyPrefetchPattern);
+  registry.registerPattern("parallel", applyParallelPattern);
+  registry.registerPattern("fuse", applyFusePattern);
 }
 
 //===----------------------------------------------------------------------===//
@@ -158,6 +341,11 @@ public:
   StringRef getArgument() const override { return "simp-annotation-lowering"; }
   StringRef getDescription() const override {
     return "Process annotation attributes and apply optimization patterns";
+  }
+
+  // Declare that this pass may create OpenMP dialect operations
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<omp::OpenMPDialect>();
   }
 
   void runOnOperation() override {
@@ -180,22 +368,30 @@ public:
     for (const auto& [attrName, dictAttr] : regions) {
       AnnotationInfo info = extractAnnotationInfo(dictAttr);
 
-      // Apply pattern if specified
-      if (info.hasPattern()) {
-        if (registry.hasPattern(info.lowerPattern)) {
-          if (failed(registry.applyPattern(info.lowerPattern, func, info, rewriter))) {
-            llvm::errs() << "Warning: Pattern '" << info.lowerPattern << "' failed\n";
-          }
-        } else {
-          llvm::errs() << "Warning: Unknown pattern '" << info.lowerPattern << "'\n";
-        }
-      } else if (info.hasTileSizes()) {
-        // Default tiling when no pattern specified
-        (void)registry.applyPattern("tile", func, info, rewriter);
-      }
+      LLVM_DEBUG({
+        llvm::dbgs() << "Processing annotations for " << func.getName() << ":\n";
+        if (info.hasPattern())
+          llvm::dbgs() << "  lower: " << info.lowerPattern << "\n";
+        if (info.hasTileSizes())
+          llvm::dbgs() << "  tile: [" << info.tileSizes[0] << ","
+                       << info.tileSizes[1] << "," << info.tileSizes[2] << "]\n";
+        if (info.hasUnroll())
+          llvm::dbgs() << "  unroll: " << info.unrollFactor << "\n";
+        if (info.hasVectorize())
+          llvm::dbgs() << "  vectorize: " << info.vectorizeWidth << "\n";
+        if (info.hasPrefetch())
+          llvm::dbgs() << "  prefetch: " << info.prefetchDistance << "\n";
+        if (info.hasParallel())
+          llvm::dbgs() << "  parallel: true\n";
+        if (info.hasFuse())
+          llvm::dbgs() << "  fuse: true\n";
+      });
+
+      // Apply composable transforms in correct order
+      applyComposableTransforms(func, info, rewriter);
 
       // Register for backend passes (VNNI, GPU, etc.)
-      if (info.hasPattern() || info.hasTileSizes()) {
+      if (info.hasAnyOptimization()) {
         simp::AnnotationRegistry::instance().registerFunction(func.getName().str(), info);
       }
 
@@ -210,6 +406,7 @@ private:
   AnnotationInfo extractAnnotationInfo(DictionaryAttr dict) {
     AnnotationInfo info;
 
+    // Core annotations
     if (auto tiles = dict.getAs<ArrayAttr>("simp.tile_sizes")) {
       for (auto size : tiles) {
         if (auto intAttr = dyn_cast<IntegerAttr>(size))
@@ -223,7 +420,81 @@ private:
     if (auto pattern = dict.getAs<StringAttr>("simp.lower_pattern"))
       info.lowerPattern = pattern.getValue().str();
 
+    // New annotations
+    if (auto unroll = dict.getAs<IntegerAttr>("simp.unroll_factor"))
+      info.unrollFactor = unroll.getInt();
+
+    if (auto vec = dict.getAs<IntegerAttr>("simp.vectorize_width"))
+      info.vectorizeWidth = vec.getInt();
+
+    if (auto pf = dict.getAs<IntegerAttr>("simp.prefetch_distance"))
+      info.prefetchDistance = pf.getInt();
+
+    if (dict.get("simp.parallel"))
+      info.parallel = true;
+
+    if (dict.get("simp.fuse"))
+      info.fuse = true;
+
+    // Transform ordering (for composability)
+    if (auto order = dict.getAs<ArrayAttr>("simp.transform_order")) {
+      for (auto name : order) {
+        if (auto strAttr = dyn_cast<StringAttr>(name))
+          info.transformOrder.push_back(strAttr.getValue().str());
+      }
+    }
+
     return info;
+  }
+
+  /// Apply all transforms in composable order
+  /// Order: parallel → tile → unroll → vectorize → prefetch → lower
+  void applyComposableTransforms(func::FuncOp func, const AnnotationInfo& info,
+                                 IRRewriter& rewriter) {
+    // If explicit order specified, use it
+    if (!info.transformOrder.empty()) {
+      for (const auto& transform : info.transformOrder) {
+        if (registry.hasPattern(transform)) {
+          (void)registry.applyPattern(transform, func, info, rewriter);
+        }
+      }
+      return;
+    }
+
+    // Default composable order: parallel → tile → unroll → vectorize → prefetch
+    // This order ensures outer transforms don't interfere with inner ones
+
+    // 1. Parallelization (outermost)
+    if (info.hasParallel()) {
+      (void)registry.applyPattern("parallel", func, info, rewriter);
+    }
+
+    // 2. Tiling (after parallel, before unroll)
+    if (info.hasPattern() && registry.hasPattern(info.lowerPattern)) {
+      (void)registry.applyPattern(info.lowerPattern, func, info, rewriter);
+    } else if (info.hasTileSizes()) {
+      (void)registry.applyPattern("tile", func, info, rewriter);
+    }
+
+    // 3. Unrolling (after tiling)
+    if (info.hasUnroll()) {
+      (void)registry.applyPattern("unroll", func, info, rewriter);
+    }
+
+    // 4. Vectorization hints
+    if (info.hasVectorize()) {
+      (void)registry.applyPattern("vectorize", func, info, rewriter);
+    }
+
+    // 5. Prefetch hints
+    if (info.hasPrefetch()) {
+      (void)registry.applyPattern("prefetch", func, info, rewriter);
+    }
+
+    // 6. Loop fusion (last, operates on transformed loops)
+    if (info.hasFuse()) {
+      (void)registry.applyPattern("fuse", func, info, rewriter);
+    }
   }
 };
 
