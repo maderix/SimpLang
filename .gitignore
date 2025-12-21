@@ -50,3 +50,4 @@ tests/*.ll
 tests/*.o
 tests/*.so
 simptensor/TENSOR_CHECKPOINT.md
+tools/ir_analyzer
