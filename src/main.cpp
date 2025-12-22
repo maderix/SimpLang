@@ -1,5 +1,6 @@
 #include <iostream>
 #include <fstream>
+#include <sstream>
 #include <cstdio>
 #include <cstring>
 
@@ -36,6 +37,11 @@
 #include <llvm/Transforms/Utils/LCSSA.h>
 #endif
 
+// Diagnostics must be included after all LLVM/MLIR headers
+// to avoid LLVM 21 inline function visibility issues
+#include "diagnostics/diagnostics.hpp"
+#include "diagnostics/diagnostic_context.hpp"
+
 extern BlockAST* programBlock;
 extern int yyparse();
 extern FILE* yyin;
@@ -53,6 +59,7 @@ int main(int argc, char** argv) {
     bool debugBuild = false;  // Debug build - disables ALL optimizations for debugging
     bool dumpMLIRPasses = false;  // Dump MLIR at each pipeline stage
     bool llvmVectorize = false;  // Skip MLIR vectorization, let LLVM handle it (better for INT8/INT4)
+    bool verboseErrors = false;  // Show raw MLIR errors in ICE messages
     std::string outputPath;
     std::string logLevel = "INFO";  // Default log level
     std::string targetArch = "";  // Target architecture (empty = native)
@@ -93,6 +100,7 @@ int main(int argc, char** argv) {
         std::cout << "  --no-prefetch      Disable prefetch insertion (memory latency hiding)" << std::endl;
         std::cout << "  --llvm-vectorize   Use LLVM vectorization + VNNI (better for INT8/INT4)" << std::endl;
         std::cout << "  --no-opt           Disable LLVM O3 optimization (faster compilation)" << std::endl;
+        std::cout << "  --verbose-errors   Show raw MLIR diagnostics for internal errors" << std::endl;
         std::cout << std::endl;
 #endif
 
@@ -193,6 +201,9 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "--dump-mlir-passes") == 0) {
             dumpMLIRPasses = true;
         }
+        else if (strcmp(argv[i], "--verbose-errors") == 0) {
+            verboseErrors = true;
+        }
 #endif
     }
     
@@ -212,8 +223,26 @@ int main(int argc, char** argv) {
     // LLVM passes are initialized automatically when needed
 #endif
 
+    // Initialize diagnostics
+    simp::diag::SourceManager sourceManager;
+    simp::diag::DiagnosticEngine diagEngine(sourceManager);
+
+    // Configure diagnostics based on log level
+    simp::diag::DiagnosticConfig diagConfig;
+    diagConfig.useColors = true;  // Match terminal default
+    diagEngine.setConfig(diagConfig);
+
     // Set input file
     LOG_INFO("Opening ", argv[1]);
+    uint32_t fileId = sourceManager.loadFile(argv[1]);
+    if (fileId == 0) {
+        std::cerr << "Error: Failed to open " << argv[1] << std::endl;
+        return 1;
+    }
+
+    // Initialize diagnostic context for lexer/parser
+    simp::diag::initDiagnosticContext(sourceManager, diagEngine, fileId);
+
     yyin = fopen(argv[1], "r");
     if (!yyin) {
         std::cerr << "Error: Failed to open " << argv[1] << std::endl;
@@ -221,8 +250,13 @@ int main(int argc, char** argv) {
     }
 
     LOG_INFO("Parsing...");
-    if (yyparse()) {
-        std::cerr << "Error parsing!" << std::endl;
+    int parseResult = yyparse();
+
+    // Check for errors from diagnostics or parser
+    if (parseResult || diagEngine.hasErrors()) {
+        // Errors already reported via diagnostics
+        fclose(yyin);
+        simp::diag::resetDiagnosticContext();
         return 1;
     }
 
@@ -319,8 +353,12 @@ int main(int argc, char** argv) {
 
         pipeline.setDumpIntermediateIR(dumpMLIRPasses);
         pipeline.setOutputPath(outputPath);
+        pipeline.setVerboseErrors(verboseErrors);
         if (dumpMLIRPasses) {
             LOG_INFO("MLIR intermediate IR dumping enabled");
+        }
+        if (verboseErrors) {
+            LOG_INFO("Verbose error output enabled (raw MLIR diagnostics shown)");
         }
 
         // Configure debug info generation

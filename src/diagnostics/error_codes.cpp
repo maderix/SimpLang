@@ -10,6 +10,13 @@ namespace {
 // Static error info table
 const std::unordered_map<uint32_t, ErrorInfo> errorInfoTable = {
     // ========================================================================
+    // Generic/Internal
+    // ========================================================================
+    {0, {ErrorCode::E0000, "E0000", "generic warning",
+         "A warning or note without a specific error code. "
+         "These are typically informational messages."}},
+
+    // ========================================================================
     // Lexer Errors
     // ========================================================================
     {1, {ErrorCode::E0001, "E0001", "unknown token",
@@ -323,6 +330,34 @@ const std::unordered_map<uint32_t, ErrorInfo> errorInfoTable = {
     {608, {ErrorCode::E0608, "E0608", "invalid IR state",
            "The intermediate representation is in an invalid state. "
            "This is usually an internal compiler error."}},
+
+    // ========================================================================
+    // Internal Compiler Errors (ICE)
+    // ========================================================================
+    {700, {ErrorCode::E0700, "E0700", "internal compiler error",
+           "The compiler encountered an unexpected internal error. "
+           "This is a bug in the SimpLang compiler, not in your code. "
+           "Please report this issue with the source file and error details."}},
+
+    {701, {ErrorCode::E0701, "E0701", "internal error: MLIR verification failed",
+           "The generated MLIR IR failed verification. This indicates a bug in "
+           "the compiler's IR generation. Please report this issue."}},
+
+    {702, {ErrorCode::E0702, "E0702", "internal error: MLIR pass failed",
+           "An MLIR optimization or transformation pass failed unexpectedly. "
+           "This is an internal compiler error. Please report this issue."}},
+
+    {703, {ErrorCode::E0703, "E0703", "internal error: bufferization failed",
+           "The buffer management phase failed. This is typically caused by "
+           "operations with unrecognized memory effects. Please report this issue."}},
+
+    {704, {ErrorCode::E0704, "E0704", "internal error: memory allocation lowering failed",
+           "Failed to lower memory allocation operations. This often indicates "
+           "a mismatch between expected and actual dimension operands."}},
+
+    {705, {ErrorCode::E0705, "E0705", "internal error: tensor reshape failed",
+           "Failed to lower tensor reshape operations. Type mismatches between "
+           "strided and non-strided memrefs can cause this error."}},
 };
 
 // Fallback error info for unknown codes
@@ -349,6 +384,7 @@ std::string_view getErrorCategory(ErrorCode code) {
     if (isTensorError(code)) return "tensor";
     if (isAnnotationError(code)) return "annotation";
     if (isCodegenError(code)) return "codegen";
+    if (isInternalError(code)) return "internal";
     return "unknown";
 }
 

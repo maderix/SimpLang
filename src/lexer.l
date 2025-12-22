@@ -1,7 +1,9 @@
 %option yylineno
 %{
 #include <string>
+#include <cstdio>
 #include "parser.hpp"
+// diagnostic_context.hpp is included via parser.hpp
 
 #define SAVE_TOKEN  yylval.string = new std::string(yytext, yyleng)
 extern "C" int yywrap() { return 1; }
@@ -119,6 +121,11 @@ static int yycolumn = 1;
 
 "@"                   { return TAT; }
 
-.                     { printf("Unknown token: %s\n", yytext); yyterminate(); }
+.                     {
+                        char msg[256];
+                        snprintf(msg, sizeof(msg), "unknown token '%s'", yytext);
+                        simp_lexer_error(yylineno, yycolumn - yyleng, msg);
+                        yyterminate();
+                      }
 
 %%

@@ -12,20 +12,29 @@
     extern int yylex();
     extern int yylineno;
     extern char *yytext;
-    void yyerror(const char *s) { 
-        fprintf(stderr, "Error: %s at symbol \"%s\" on line %d\n", s, yytext, yylineno);
+
+    // Forward declaration - defined after we have access to yylloc
+    void yyerror(const char *s);
+%}
+
+%code provides {
+    // yyerror implementation using diagnostics
+    inline void yyerror(const char *s) {
+        extern YYLTYPE yylloc;
+        simp_parser_error(yylloc.first_line, yylloc.first_column,
+                          yylloc.last_line, yylloc.last_column, s);
     }
 
     // NOTE: SET_LOC uses @$ which must be referenced within the grammar rule actions
     // We'll set locations directly in rules using @$.first_line
 
     // Add helper function to convert raw pointers to unique_ptr
-    std::unique_ptr<ExprAST> makeUnique(ExprAST* ptr) {
+    inline std::unique_ptr<ExprAST> makeUnique(ExprAST* ptr) {
         return std::unique_ptr<ExprAST>(ptr);
     }
-    
+
     // Helper to convert vector of raw pointers to vector of unique_ptr
-    std::vector<std::unique_ptr<ExprAST>> makeUniqueVector(const std::vector<ExprAST*>& ptrs) {
+    inline std::vector<std::unique_ptr<ExprAST>> makeUniqueVector(const std::vector<ExprAST*>& ptrs) {
         std::vector<std::unique_ptr<ExprAST>> result;
         for (auto ptr : ptrs) {
             result.push_back(std::unique_ptr<ExprAST>(ptr));
@@ -36,7 +45,7 @@
     // Helper to detect if expression list is an initializer list
     // Heuristic: >4 elements OR any non-literal = initializer list
     // Otherwise assume dimensions (for multi-dimensional arrays like [2,3,4])
-    bool isInitializerList(const std::vector<ExprAST*>& exprs) {
+    inline bool isInitializerList(const std::vector<ExprAST*>& exprs) {
         if (exprs.empty()) return false;
 
         // More than 4 elements = definitely initializer (arrays >4D are rare)
@@ -55,13 +64,14 @@
         // Default to dimensions for backward compatibility
         return false;
     }
-%}
+}
 
 %define parse.trace
 %locations
 
 %code requires {
     #include "ast.hpp"
+    #include "diagnostics/diagnostic_context.hpp"
 }
 
 %{

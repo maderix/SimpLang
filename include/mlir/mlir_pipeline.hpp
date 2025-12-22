@@ -111,6 +111,9 @@ public:
   /// Set source filename for debug info
   void setSourceFileName(const std::string& name) { sourceFileName = name; }
 
+  /// Enable/disable verbose error output (shows raw MLIR errors)
+  void setVerboseErrors(bool enable) { verboseErrors = enable; }
+
   /// Variable debug info structure
   struct VarDebugInfo {
     std::string name;
@@ -163,6 +166,9 @@ private:
 
   /// Source filename for debug info
   std::string sourceFileName;
+
+  /// Enable verbose error output (default: false)
+  bool verboseErrors = false;
 
   /// Variable debug info for functions (from codegen)
   std::map<std::string, std::vector<VarDebugInfo>> functionVariables;

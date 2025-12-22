@@ -8,6 +8,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/mlir_pipeline.hpp"
+#include "mlir_diagnostic_handler.hpp"
 #include "mlir/Passes.h"
 #include "mlir/simp_dialect.hpp"
 #include "mlir/cache_info.hpp"
@@ -109,6 +110,9 @@ bool MLIRCompilationPipeline::runPasses() {
     return false;
   }
 
+  // Create ICE diagnostic handler to intercept MLIR errors
+  mlir::simp::ICEDiagnosticHandler iceHandler(module.getContext(), verboseErrors);
+
   // Register BufferDeallocationOpInterface external models for dialects
   // This is required for ownership-based buffer deallocation pass
   {
@@ -125,13 +129,14 @@ bool MLIRCompilationPipeline::runPasses() {
 
   // Phase 1: Lower Simp dialect to MemRef + Arith + Linalg
   {
+    mlir::simp::PhaseScope phaseScope(iceHandler, "Phase 1 (Simp lowering)");
     mlir::PassManager pm(module.getContext());
     if (dumpIntermediateIR) pm.enableIRPrinting();
     buildPhase1_SimpLowering(pm);
 
     if (failed(pm.run(module))) {
-      llvm::errs() << "Error: Phase 1 (Simp lowering) failed\n";
-      module.dump();
+      iceHandler.emitICE();
+      if (verboseErrors) module.dump();
       return false;
     }
 
@@ -149,13 +154,14 @@ bool MLIRCompilationPipeline::runPasses() {
   // Phase 2: Linalg optimization (tiling, vectorization, loop lowering)
   // This phase should create scf.for loops and insert memref.prefetch
   {
+    mlir::simp::PhaseScope phaseScope(iceHandler, "Phase 2 (Linalg optimization)");
     mlir::PassManager pm(module.getContext());
     if (dumpIntermediateIR) pm.enableIRPrinting();
     buildPhase2_LinalgOptimization(pm);
 
     if (failed(pm.run(module))) {
-      llvm::errs() << "Error: Phase 2 (Linalg optimization) failed\n";
-      module.dump();
+      iceHandler.emitICE();
+      if (verboseErrors) module.dump();
       return false;
     }
 
@@ -172,13 +178,14 @@ bool MLIRCompilationPipeline::runPasses() {
 
   // Phase 2.5: Buffer management (hoisting, deallocation)
   {
+    mlir::simp::PhaseScope phaseScope(iceHandler, "Phase 2.5 (Buffer management)");
     mlir::PassManager pm(module.getContext());
     if (dumpIntermediateIR) pm.enableIRPrinting();
     buildPhase2_5_BufferManagement(pm);
 
     if (failed(pm.run(module))) {
-      llvm::errs() << "Error: Phase 2.5 (Buffer management) failed\n";
-      module.dump();
+      iceHandler.emitICE();
+      if (verboseErrors) module.dump();
       return false;
     }
 
@@ -197,14 +204,15 @@ bool MLIRCompilationPipeline::runPasses() {
   // This runs AFTER buffer management so that deallocation ops don't end up
   // inside omp.wsloop (which requires exactly one nested op - omp.loop_nest)
   {
+    mlir::simp::PhaseScope phaseScope(iceHandler, "Phase 2.6 (Late-stage OpenMP)");
     mlir::PassManager pm(module.getContext());
     if (dumpIntermediateIR) pm.enableIRPrinting();
     pm.addNestedPass<mlir::func::FuncOp>(mlir::simp::createConvertMarkedLoopsToOpenMPPass());
     if (!enableDebugInfo) pm.addPass(mlir::createCanonicalizerPass());
 
     if (failed(pm.run(module))) {
-      llvm::errs() << "Error: Phase 2.6 (Late-stage OpenMP) failed\n";
-      module.dump();
+      iceHandler.emitICE();
+      if (verboseErrors) module.dump();
       return false;
     }
 
@@ -218,13 +226,14 @@ bool MLIRCompilationPipeline::runPasses() {
 
   // Phase 3: Lower to LLVM dialect (vector, control flow, arithmetic)
   {
+    mlir::simp::PhaseScope phaseScope(iceHandler, "Phase 3 (LLVM dialect lowering)");
     mlir::PassManager pm(module.getContext());
     if (dumpIntermediateIR) pm.enableIRPrinting();
     buildPhase3_LLVMDialectLowering(pm);
 
     if (failed(pm.run(module))) {
-      llvm::errs() << "Error: Phase 3 (LLVM dialect lowering) failed\n";
-      module.dump();
+      iceHandler.emitICE();
+      if (verboseErrors) module.dump();
       return false;
     }
 
@@ -241,9 +250,13 @@ bool MLIRCompilationPipeline::runPasses() {
 
   // Apply vector lowering patterns and LLVM dialect conversion
   // This must be done AFTER the pass pipeline since it requires direct module access
-  if (!applyLLVMDialectConversion()) {
-    llvm::errs() << "Error: LLVM dialect conversion failed\n";
-    return false;
+  {
+    iceHandler.setPhase("LLVM dialect conversion");
+    iceHandler.clear();
+    if (!applyLLVMDialectConversion()) {
+      iceHandler.emitICE();
+      return false;
+    }
   }
 
   // Try to reconcile unrealized casts after pattern conversion
@@ -259,8 +272,9 @@ bool MLIRCompilationPipeline::runPasses() {
   // NOTE: When OpenMP is enabled, unrealized_conversion_cast ops are expected
   // (see mlir/test/Conversion/OpenMPToLLVM/convert-to-llvmir.mlir)
   if (!enableOpenMP && failed(mlir::verify(module))) {
-    llvm::errs() << "Error: Module verification failed after lowering\n";
-    module.dump();
+    iceHandler.setPhase("Module verification");
+    iceHandler.emitICE();
+    if (verboseErrors) module.dump();
     return false;
   }
 

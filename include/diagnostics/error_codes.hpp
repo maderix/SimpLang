@@ -18,6 +18,11 @@ namespace diag {
 ///   E0600-E0699: Codegen errors
 enum class ErrorCode : uint32_t {
     // ========================================================================
+    // Generic/Internal (E0000)
+    // ========================================================================
+    E0000 = 0,    // Generic warning/note (no specific code)
+
+    // ========================================================================
     // Lexer Errors (E0001-E0099)
     // ========================================================================
     E0001 = 1,    // Unknown token
@@ -121,6 +126,16 @@ enum class ErrorCode : uint32_t {
     E0606 = 606,  // Vectorization failed
     E0607 = 607,  // Pass execution failed
     E0608 = 608,  // Invalid IR state
+
+    // ========================================================================
+    // Internal Compiler Errors (E0700-E0799)
+    // ========================================================================
+    E0700 = 700,  // Internal compiler error (ICE)
+    E0701 = 701,  // ICE: MLIR verification failed
+    E0702 = 702,  // ICE: MLIR pass failed
+    E0703 = 703,  // ICE: Bufferization failed
+    E0704 = 704,  // ICE: Memory allocation lowering failed
+    E0705 = 705,  // ICE: Tensor reshape failed
 };
 
 /// Severity level for diagnostics
@@ -182,6 +197,11 @@ inline bool isAnnotationError(ErrorCode code) {
 inline bool isCodegenError(ErrorCode code) {
     uint32_t v = static_cast<uint32_t>(code);
     return v >= 600 && v < 700;
+}
+
+inline bool isInternalError(ErrorCode code) {
+    uint32_t v = static_cast<uint32_t>(code);
+    return v >= 700 && v < 800;
 }
 
 } // namespace diag

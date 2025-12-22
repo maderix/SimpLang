@@ -46,6 +46,7 @@ add_mlir_dialect_library(simp_dialect
   simp_ops.cpp
   mlir_codegen.cpp
   mlir_pipeline.cpp
+  mlir_diagnostic_handler.cpp
   cache_info.cpp
   Passes.cpp
   lowering/ConvertSimpToMemRef.cpp

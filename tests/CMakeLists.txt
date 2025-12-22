@@ -618,3 +618,20 @@ target_link_libraries(test_diagnostics
 target_compile_features(test_diagnostics PUBLIC cxx_std_17)
 
 add_test(NAME diagnostics_test COMMAND test_diagnostics)
+
+# ============================================================================
+# Error Codes Integration Test
+# ============================================================================
+
+add_executable(test_error_codes
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_error_codes.cpp
+)
+
+target_compile_features(test_error_codes PUBLIC cxx_std_17)
+
+# This test runs the compiler on various broken files and checks error codes
+add_test(
+    NAME error_codes_test
+    COMMAND test_error_codes ${CMAKE_BINARY_DIR}/src/simplang
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)

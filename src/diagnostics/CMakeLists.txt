@@ -9,6 +9,7 @@ add_library(simplang_diagnostics STATIC
     diagnostic_builder.cpp
     diagnostic_engine.cpp
     diagnostic_renderer.cpp
+    diagnostic_context.cpp
 )
 
 target_include_directories(simplang_diagnostics

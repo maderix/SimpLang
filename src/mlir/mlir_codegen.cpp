@@ -32,8 +32,60 @@
 // This way the header doesn't pull in exception-throwing code
 #include "ast/ast.hpp"
 
+// Diagnostics integration
+#include "diagnostics/diagnostic_context.hpp"
+
 using namespace mlir;
 using namespace mlir::simp;
+
+//===----------------------------------------------------------------------===//
+// Diagnostic Helpers
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Emit an error diagnostic with source location from an AST node
+void simpEmitError(int line, int col, ::simp::diag::ErrorCode code, const std::string& message) {
+  auto& ctx = ::simp::diag::getDiagnosticContext();
+  if (ctx.isValid()) {
+    auto span = ::simp::diag::makeSpan(line, col);
+    ctx.engine->error(code)
+        .withMessage(message)
+        .at(span)
+        .emit();
+  } else {
+    // Fallback to llvm::errs if diagnostics not initialized
+    llvm::errs() << "Error at " << line << ":" << col << ": " << message << "\n";
+  }
+}
+
+/// Emit a warning diagnostic with source location
+void simpEmitWarning(int line, int col, const std::string& message) {
+  auto& ctx = ::simp::diag::getDiagnosticContext();
+  if (ctx.isValid()) {
+    auto span = ::simp::diag::makeSpan(line, col);
+    ctx.engine->warning(::simp::diag::ErrorCode::E0000)
+        .withMessage(message)
+        .at(span)
+        .emit();
+  } else {
+    llvm::errs() << "Warning at " << line << ":" << col << ": " << message << "\n";
+  }
+}
+
+/// Emit an error without specific location (codegen phase)
+void simpEmitCodegenError(::simp::diag::ErrorCode code, const std::string& message) {
+  auto& ctx = ::simp::diag::getDiagnosticContext();
+  if (ctx.isValid()) {
+    ctx.engine->error(code)
+        .withMessage(message)
+        .emit();
+  } else {
+    llvm::errs() << "Error: " << message << "\n";
+  }
+}
+
+} // anonymous namespace
 
 //===----------------------------------------------------------------------===//
 // Constructor & Initialization
@@ -80,7 +132,7 @@ void MLIRCodeGenContext::createModule(const std::string& moduleName) {
 
 void MLIRCodeGenContext::declareVariable(const std::string& name, mlir::Value value) {
   if (symbolTable.empty()) {
-    llvm::errs() << "Error: No scope to declare variable '" << name << "'\n";
+    simpEmitCodegenError(::simp::diag::ErrorCode::E0300, "no scope to declare variable \'" + name + "\'");
     return;
   }
 
@@ -97,8 +149,10 @@ mlir::Value MLIRCodeGenContext::lookupVariable(const std::string& name) {
     }
   }
 
-  // Not found
-  llvm::errs() << "Error: Undefined variable '" << name << "'\n";
+  // Not found - emit diagnostic (we don't have source location here,
+  // so use a codegen-phase error)
+  simpEmitCodegenError(::simp::diag::ErrorCode::E0300,
+                       "undefined variable '" + name + "'");
   return nullptr;
 }
 
@@ -461,7 +515,7 @@ mlir::Type MLIRCodeGenContext::convertType(const std::string& simpType) {
   }
 
   // Default to f32 (matches existing SimpLang compiler)
-  llvm::errs() << "Warning: Unknown type '" << simpType << "', defaulting to f32\n";
+  simpEmitCodegenError(::simp::diag::ErrorCode::E0206, "unknown type \'" + simpType + "\', defaulting to f32");
   return builder.getF32Type();
 }
 
@@ -523,7 +577,7 @@ mlir::Location MLIRCodeGenContext::getVariableLocation(int line, int col, const 
 
 mlir::ModuleOp MLIRCodeGenContext::lowerAST(BlockAST* programBlock) {
   if (!programBlock) {
-    llvm::errs() << "Error: Null program block\n";
+    simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Null program block\n");
     return nullptr;
   }
 
@@ -537,13 +591,13 @@ mlir::ModuleOp MLIRCodeGenContext::lowerAST(BlockAST* programBlock) {
     if (stmt->getKind() == ASTKind::FunctionDecl) {
       FunctionAST* func = static_cast<FunctionAST*>(stmt);
       if (!lowerFunction(func)) {
-        llvm::errs() << "Error: Failed to lower function\n";
+        simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Failed to lower function\n");
         return nullptr;
       }
     } else {
       // Handle other top-level statements
       if (failed(lowerStatement(stmt))) {
-        llvm::errs() << "Error: Failed to lower statement\n";
+        simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Failed to lower statement\n");
         return nullptr;
       }
     }
@@ -551,7 +605,7 @@ mlir::ModuleOp MLIRCodeGenContext::lowerAST(BlockAST* programBlock) {
 
   // Verify the module
   if (failed(mlir::verify(module))) {
-    llvm::errs() << "Error: Module verification failed\n";
+    simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Module verification failed\n");
     module.dump();
     return nullptr;
   }
@@ -656,7 +710,7 @@ mlir::Value MLIRCodeGenContext::lowerAssignment(AssignmentExprAST* assignment) {
   // Lower the RHS expression
   mlir::Value value = lowerExpression(assignment->getRHS());
   if (!value) {
-    llvm::errs() << "Error: Failed to lower assignment RHS\n";
+    simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Failed to lower assignment RHS\n");
     return nullptr;
   }
 
@@ -679,7 +733,7 @@ mlir::Value MLIRCodeGenContext::lowerBinaryOp(BinaryExprAST* binOp) {
   mlir::Value rhs = lowerExpression(binOp->getRight());
 
   if (!lhs || !rhs) {
-    llvm::errs() << "Error: Failed to lower binary operation operands\n";
+    simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Failed to lower binary operation operands\n");
     return nullptr;
   }
 
@@ -699,7 +753,7 @@ mlir::Value MLIRCodeGenContext::lowerBinaryOp(BinaryExprAST* binOp) {
       case OpDiv:
         return builder.create<mlir::simp::TensorDivOp>(loc, lhsTensorType, lhs, rhs);
       default:
-        llvm::errs() << "Error: Unsupported binary operation on tensors\n";
+        simpEmitCodegenError(::simp::diag::ErrorCode::E0601, "Unsupported binary operation on tensors\n");
         return nullptr;
     }
   }
@@ -779,35 +833,35 @@ mlir::Value MLIRCodeGenContext::lowerBinaryOp(BinaryExprAST* binOp) {
     // Bitwise operations - only valid for integer types
     case OpAnd:
       if (!mlir::isa<mlir::IntegerType>(lhs.getType())) {
-        llvm::errs() << "Error: Bitwise AND (&) can only be applied to integer types\n";
+        simpEmitCodegenError(::simp::diag::ErrorCode::E0207, "Bitwise AND (&) can only be applied to integer types\n");
         return nullptr;
       }
       return builder.create<mlir::arith::AndIOp>(loc, lhs, rhs);
 
     case OpOr:
       if (!mlir::isa<mlir::IntegerType>(lhs.getType())) {
-        llvm::errs() << "Error: Bitwise OR (|) can only be applied to integer types\n";
+        simpEmitCodegenError(::simp::diag::ErrorCode::E0207, "Bitwise OR (|) can only be applied to integer types\n");
         return nullptr;
       }
       return builder.create<mlir::arith::OrIOp>(loc, lhs, rhs);
 
     case OpXor:
       if (!mlir::isa<mlir::IntegerType>(lhs.getType())) {
-        llvm::errs() << "Error: Bitwise XOR (^) can only be applied to integer types\n";
+        simpEmitCodegenError(::simp::diag::ErrorCode::E0207, "Bitwise XOR (^) can only be applied to integer types\n");
         return nullptr;
       }
       return builder.create<mlir::arith::XOrIOp>(loc, lhs, rhs);
 
     case OpLShift:
       if (!mlir::isa<mlir::IntegerType>(lhs.getType())) {
-        llvm::errs() << "Error: Left shift (<<) can only be applied to integer types\n";
+        simpEmitCodegenError(::simp::diag::ErrorCode::E0207, "Left shift (<<) can only be applied to integer types\n");
         return nullptr;
       }
       return builder.create<mlir::arith::ShLIOp>(loc, lhs, rhs);
 
     case OpRShift:
       if (!mlir::isa<mlir::IntegerType>(lhs.getType())) {
-        llvm::errs() << "Error: Right shift (>>) can only be applied to integer types\n";
+        simpEmitCodegenError(::simp::diag::ErrorCode::E0207, "Right shift (>>) can only be applied to integer types\n");
         return nullptr;
       }
       // Use arithmetic right shift (sign-extending for signed integers)
@@ -821,7 +875,7 @@ mlir::Value MLIRCodeGenContext::lowerBinaryOp(BinaryExprAST* binOp) {
       }
 
     default:
-      llvm::errs() << "Error: Unsupported binary operator: " << binOp->getOp() << "\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0601, "unsupported binary operator: " + std::to_string(binOp->getOp()));
       return nullptr;
   }
 }
@@ -832,7 +886,7 @@ mlir::Value MLIRCodeGenContext::lowerUnaryOp(UnaryExprAST* unaryOp) {
   // Lower the operand
   mlir::Value operand = lowerExpression(unaryOp->getOperand());
   if (!operand) {
-    llvm::errs() << "Error: Failed to lower unary operand\n";
+    simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Failed to lower unary operand\n");
     return nullptr;
   }
 
@@ -845,7 +899,7 @@ mlir::Value MLIRCodeGenContext::lowerUnaryOp(UnaryExprAST* unaryOp) {
       return builder.create<mlir::simp::NegOp>(loc, resultType, operand);
 
     default:
-      llvm::errs() << "Error: Unsupported unary operator: " << unaryOp->getOp() << "\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0601, "unsupported unary operator: " + std::to_string(unaryOp->getOp()));
       return nullptr;
   }
 }
@@ -856,7 +910,7 @@ mlir::Value MLIRCodeGenContext::lowerCast(CastExprAST* castExpr) {
   // Lower the expression being cast
   mlir::Value value = lowerExpression(castExpr->getExpr());
   if (!value) {
-    llvm::errs() << "Error: Failed to lower cast expression\n";
+    simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Failed to lower cast expression\n");
     return nullptr;
   }
 
@@ -916,7 +970,7 @@ mlir::Value MLIRCodeGenContext::lowerArrayCreate(ArrayCreateExprAST* arrayCreate
 
   const auto& expressions = arrayCreate->getDimensions();
   if (expressions.empty()) {
-    llvm::errs() << "Error: Array must have at least one dimension or initializer\n";
+    simpEmitCodegenError(::simp::diag::ErrorCode::E0400, "Array must have at least one dimension or initializer\n");
     return nullptr;
   }
 
@@ -936,7 +990,7 @@ mlir::Value MLIRCodeGenContext::lowerArrayCreate(ArrayCreateExprAST* arrayCreate
     for (size_t i = 0; i < expressions.size(); ++i) {
       mlir::Value value = lowerExpression(expressions[i].get());
       if (!value) {
-        llvm::errs() << "Error: Failed to lower initializer expression\n";
+        simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Failed to lower initializer expression\n");
         return nullptr;
       }
 
@@ -953,7 +1007,7 @@ mlir::Value MLIRCodeGenContext::lowerArrayCreate(ArrayCreateExprAST* arrayCreate
     for (const auto& dim : expressions) {
       mlir::Value dimValue = lowerExpression(dim.get());
       if (!dimValue) {
-        llvm::errs() << "Error: Failed to lower array dimension\n";
+        simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Failed to lower array dimension\n");
         return nullptr;
       }
       dimValues.push_back(dimValue);
@@ -977,14 +1031,14 @@ mlir::Value MLIRCodeGenContext::lowerArrayAccess(ArrayAccessExprAST* arrayAccess
   // Lower the array expression
   mlir::Value array = lowerExpression(arrayAccess->getArray());
   if (!array) {
-    llvm::errs() << "Error: Failed to lower array expression\n";
+    simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Failed to lower array expression\n");
     return nullptr;
   }
 
   // Lower all index expressions
   const auto& indices = arrayAccess->getIndices();
   if (indices.empty()) {
-    llvm::errs() << "Error: Array/tensor access requires at least one index\n";
+    simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Array/tensor access requires at least one index\n");
     return nullptr;
   }
 
@@ -992,7 +1046,7 @@ mlir::Value MLIRCodeGenContext::lowerArrayAccess(ArrayAccessExprAST* arrayAccess
   for (const auto& idx : indices) {
     mlir::Value indexValue = lowerExpression(idx.get());
     if (!indexValue) {
-      llvm::errs() << "Error: Failed to lower index\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Failed to lower index\n");
       return nullptr;
     }
     indexValues.push_back(indexValue);
@@ -1032,7 +1086,7 @@ mlir::Value MLIRCodeGenContext::lowerArrayAccess(ArrayAccessExprAST* arrayAccess
     // Look up stored dimensions for this array by variable name
     auto dimIt = arrayDimensions.find(arrayVarName);
     if (dimIt == arrayDimensions.end() || arrayVarName.empty()) {
-      llvm::errs() << "Error: Multi-dimensional array access but dimensions not tracked\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Multi-dimensional array access but dimensions not tracked\n");
       llvm::errs() << "       Variable name: " << (arrayVarName.empty() ? "<unknown>" : arrayVarName) << "\n";
       llvm::errs() << "       This array may not have been created with explicit dimensions\n";
       return nullptr;
@@ -1115,7 +1169,7 @@ mlir::Value MLIRCodeGenContext::lowerArrayAccess(ArrayAccessExprAST* arrayAccess
     // Get element type from array type
     auto arrayType = mlir::dyn_cast<mlir::simp::ArrayType>(array.getType());
     if (!arrayType) {
-      llvm::errs() << "Error: Array access on non-array type\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Array access on non-array type\n");
       return nullptr;
     }
 
@@ -1137,14 +1191,14 @@ mlir::Value MLIRCodeGenContext::lowerArrayStore(ArrayStoreExprAST* arrayStore) {
   // Lower the array expression
   mlir::Value array = lowerExpression(arrayStore->getArray());
   if (!array) {
-    llvm::errs() << "Error: Failed to lower array expression in store\n";
+    simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Failed to lower array expression in store\n");
     return nullptr;
   }
 
   // Lower all index expressions
   const auto& indices = arrayStore->getIndices();
   if (indices.empty()) {
-    llvm::errs() << "Error: Array store requires at least one index\n";
+    simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Array store requires at least one index\n");
     return nullptr;
   }
 
@@ -1152,7 +1206,7 @@ mlir::Value MLIRCodeGenContext::lowerArrayStore(ArrayStoreExprAST* arrayStore) {
   for (const auto& idx : indices) {
     mlir::Value indexValue = lowerExpression(idx.get());
     if (!indexValue) {
-      llvm::errs() << "Error: Failed to lower array index in store\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Failed to lower array index in store\n");
       return nullptr;
     }
     indexValues.push_back(indexValue);
@@ -1161,7 +1215,7 @@ mlir::Value MLIRCodeGenContext::lowerArrayStore(ArrayStoreExprAST* arrayStore) {
   // Lower the value to store
   mlir::Value value = lowerExpression(arrayStore->getValue());
   if (!value) {
-    llvm::errs() << "Error: Failed to lower store value\n";
+    simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Failed to lower store value\n");
     return nullptr;
   }
 
@@ -1188,13 +1242,13 @@ mlir::Value MLIRCodeGenContext::lowerArrayStore(ArrayStoreExprAST* arrayStore) {
     // Look up dimensions by variable name
     auto dimIt = arrayDimensions.find(varName);
     if (dimIt == arrayDimensions.end()) {
-      llvm::errs() << "Error: Multi-dimensional array dimensions not tracked for " << varName << "\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0401, "multi-dimensional array dimensions not tracked for " + varName);
       return nullptr;
     }
 
     const auto& dims = dimIt->second;
     if (dims.size() != indexValues.size()) {
-      llvm::errs() << "Error: Dimension mismatch in array store\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0401, "Dimension mismatch in array store\n");
       return nullptr;
     }
 
@@ -1275,66 +1329,66 @@ mlir::Value MLIRCodeGenContext::lowerMatMul(MatMulExprAST* matmul) {
   // Lower the left-hand side matrix (A: MxK)
   mlir::Value lhs = lowerExpression(matmul->getLHS());
   if (!lhs) {
-    llvm::errs() << "Error: Failed to lower matmul LHS\n";
+    simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Failed to lower matmul LHS\n");
     return nullptr;
   }
 
   // Lower the right-hand side matrix (B: KxN)
   mlir::Value rhs = lowerExpression(matmul->getRHS());
   if (!rhs) {
-    llvm::errs() << "Error: Failed to lower matmul RHS\n";
+    simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Failed to lower matmul RHS\n");
     return nullptr;
   }
 
   // Lower the dimension arguments: m, k, n
   mlir::Value m = lowerExpression(matmul->getM());
   if (!m) {
-    llvm::errs() << "Error: Failed to lower matmul dimension m\n";
+    simpEmitCodegenError(::simp::diag::ErrorCode::E0404, "Failed to lower matmul dimension m\n");
     return nullptr;
   }
 
   mlir::Value k = lowerExpression(matmul->getK());
   if (!k) {
-    llvm::errs() << "Error: Failed to lower matmul dimension k\n";
+    simpEmitCodegenError(::simp::diag::ErrorCode::E0404, "Failed to lower matmul dimension k\n");
     return nullptr;
   }
 
   mlir::Value n = lowerExpression(matmul->getN());
   if (!n) {
-    llvm::errs() << "Error: Failed to lower matmul dimension n\n";
+    simpEmitCodegenError(::simp::diag::ErrorCode::E0404, "Failed to lower matmul dimension n\n");
     return nullptr;
   }
 
   // Lower the output buffer (pre-allocated by caller)
   mlir::Value output = lowerExpression(matmul->getOutput());
   if (!output) {
-    llvm::errs() << "Error: Failed to lower matmul output buffer\n";
+    simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Failed to lower matmul output buffer\n");
     return nullptr;
   }
 
   // Lower the offset arguments
   mlir::Value lhs_offset = lowerExpression(matmul->getLHSOffset());
   if (!lhs_offset) {
-    llvm::errs() << "Error: Failed to lower matmul lhs_offset\n";
+    simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Failed to lower matmul lhs_offset\n");
     return nullptr;
   }
 
   mlir::Value rhs_offset = lowerExpression(matmul->getRHSOffset());
   if (!rhs_offset) {
-    llvm::errs() << "Error: Failed to lower matmul rhs_offset\n";
+    simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Failed to lower matmul rhs_offset\n");
     return nullptr;
   }
 
   mlir::Value output_offset = lowerExpression(matmul->getOutputOffset());
   if (!output_offset) {
-    llvm::errs() << "Error: Failed to lower matmul output_offset\n";
+    simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Failed to lower matmul output_offset\n");
     return nullptr;
   }
 
   // Get the array type
   auto arrayType = mlir::dyn_cast<mlir::simp::ArrayType>(output.getType());
   if (!arrayType) {
-    llvm::errs() << "Error: MatMul output is not an array type\n";
+    simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "MatMul output is not an array type\n");
     return nullptr;
   }
 
@@ -1355,7 +1409,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
   for (auto* argExpr : call->getArguments()) {
     mlir::Value arg = lowerExpression(argExpr);
     if (!arg) {
-      llvm::errs() << "Error: Failed to lower call argument\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Failed to lower call argument\n");
       return nullptr;
     }
     args.push_back(arg);
@@ -1365,7 +1419,9 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
   if (calleeName == "conv2d") {
     // conv2d(input, weights, bias, output, batch, in_h, in_w, in_c, out_c, k_h, k_w, stride_h, stride_w, pad_h, pad_w)
     if (args.size() != 15) {
-      llvm::errs() << "Error: conv2d requires 15 arguments (got " << args.size() << ")\n";
+      simpEmitError(call->getLine(), call->getColumn(),
+                    ::simp::diag::ErrorCode::E0304,
+                    "conv2d requires 15 arguments (got " + std::to_string(args.size()) + ")");
       return nullptr;
     }
 
@@ -1404,7 +1460,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
   // Handle builtin: matmul(lhs, rhs, output, m, k, n, lhs_offset, rhs_offset, output_offset)
   if (calleeName == "matmul") {
     if (args.size() != 9) {
-      llvm::errs() << "Error: matmul requires 9 arguments (got " << args.size() << ")\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0304, "matmul requires 9 arguments (got " + std::to_string(args.size()) + ")");
       return nullptr;
     }
 
@@ -1431,7 +1487,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
   // Handle builtin: rmsnorm(input, weight, output, size, epsilon, weight_offset)
   if (calleeName == "rmsnorm") {
     if (args.size() != 6) {
-      llvm::errs() << "Error: rmsnorm requires 6 arguments (got " << args.size() << ")\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0304, "rmsnorm requires 6 arguments (got " + std::to_string(args.size()) + ")");
       return nullptr;
     }
 
@@ -1455,7 +1511,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
   // Handle builtin: softmax(input, output, size, input_offset, output_offset)
   if (calleeName == "softmax") {
     if (args.size() != 5) {
-      llvm::errs() << "Error: softmax requires 5 arguments (got " << args.size() << ")\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0304, "softmax requires 5 arguments (got " + std::to_string(args.size()) + ")");
       return nullptr;
     }
 
@@ -1478,7 +1534,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
   // Handle builtin: silu(input, output, size)
   if (calleeName == "silu") {
     if (args.size() != 3) {
-      llvm::errs() << "Error: silu requires 3 arguments (got " << args.size() << ")\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0304, "silu requires 3 arguments (got " + std::to_string(args.size()) + ")");
       return nullptr;
     }
 
@@ -1499,7 +1555,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
   // Handle builtin: dequant_w4(qweights, scales, zeros, idx, group_size)
   if (calleeName == "dequant_w4") {
     if (args.size() != 5) {
-      llvm::errs() << "Error: dequant_w4 requires 5 arguments (got " << args.size() << ")\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0304, "dequant_w4 requires 5 arguments (got " + std::to_string(args.size()) + ")");
       return nullptr;
     }
 
@@ -1523,7 +1579,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
   // Handle builtin: matmul_quant(qweights, scales, zeros, input, output, rows, cols, group_size, offset)
   if (calleeName == "matmul_quant") {
     if (args.size() != 9) {
-      llvm::errs() << "Error: matmul_quant requires 9 arguments (got " << args.size() << ")\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0304, "matmul_quant requires 9 arguments (got " + std::to_string(args.size()) + ")");
       return nullptr;
     }
 
@@ -1550,7 +1606,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
   // Handle builtin math functions: sqrt, exp
   if (calleeName == "sqrt") {
     if (args.size() != 1) {
-      llvm::errs() << "Error: sqrt requires 1 argument (got " << args.size() << ")\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0304, "sqrt requires 1 arguments (got " + std::to_string(args.size()) + ")");
       return nullptr;
     }
     return builder.create<math::SqrtOp>(loc, args[0]);
@@ -1558,7 +1614,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
 
   if (calleeName == "exp") {
     if (args.size() != 1) {
-      llvm::errs() << "Error: exp requires 1 argument (got " << args.size() << ")\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0304, "exp requires 1 arguments (got " + std::to_string(args.size()) + ")");
       return nullptr;
     }
     return builder.create<math::ExpOp>(loc, args[0]);
@@ -1566,7 +1622,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
 
   if (calleeName == "log") {
     if (args.size() != 1) {
-      llvm::errs() << "Error: log requires 1 argument (got " << args.size() << ")\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0304, "log requires 1 arguments (got " + std::to_string(args.size()) + ")");
       return nullptr;
     }
     return builder.create<math::LogOp>(loc, args[0]);
@@ -1574,7 +1630,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
 
   if (calleeName == "pow") {
     if (args.size() != 2) {
-      llvm::errs() << "Error: pow requires 2 arguments (got " << args.size() << ")\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0304, "pow requires 2 arguments (got " + std::to_string(args.size()) + ")");
       return nullptr;
     }
     return builder.create<math::PowFOp>(loc, args[0], args[1]);
@@ -1582,7 +1638,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
 
   if (calleeName == "cos") {
     if (args.size() != 1) {
-      llvm::errs() << "Error: cos requires 1 argument (got " << args.size() << ")\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0304, "cos requires 1 arguments (got " + std::to_string(args.size()) + ")");
       return nullptr;
     }
     return builder.create<math::CosOp>(loc, args[0]);
@@ -1590,7 +1646,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
 
   if (calleeName == "sin") {
     if (args.size() != 1) {
-      llvm::errs() << "Error: sin requires 1 argument (got " << args.size() << ")\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0304, "sin requires 1 arguments (got " + std::to_string(args.size()) + ")");
       return nullptr;
     }
     return builder.create<math::SinOp>(loc, args[0]);
@@ -1599,13 +1655,13 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
   // Handle tensor reduction builtins
   if (calleeName == "tensor_sum") {
     if (args.size() < 1 || args.size() > 2) {
-      llvm::errs() << "Error: tensor_sum requires 1-2 arguments (tensor, [axis]), got " << args.size() << "\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0304, "tensor_sum requires 1-2 arguments (tensor, [axis]), got " + std::to_string(args.size()));
       return nullptr;
     }
     mlir::Value tensor = args[0];
     auto tensorType = mlir::dyn_cast<mlir::simp::SimpTensorType>(tensor.getType());
     if (!tensorType) {
-      llvm::errs() << "Error: tensor_sum requires a tensor argument\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0403, "tensor_sum requires a tensor argument\n");
       return nullptr;
     }
 
@@ -1686,13 +1742,13 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
 
   if (calleeName == "tensor_mean") {
     if (args.size() < 1 || args.size() > 2) {
-      llvm::errs() << "Error: tensor_mean requires 1-2 arguments (tensor, [axis]), got " << args.size() << "\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0304, "tensor_mean requires 1-2 arguments (tensor, [axis]), got " + std::to_string(args.size()));
       return nullptr;
     }
     mlir::Value tensor = args[0];
     auto tensorType = mlir::dyn_cast<mlir::simp::SimpTensorType>(tensor.getType());
     if (!tensorType) {
-      llvm::errs() << "Error: tensor_mean requires a tensor argument\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0403, "tensor_mean requires a tensor argument\n");
       return nullptr;
     }
 
@@ -1703,13 +1759,13 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
 
   if (calleeName == "tensor_max") {
     if (args.size() < 1 || args.size() > 2) {
-      llvm::errs() << "Error: tensor_max requires 1-2 arguments (tensor, [axis]), got " << args.size() << "\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0304, "tensor_max requires 1-2 arguments (tensor, [axis]), got " + std::to_string(args.size()));
       return nullptr;
     }
     mlir::Value tensor = args[0];
     auto tensorType = mlir::dyn_cast<mlir::simp::SimpTensorType>(tensor.getType());
     if (!tensorType) {
-      llvm::errs() << "Error: tensor_max requires a tensor argument\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0403, "tensor_max requires a tensor argument\n");
       return nullptr;
     }
 
@@ -1720,13 +1776,13 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
 
   if (calleeName == "tensor_min") {
     if (args.size() < 1 || args.size() > 2) {
-      llvm::errs() << "Error: tensor_min requires 1-2 arguments (tensor, [axis]), got " << args.size() << "\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0304, "tensor_min requires 1-2 arguments (tensor, [axis]), got " + std::to_string(args.size()));
       return nullptr;
     }
     mlir::Value tensor = args[0];
     auto tensorType = mlir::dyn_cast<mlir::simp::SimpTensorType>(tensor.getType());
     if (!tensorType) {
-      llvm::errs() << "Error: tensor_min requires a tensor argument\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0403, "tensor_min requires a tensor argument\n");
       return nullptr;
     }
 
@@ -1737,13 +1793,13 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
 
   if (calleeName == "tensor_argmax") {
     if (args.size() < 1 || args.size() > 2) {
-      llvm::errs() << "Error: tensor_argmax requires 1-2 arguments (tensor, [axis]), got " << args.size() << "\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0304, "tensor_argmax requires 1-2 arguments (tensor, [axis]), got " + std::to_string(args.size()));
       return nullptr;
     }
     mlir::Value tensor = args[0];
     auto tensorType = mlir::dyn_cast<mlir::simp::SimpTensorType>(tensor.getType());
     if (!tensorType) {
-      llvm::errs() << "Error: tensor_argmax requires a tensor argument\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0403, "tensor_argmax requires a tensor argument\n");
       return nullptr;
     }
 
@@ -1755,14 +1811,14 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
   // tensor_reshape: tensor_reshape(tensor, dim0, dim1, ...)
   if (calleeName == "tensor_reshape") {
     if (args.size() < 2) {
-      llvm::errs() << "Error: tensor_reshape requires at least 2 arguments (tensor, new_dims...), got " << args.size() << "\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0304, "tensor_reshape requires at least 2 arguments (tensor, new_dims...), got " + std::to_string(args.size()));
       return nullptr;
     }
 
     mlir::Value tensor = args[0];
     auto tensorType = mlir::dyn_cast<mlir::simp::SimpTensorType>(tensor.getType());
     if (!tensorType) {
-      llvm::errs() << "Error: tensor_reshape requires a tensor argument\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0403, "tensor_reshape requires a tensor argument\n");
       return nullptr;
     }
 
@@ -1781,7 +1837,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
     }
 
     if (newShape.empty()) {
-      llvm::errs() << "Error: tensor_reshape requires constant dimension arguments\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0403, "tensor_reshape requires constant dimension arguments\n");
       return nullptr;
     }
 
@@ -1793,14 +1849,14 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
   // tensor_transpose: tensor_transpose(tensor) or tensor_transpose(tensor, perm0, perm1, ...)
   if (calleeName == "tensor_transpose") {
     if (args.size() < 1) {
-      llvm::errs() << "Error: tensor_transpose requires at least 1 argument (tensor, [perm...]), got " << args.size() << "\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0304, "tensor_transpose requires at least 1 arguments (tensor, [perm...]), got " + std::to_string(args.size()));
       return nullptr;
     }
 
     mlir::Value tensor = args[0];
     auto tensorType = mlir::dyn_cast<mlir::simp::SimpTensorType>(tensor.getType());
     if (!tensorType) {
-      llvm::errs() << "Error: tensor_transpose requires a tensor argument\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0403, "tensor_transpose requires a tensor argument\n");
       return nullptr;
     }
 
@@ -1828,7 +1884,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
       }
 
       if (perm.size() != rank) {
-        llvm::errs() << "Error: transpose permutation size must match tensor rank\n";
+        simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "transpose permutation size must match tensor rank\n");
         return nullptr;
       }
 
@@ -1837,7 +1893,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
         resultShape.push_back(shape[p]);
       }
     } else {
-      llvm::errs() << "Error: tensor_transpose requires permutation for rank > 2\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0403, "tensor_transpose requires permutation for rank > 2\n");
       return nullptr;
     }
 
@@ -1849,14 +1905,14 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
   // tensor_slice: tensor_slice(tensor, start0, end0, start1, end1, ...)
   if (calleeName == "tensor_slice") {
     if (args.size() < 1) {
-      llvm::errs() << "Error: tensor_slice requires arguments (tensor, indices...), got " << args.size() << "\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0304, "tensor_slice requires arguments (tensor, indices...), got " + std::to_string(args.size()));
       return nullptr;
     }
 
     mlir::Value tensor = args[0];
     auto tensorType = mlir::dyn_cast<mlir::simp::SimpTensorType>(tensor.getType());
     if (!tensorType) {
-      llvm::errs() << "Error: tensor_slice requires a tensor argument\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0403, "tensor_slice requires a tensor argument\n");
       return nullptr;
     }
 
@@ -1894,7 +1950,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
       }
 
       if (start == -1 || end == -1) {
-        llvm::errs() << "Error: tensor_slice requires constant start/end indices\n";
+        simpEmitCodegenError(::simp::diag::ErrorCode::E0403, "tensor_slice requires constant start/end indices\n");
         return nullptr;
       }
 
@@ -1909,7 +1965,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
   // tensor_gather: tensor_gather(source, indices, [axis])
   if (calleeName == "tensor_gather") {
     if (args.size() < 2 || args.size() > 3) {
-      llvm::errs() << "Error: tensor_gather requires 2-3 arguments (source, indices, [axis]), got " << args.size() << "\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0304, "tensor_gather requires 2-3 arguments (source, indices, [axis]), got " + std::to_string(args.size()));
       return nullptr;
     }
 
@@ -1919,17 +1975,17 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
     auto indicesType = mlir::dyn_cast<mlir::simp::SimpTensorType>(indices.getType());
 
     if (!sourceType) {
-      llvm::errs() << "Error: tensor_gather requires tensor source argument\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0403, "tensor_gather requires tensor source argument\n");
       return nullptr;
     }
     if (!indicesType) {
-      llvm::errs() << "Error: tensor_gather requires tensor indices argument\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0403, "tensor_gather requires tensor indices argument\n");
       return nullptr;
     }
 
     // Validate indices tensor is 1D and i64
     if (indicesType.getShape().size() != 1) {
-      llvm::errs() << "Error: tensor_gather indices must be 1D tensor, got rank " << indicesType.getShape().size() << "\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0400, "tensor_gather indices must be 1D tensor, got rank " + std::to_string(indicesType.getShape().size()));
       return nullptr;
     }
 
@@ -1958,7 +2014,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
       axis += rank;
     }
     if (axis < 0 || axis >= rank) {
-      llvm::errs() << "Error: tensor_gather axis " << axis << " out of bounds for rank " << rank << "\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0402, "tensor_gather axis " + std::to_string(axis) + " out of bounds for rank " + std::to_string(rank));
       return nullptr;
     }
 
@@ -1984,7 +2040,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
   // tensor_scatter: tensor_scatter(dst, indices, values, [axis])
   if (calleeName == "tensor_scatter") {
     if (args.size() < 3 || args.size() > 4) {
-      llvm::errs() << "Error: tensor_scatter requires 3-4 arguments (dst, indices, values, [axis]), got " << args.size() << "\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0304, "tensor_scatter requires 3-4 arguments (dst, indices, values, [axis]), got " + std::to_string(args.size()));
       return nullptr;
     }
 
@@ -1996,21 +2052,21 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
     auto valuesType = mlir::dyn_cast<mlir::simp::SimpTensorType>(values.getType());
 
     if (!dstType) {
-      llvm::errs() << "Error: tensor_scatter requires tensor dst argument\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0403, "tensor_scatter requires tensor dst argument\n");
       return nullptr;
     }
     if (!indicesType) {
-      llvm::errs() << "Error: tensor_scatter requires tensor indices argument\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0403, "tensor_scatter requires tensor indices argument\n");
       return nullptr;
     }
     if (!valuesType) {
-      llvm::errs() << "Error: tensor_scatter requires tensor values argument\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0403, "tensor_scatter requires tensor values argument\n");
       return nullptr;
     }
 
     // Validate indices tensor is 1D
     if (indicesType.getShape().size() != 1) {
-      llvm::errs() << "Error: tensor_scatter indices must be 1D tensor, got rank " << indicesType.getShape().size() << "\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0400, "tensor_scatter indices must be 1D tensor, got rank " + std::to_string(indicesType.getShape().size()));
       return nullptr;
     }
 
@@ -2039,25 +2095,25 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
       axis += rank;
     }
     if (axis < 0 || axis >= rank) {
-      llvm::errs() << "Error: tensor_scatter axis " << axis << " out of bounds for rank " << rank << "\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0402, "tensor_scatter axis " + std::to_string(axis) + " out of bounds for rank " + std::to_string(rank));
       return nullptr;
     }
 
     // Validate values shape matches dst shape with axis replaced by numIndices
     auto valuesShape = valuesType.getShape();
     if (valuesShape.size() != rank) {
-      llvm::errs() << "Error: tensor_scatter values rank must match dst rank\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "tensor_scatter values rank must match dst rank\n");
       return nullptr;
     }
     for (int64_t i = 0; i < rank; i++) {
       if (i == axis) {
         if (valuesShape[i] != numIndices) {
-          llvm::errs() << "Error: tensor_scatter values axis dimension must match indices length\n";
+          simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "tensor_scatter values axis dimension must match indices length\n");
           return nullptr;
         }
       } else {
         if (valuesShape[i] != dstShape[i]) {
-          llvm::errs() << "Error: tensor_scatter values shape must match dst shape (except axis)\n";
+          simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "tensor_scatter values shape must match dst shape (except axis)\n");
           return nullptr;
         }
       }
@@ -2076,7 +2132,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
   // tensor_from_array is handled specially in variable declarations
   // See lowerVariableDeclaration for the implementation
   if (calleeName == "tensor_from_array") {
-    llvm::errs() << "Error: tensor_from_array must be used in a tensor variable declaration\n";
+    simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "tensor_from_array must be used in a tensor variable declaration\n");
     llvm::errs() << "  Example: f32<32000, 768> embedding = tensor_from_array(array);\n";
     return nullptr;
   }
@@ -2084,7 +2140,9 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
   // tensor_matmul: tensor_matmul(lhs, rhs)
   if (calleeName == "tensor_matmul") {
     if (args.size() != 2) {
-      llvm::errs() << "Error: tensor_matmul requires 2 arguments (lhs, rhs), got " << args.size() << "\n";
+      simpEmitError(call->getLine(), call->getColumn(),
+                    ::simp::diag::ErrorCode::E0304,
+                    "tensor_matmul requires 2 arguments (lhs, rhs), got " + std::to_string(args.size()));
       return nullptr;
     }
 
@@ -2094,11 +2152,15 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
     auto rhsType = mlir::dyn_cast<mlir::simp::SimpTensorType>(rhs.getType());
 
     if (!lhsType) {
-      llvm::errs() << "Error: tensor_matmul requires tensor lhs argument\n";
+      simpEmitError(call->getLine(), call->getColumn(),
+                    ::simp::diag::ErrorCode::E0403,
+                    "tensor_matmul requires tensor lhs argument");
       return nullptr;
     }
     if (!rhsType) {
-      llvm::errs() << "Error: tensor_matmul requires tensor rhs argument\n";
+      simpEmitError(call->getLine(), call->getColumn(),
+                    ::simp::diag::ErrorCode::E0403,
+                    "tensor_matmul requires tensor rhs argument");
       return nullptr;
     }
 
@@ -2118,7 +2180,10 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
       int64_t N = rhsShape[1];
 
       if (K_lhs != K_rhs) {
-        llvm::errs() << "Error: tensor_matmul dimension mismatch: lhs K=" << K_lhs << ", rhs K=" << K_rhs << "\n";
+        simpEmitError(call->getLine(), call->getColumn(),
+                      ::simp::diag::ErrorCode::E0404,
+                      "tensor_matmul dimension mismatch: lhs K=" + std::to_string(K_lhs) +
+                      ", rhs K=" + std::to_string(K_rhs));
         return nullptr;
       }
 
@@ -2134,11 +2199,11 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
       int64_t N = rhsShape[2];
 
       if (B_lhs != B_rhs) {
-        llvm::errs() << "Error: tensor_matmul batch size mismatch\n";
+        simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "tensor_matmul batch size mismatch\n");
         return nullptr;
       }
       if (K_lhs != K_rhs) {
-        llvm::errs() << "Error: tensor_matmul dimension mismatch\n";
+        simpEmitCodegenError(::simp::diag::ErrorCode::E0401, "tensor_matmul dimension mismatch\n");
         return nullptr;
       }
 
@@ -2154,7 +2219,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
       int64_t C_in_rhs = rhsShape[1];
 
       if (C_in_lhs != C_in_rhs) {
-        llvm::errs() << "Error: tensor_matmul channel mismatch\n";
+        simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "tensor_matmul channel mismatch\n");
         return nullptr;
       }
 
@@ -2182,7 +2247,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
   // A[M,K] × B_T[N,K] → C[M,N] - no runtime transpose needed
   if (calleeName == "tensor_matmul_nt") {
     if (args.size() != 2) {
-      llvm::errs() << "Error: tensor_matmul_nt requires 2 arguments (lhs, rhs_transposed), got " << args.size() << "\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0304, "tensor_matmul_nt requires 2 arguments (lhs, rhs_transposed), got " + std::to_string(args.size()));
       return nullptr;
     }
 
@@ -2192,7 +2257,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
     auto rhsType = mlir::dyn_cast<mlir::simp::SimpTensorType>(rhs.getType());
 
     if (!lhsType || !rhsType) {
-      llvm::errs() << "Error: tensor_matmul_nt requires tensor arguments\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0403, "tensor_matmul_nt requires tensor arguments\n");
       return nullptr;
     }
 
@@ -2200,7 +2265,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
     auto rhsShape = rhsType.getShape();
 
     if (lhsShape.size() != 2 || rhsShape.size() != 2) {
-      llvm::errs() << "Error: tensor_matmul_nt requires 2D tensors\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0403, "tensor_matmul_nt requires 2D tensors\n");
       return nullptr;
     }
 
@@ -2211,7 +2276,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
     int64_t K_rhs = rhsShape[1];
 
     if (K_lhs != K_rhs) {
-      llvm::errs() << "Error: tensor_matmul_nt dimension mismatch: K=" << K_lhs << " vs " << K_rhs << "\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0404, "tensor_matmul_nt dimension mismatch: K=" + std::to_string(K_lhs) + " vs " + std::to_string(K_rhs));
       return nullptr;
     }
 
@@ -2232,7 +2297,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
   // tensor_dot: tensor_dot(lhs, rhs)
   if (calleeName == "tensor_dot") {
     if (args.size() != 2) {
-      llvm::errs() << "Error: tensor_dot requires 2 arguments (lhs, rhs), got " << args.size() << "\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0304, "tensor_dot requires 2 arguments (lhs, rhs), got " + std::to_string(args.size()));
       return nullptr;
     }
 
@@ -2242,11 +2307,11 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
     auto rhsType = mlir::dyn_cast<mlir::simp::SimpTensorType>(rhs.getType());
 
     if (!lhsType) {
-      llvm::errs() << "Error: tensor_dot requires tensor lhs argument\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0403, "tensor_dot requires tensor lhs argument\n");
       return nullptr;
     }
     if (!rhsType) {
-      llvm::errs() << "Error: tensor_dot requires tensor rhs argument\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0403, "tensor_dot requires tensor rhs argument\n");
       return nullptr;
     }
 
@@ -2254,12 +2319,12 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
     auto rhsShape = rhsType.getShape();
 
     if (lhsShape.size() != 1 || rhsShape.size() != 1) {
-      llvm::errs() << "Error: tensor_dot requires 1D tensors\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0403, "tensor_dot requires 1D tensors\n");
       return nullptr;
     }
 
     if (lhsShape[0] != rhsShape[0]) {
-      llvm::errs() << "Error: tensor_dot dimension mismatch: " << lhsShape[0] << " vs " << rhsShape[0] << "\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0404, "tensor_dot dimension mismatch: " + std::to_string(lhsShape[0]) + " vs " + std::to_string(rhsShape[0]));
       return nullptr;
     }
 
@@ -2272,7 +2337,9 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
   // Look up user-defined functions in the module
   mlir::func::FuncOp callee = module.lookupSymbol<mlir::func::FuncOp>(calleeName);
   if (!callee) {
-    llvm::errs() << "Error: Undefined function '" << calleeName << "'\n";
+    simpEmitError(call->getLine(), call->getColumn(),
+                  ::simp::diag::ErrorCode::E0301,
+                  "undefined function '" + calleeName + "'");
     return nullptr;
   }
 
@@ -2286,7 +2353,7 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
 
   // Return the first result (functions return a single value)
   if (callOp.getNumResults() == 0) {
-    llvm::errs() << "Error: Function '" << calleeName << "' has no return value\n";
+    simpEmitCodegenError(::simp::diag::ErrorCode::E0310, "function \'" + calleeName + "\' has no return value");
     return nullptr;
   }
 
@@ -2324,20 +2391,20 @@ mlir::LogicalResult MLIRCodeGenContext::lowerStatement(StmtAST* stmt) {
 
     case ASTKind::FunctionDecl:
       // Functions are handled at top level, not as statements
-      llvm::errs() << "Warning: Function declarations should be lowered at module level\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0000, "Function declarations should be lowered at module level\n");
       return mlir::success();
 
     case ASTKind::BlockStmt:
     case ASTKind::IncludeStmt:
       // Not yet implemented
-      llvm::errs() << "Warning: Statement kind not yet implemented in MLIR lowering\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0000, "Statement kind not yet implemented in MLIR lowering\n");
       return mlir::success();
 
     case ASTKind::AnnotatedBlockStmt:
       return lowerAnnotatedBlock(static_cast<AnnotatedBlockAST*>(stmt));
 
     default:
-      llvm::errs() << "Error: Unknown statement kind in MLIR lowering\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Unknown statement kind in MLIR lowering\n");
       return mlir::failure();
   }
 }
@@ -2372,7 +2439,7 @@ mlir::LogicalResult MLIRCodeGenContext::lowerDeclaration(VariableDeclarationAST*
     auto simpTensorType = mlir::dyn_cast<mlir::simp::SimpTensorType>(tensorType);
 
     if (!simpTensorType) {
-      llvm::errs() << "Error: Expected SimpTensorType for tensor declaration\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Expected SimpTensorType for tensor declaration\n");
       return mlir::failure();
     }
 
@@ -2445,13 +2512,13 @@ mlir::LogicalResult MLIRCodeGenContext::lowerDeclaration(VariableDeclarationAST*
       size_t numArgs = funcCall->getArguments().size();
       LOG_DEBUG("tensor_from_array has ", numArgs, " arguments");
       if (numArgs != 1 && numArgs != 2) {
-        llvm::errs() << "Error: tensor_from_array requires 1 or 2 arguments (array, [offset])\n";
+        simpEmitCodegenError(::simp::diag::ErrorCode::E0403, "tensor_from_array requires 1 or 2 arguments (array, [offset])\n");
         return mlir::failure();
       }
 
       mlir::Value arrayArg = lowerExpression(funcCall->getArguments()[0]);
       if (!arrayArg) {
-        llvm::errs() << "Error: Failed to lower tensor_from_array array argument\n";
+        simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Failed to lower tensor_from_array array argument\n");
         return mlir::failure();
       }
 
@@ -2460,7 +2527,7 @@ mlir::LogicalResult MLIRCodeGenContext::lowerDeclaration(VariableDeclarationAST*
       if (numArgs == 2) {
         offsetArg = lowerExpression(funcCall->getArguments()[1]);
         if (!offsetArg) {
-          llvm::errs() << "Error: Failed to lower tensor_from_array offset argument\n";
+          simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Failed to lower tensor_from_array offset argument\n");
           return mlir::failure();
         }
       } else {
@@ -2776,14 +2843,14 @@ mlir::LogicalResult MLIRCodeGenContext::lowerIf(IfAST* ifStmt) {
   // Lower the condition expression
   mlir::Value condition = lowerExpression(ifStmt->getCondition());
   if (!condition) {
-    llvm::errs() << "Error: Failed to lower if condition\n";
+    simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Failed to lower if condition\n");
     return mlir::failure();
   }
 
   // The condition must be i1 type for scf.if
   if (!condition.getType().isInteger(1)) {
     // For now, we'll just warn about this limitation
-    llvm::errs() << "Warning: Non-boolean condition in if statement\n";
+    simpEmitCodegenError(::simp::diag::ErrorCode::E0000, "Non-boolean condition in if statement\n");
   }
 
   // Get the set of variables that exist before the if statement
@@ -3037,14 +3104,14 @@ mlir::LogicalResult MLIRCodeGenContext::lowerWhile(WhileAST* whileLoop) {
     // Lower the condition
     mlir::Value condition = lowerExpression(whileLoop->getCondition());
     if (!condition) {
-      llvm::errs() << "Error: Failed to lower while condition\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Failed to lower while condition\n");
       popScope();
       return mlir::failure();
     }
 
     // The condition must be i1 type
     if (!condition.getType().isInteger(1)) {
-      llvm::errs() << "Warning: Non-boolean condition in while loop\n";
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0000, "Non-boolean condition in while loop\n");
     }
 
     // Collect current values for passing to loop body
@@ -3142,7 +3209,7 @@ mlir::LogicalResult MLIRCodeGenContext::lowerFor(ForAST* forLoop) {
   mlir::Value loopVarInit = lookupVariable(loopVarName);
 
   if (!loopVarInit) {
-    llvm::errs() << "Error: Loop variable not found after init\n";
+    simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Loop variable not found after init\n");
     popScope();
     return mlir::failure();
   }
@@ -3161,7 +3228,7 @@ mlir::LogicalResult MLIRCodeGenContext::lowerFor(ForAST* forLoop) {
   }
 
   if (!upperBound) {
-    llvm::errs() << "Error: Could not extract upper bound from for condition\n";
+    simpEmitCodegenError(::simp::diag::ErrorCode::E0600, "Could not extract upper bound from for condition\n");
     popScope();
     return mlir::failure();
   }
@@ -3436,9 +3503,9 @@ void MLIRCodeGenContext::updateSymbolTableWithResults(
 
   // Ensure we have the right number of results
   if (varNames.size() != results.size()) {
-    llvm::errs() << "Error: Mismatch between variable count ("
-                 << varNames.size() << ") and result count ("
-                 << results.size() << ")\n";
+    simpEmitCodegenError(::simp::diag::ErrorCode::E0600,
+        "mismatch between variable count (" + std::to_string(varNames.size()) +
+        ") and result count (" + std::to_string(results.size()) + ")");
     return;
   }
 
