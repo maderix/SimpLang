@@ -200,6 +200,18 @@ bool MLIRCompilationPipeline::runPasses() {
     }
   }
 
+  // Insert prefetch ops after buffer deallocation (memref.prefetch has unknown memory effects)
+  if (enablePrefetch && !enableDebugInfo && !skipMLIRVectorization) {
+    llvm::outs() << "[Prefetch] Inserting prefetch operations into loops\n";
+    mlir::PassManager pm(module.getContext());
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::simp::createInsertPrefetchPass());
+    pm.addPass(mlir::createCanonicalizerPass());
+    if (failed(pm.run(module))) {
+      iceHandler.emitICE();
+      return false;
+    }
+  }
+
   // Phase 2.6: Late-stage OpenMP conversion
   // This runs AFTER buffer management so that deallocation ops don't end up
   // inside omp.wsloop (which requires exactly one nested op - omp.loop_nest)
@@ -458,15 +470,6 @@ void MLIRCompilationPipeline::buildPhase2_LinalgOptimization(mlir::OpPassManager
   if (!enableDebugInfo) {
     pm.addPass(mlir::createCanonicalizerPass());
     pm.addPass(mlir::createCSEPass());
-  }
-
-  // INSERT PREFETCH: Add prefetch operations to hide memory latency
-  // NOTE: Prefetch is disabled when using LLVM vectorization path because
-  // InsertPrefetchPass can generate invalid IR with certain loop structures.
-  if (enablePrefetch && !enableDebugInfo && !skipMLIRVectorization) {
-    llvm::outs() << "[Prefetch] Inserting prefetch operations into loops\n";
-    pm.addNestedPass<mlir::func::FuncOp>(mlir::simp::createInsertPrefetchPass());
-    pm.addPass(mlir::createCanonicalizerPass());
   }
 
   // OPTIMIZATION: Skip optimizations in debug mode

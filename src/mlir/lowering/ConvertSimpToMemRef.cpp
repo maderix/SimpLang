@@ -290,15 +290,24 @@ struct TensorCreateOpLowering : public OpConversionPattern<simp::TensorCreateOp>
       simp::TensorCreateOp op, OpAdaptor adaptor,
       ConversionPatternRewriter &rewriter) const override {
 
-    // Get the tensor type
-    auto tensorType = mlir::cast<simp::SimpTensorType>(op.getType());
+    auto loc = op.getLoc();
 
-    // Convert to memref<shape x T> with static dimensions
-    auto memrefType = MemRefType::get(tensorType.getShape(), tensorType.getElementType());
+    // Get the expected result type from type converter (may be strided memref)
+    auto resultType = mlir::cast<MemRefType>(getTypeConverter()->convertType(op.getType()));
 
-    // Create memref.alloc with static shape
-    rewriter.replaceOpWithNewOp<memref::AllocOp>(op, memrefType);
+    // Create simple memref type for allocation (no strided layout)
+    auto allocType = MemRefType::get(resultType.getShape(), resultType.getElementType());
 
+    // Allocate with simple type
+    Value allocResult = rewriter.create<memref::AllocOp>(loc, allocType);
+
+    // Cast to expected strided type if needed
+    Value result = allocResult;
+    if (resultType != allocType) {
+      result = rewriter.create<memref::CastOp>(loc, resultType, allocResult);
+    }
+
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
@@ -540,7 +549,14 @@ struct TensorBinaryOpLowering : public OpConversionPattern<SimpOp> {
     auto shape = memrefType.getShape();
 
     // Allocate result memref
-    Value result = rewriter.create<memref::AllocOp>(loc, memrefType);
+    // For strided memref with dynamic offset, we must allocate simple type first
+    // then cast to the expected strided type
+    auto allocType = MemRefType::get(shape, memrefType.getElementType());
+    Value allocResult = rewriter.create<memref::AllocOp>(loc, allocType);
+    Value result = allocResult;
+    if (memrefType != allocType) {
+      result = rewriter.create<memref::CastOp>(loc, memrefType, allocResult);
+    }
 
     // Build nested loops for each dimension
     SmallVector<Value, 4> lowerBounds, upperBounds, steps;
@@ -595,7 +611,13 @@ struct TensorUnaryOpLowering : public OpConversionPattern<SimpOp> {
     auto elemType = memrefType.getElementType();
 
     // Allocate result memref
-    Value result = rewriter.create<memref::AllocOp>(loc, memrefType);
+    // For strided memref with dynamic offset, allocate simple type first then cast
+    auto allocType = MemRefType::get(shape, elemType);
+    Value allocResult = rewriter.create<memref::AllocOp>(loc, allocType);
+    Value result = allocResult;
+    if (memrefType != allocType) {
+      result = rewriter.create<memref::CastOp>(loc, memrefType, allocResult);
+    }
 
     // Build nested loops
     SmallVector<Value, 4> lowerBounds, upperBounds, steps;
@@ -2285,8 +2307,13 @@ struct TensorReshapeOpLowering : public OpConversionPattern<simp::TensorReshapeO
       totalElements *= dim;
     }
 
-    // Allocate result tensor
-    Value result = rewriter.create<memref::AllocOp>(loc, resultType);
+    // Allocate result tensor (simple type first, then cast to strided)
+    auto allocType = MemRefType::get(resultType.getShape(), resultType.getElementType());
+    Value allocResult = rewriter.create<memref::AllocOp>(loc, allocType);
+    Value result = allocResult;
+    if (resultType != allocType) {
+      result = rewriter.create<memref::CastOp>(loc, resultType, allocResult);
+    }
 
     // Use linalg.generic with flat 1D iteration for vectorization
     // Collapse both input and output to 1D views
@@ -2364,8 +2391,13 @@ struct TensorTransposeOpLowering : public OpConversionPattern<simp::TensorTransp
     auto inputShape = inputType.getShape();
     auto resultShape = resultType.getShape();
 
-    // Allocate result tensor
-    Value result = rewriter.create<memref::AllocOp>(loc, resultType);
+    // Allocate result tensor (simple type first, then cast to strided)
+    auto allocType = MemRefType::get(resultType.getShape(), resultType.getElementType());
+    Value allocResult = rewriter.create<memref::AllocOp>(loc, allocType);
+    Value result = allocResult;
+    if (resultType != allocType) {
+      result = rewriter.create<memref::CastOp>(loc, resultType, allocResult);
+    }
 
     // Build nested loops for transpose
     SmallVector<Value, 4> lbs, ubs, steps;
@@ -2424,8 +2456,13 @@ struct TensorSliceOpLowering : public OpConversionPattern<simp::TensorSliceOp> {
       ends.push_back(allOperands[1 + i * 2 + 1]);
     }
 
-    // Allocate result tensor
-    Value result = rewriter.create<memref::AllocOp>(loc, resultType);
+    // Allocate result tensor (simple type first, then cast to strided)
+    auto allocType = MemRefType::get(resultType.getShape(), resultType.getElementType());
+    Value allocResult = rewriter.create<memref::AllocOp>(loc, allocType);
+    Value result = allocResult;
+    if (resultType != allocType) {
+      result = rewriter.create<memref::CastOp>(loc, resultType, allocResult);
+    }
 
     // Build nested loops to copy slice
     SmallVector<Value, 4> lbs, ubs, steps;
@@ -2498,8 +2535,13 @@ struct TensorGatherOpLowering : public OpConversionPattern<simp::TensorGatherOp>
       axis += rank;
     }
 
-    // Allocate result tensor
-    Value result = rewriter.create<memref::AllocOp>(loc, resultType);
+    // Allocate result tensor (simple type first, then cast to strided)
+    auto allocType = MemRefType::get(resultType.getShape(), resultType.getElementType());
+    Value allocResult = rewriter.create<memref::AllocOp>(loc, allocType);
+    Value result = allocResult;
+    if (resultType != allocType) {
+      result = rewriter.create<memref::CastOp>(loc, resultType, allocResult);
+    }
 
     // OPTIMIZATION: For axis=0 with 2D/3D, use explicit nested loops (no delinearization overhead)
     // This matches the native C++ pattern more closely and avoids expensive div/mod ops
@@ -2862,10 +2904,9 @@ struct TensorMatMulOpLowering : public OpConversionPattern<simp::TensorMatMulOp>
 
       auto elemType = lhsType.getElementType();
 
-      // Create 2D views using memref.collapse_shape
+      // Create 2D views using memref.collapse_shape (let MLIR infer strided output type)
       SmallVector<ReassociationIndices, 2> lhsReassoc = {{0, 1, 2}, {3}};
-      auto lhsCollapsed = rewriter.create<memref::CollapseShapeOp>(
-          loc, MemRefType::get({spatial, C_in}, elemType), lhs, lhsReassoc);
+      auto lhsCollapsed = rewriter.create<memref::CollapseShapeOp>(loc, lhs, lhsReassoc);
 
       // Transpose weights from (C_out, C_in) to (C_in, C_out) for matmul
       auto rhsTransposed = rewriter.create<memref::AllocOp>(
@@ -2900,12 +2941,13 @@ struct TensorMatMulOpLowering : public OpConversionPattern<simp::TensorMatMulOp>
       rewriter.create<linalg::MatmulOp>(
           loc, ValueRange{lhsCollapsed, rhsTransposed}, ValueRange(tempResult));
 
-      // Reshape result back to (N, H, W, C_out)
+      // Reshape result back to (N, H, W, C_out) - use simple type matching tempResult
       SmallVector<ReassociationIndices, 2> resultReassoc = {{0, 1, 2}, {3}};
+      auto expandedType = MemRefType::get({N, H, W, C_out}, elemType);
       auto resultExpanded = rewriter.create<memref::ExpandShapeOp>(
-          loc, resultType, tempResult, resultReassoc);
+          loc, expandedType, tempResult, resultReassoc);
 
-      // Copy expanded result to final output
+      // Copy expanded result to final output (simple to simple, allocResult is simple)
       rewriter.create<memref::CopyOp>(loc, resultExpanded, allocResult);
 
     } else {

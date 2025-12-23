@@ -26,6 +26,8 @@
 #include "llvm/Transforms/Utils/LoopUtils.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "mlir/passes/AnnotationRegistry.h"
+#include <map>
+#include <string>
 
 using namespace llvm;
 
@@ -136,7 +138,10 @@ struct TiledMatmulLoops {
   int64_t M = 0;  // A rows, C rows
   int64_t N = 0;  // B cols, C cols
   int64_t K = 0;  // A cols, B rows (reduction dimension)
-  int64_t TileSize = 16;
+  int64_t TileSize = 16;  // K tile (kept for compatibility)
+  int64_t TileSizeM = 64; // M tile size (for ii loop) - extracted from annotation
+  int64_t TileSizeN = 64; // N tile size (for jj loop) - extracted from annotation
+  int64_t TileSizeK = 4;  // K tile size (for kk loop) - extracted from annotation
 
   bool isValid() const {
     return IOuterLoop && JOuterLoop && KOuterLoop &&
@@ -207,11 +212,155 @@ struct MatmulOperands {
 };
 
 //===----------------------------------------------------------------------===//
+// Module-level storage for hoisted B_T pointers (for OpenMP transpose hoisting)
+//===----------------------------------------------------------------------===//
+static std::map<std::string, GlobalVariable*> HoistedBT;
+
+//===----------------------------------------------------------------------===//
 // VNNIPass - Main pass implementation
 //===----------------------------------------------------------------------===//
 struct VNNIPass : public FunctionPass {
   static char ID;
   VNNIPass() : FunctionPass(ID) {}
+
+  // Check if function is an OpenMP outlined function
+  bool isOutlinedFunction(const std::string &name) {
+    return name.find("..omp_par") != std::string::npos;
+  }
+
+  // Get parent function name from outlined function name
+  std::string getParentFuncName(const std::string &outlinedName) {
+    size_t pos = outlinedName.find("..omp_par");
+    if (pos != std::string::npos) {
+      return outlinedName.substr(0, pos);
+    }
+    return outlinedName;
+  }
+
+  // Check if function has __kmpc_fork_call (is OpenMP parent)
+  CallInst* findForkCall(Function &F) {
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        if (auto *CI = dyn_cast<CallInst>(&I)) {
+          if (auto *Callee = CI->getCalledFunction()) {
+            if (Callee->getName() == "__kmpc_fork_call") {
+              return CI;
+            }
+          }
+        }
+      }
+    }
+    return nullptr;
+  }
+
+  // Generate hoisted B_transpose in parent function before __kmpc_fork_call
+  bool generateHoistedTranspose(Function &F, CallInst *ForkCall,
+                                 int64_t K, int64_t N, Value *BaseB) {
+    std::string funcName = F.getName().str();
+    errs() << "VNNI-HOIST: Generating hoisted B_transpose for " << funcName << "\n";
+
+    LLVMContext &Ctx = F.getContext();
+    Module *M = F.getParent();
+
+    Type *I64Ty = Type::getInt64Ty(Ctx);
+    Type *I8Ty = Type::getInt8Ty(Ctx);
+    Type *PtrTy = PointerType::get(Ctx, 0);
+
+    // Create global variable for B_T pointer
+    std::string globalName = "vnni_B_T_" + funcName;
+    GlobalVariable *BT_Global = new GlobalVariable(
+        *M, PtrTy, false, GlobalValue::InternalLinkage,
+        ConstantPointerNull::get(cast<PointerType>(PtrTy)), globalName);
+    HoistedBT[funcName] = BT_Global;
+    errs() << "  Created global: " << globalName << "\n";
+
+    // Insert allocation and transpose BEFORE fork_call
+    IRBuilder<> Builder(ForkCall);
+
+    FunctionCallee AlignedAllocFn = M->getOrInsertFunction(
+        "aligned_alloc", PtrTy, I64Ty, I64Ty);
+    FunctionCallee FreeFn = M->getOrInsertFunction("free", Type::getVoidTy(Ctx), PtrTy);
+
+    int64_t AllocSize = ((N * K + 63) / 64) * 64;
+    Value *Align = ConstantInt::get(I64Ty, 64);
+    Value *Size = ConstantInt::get(I64Ty, AllocSize);
+    Value *BT_Alloc = Builder.CreateCall(AlignedAllocFn, {Align, Size}, "B_T_hoisted");
+    errs() << "  Allocated " << AllocSize << " bytes for B_T\n";
+
+    // Store to global for outlined function to access
+    Builder.CreateStore(BT_Alloc, BT_Global);
+
+    // Generate transpose loops inline before fork_call
+    BasicBlock *OrigBB = ForkCall->getParent();
+    BasicBlock *ContinueBB = OrigBB->splitBasicBlock(ForkCall, "fork_call_bb");
+
+    // Remove the unconditional branch created by splitBasicBlock
+    OrigBB->getTerminator()->eraseFromParent();
+
+    // Create transpose loop blocks
+    BasicBlock *JHdr = BasicBlock::Create(Ctx, "hoist.j.hdr", &F, ContinueBB);
+    BasicBlock *KHdr = BasicBlock::Create(Ctx, "hoist.k.hdr", &F, ContinueBB);
+    BasicBlock *KBody = BasicBlock::Create(Ctx, "hoist.k.body", &F, ContinueBB);
+    BasicBlock *KExit = BasicBlock::Create(Ctx, "hoist.k.exit", &F, ContinueBB);
+    BasicBlock *JExit = BasicBlock::Create(Ctx, "hoist.j.exit", &F, ContinueBB);
+
+    // Branch from original BB to J header
+    Builder.SetInsertPoint(OrigBB);
+    Builder.CreateBr(JHdr);
+
+    // J loop header
+    Builder.SetInsertPoint(JHdr);
+    PHINode *TJ = Builder.CreatePHI(I64Ty, 2, "hoist.tj");
+    TJ->addIncoming(ConstantInt::get(I64Ty, 0), OrigBB);
+    Value *JCond = Builder.CreateICmpSLT(TJ, ConstantInt::get(I64Ty, N));
+    Builder.CreateCondBr(JCond, KHdr, JExit);
+
+    // K loop header
+    Builder.SetInsertPoint(KHdr);
+    PHINode *TK = Builder.CreatePHI(I64Ty, 2, "hoist.tk");
+    TK->addIncoming(ConstantInt::get(I64Ty, 0), JHdr);
+    Value *KCond = Builder.CreateICmpSLT(TK, ConstantInt::get(I64Ty, K));
+    Builder.CreateCondBr(KCond, KBody, KExit);
+
+    // K body: B_T[j*K + k] = B[k*N + j]
+    Builder.SetInsertPoint(KBody);
+    Value *SrcIdx = Builder.CreateAdd(
+        Builder.CreateMul(TK, ConstantInt::get(I64Ty, N)), TJ, "hoist.src.idx");
+    Value *SrcPtr = Builder.CreateGEP(I8Ty, BaseB, SrcIdx, "hoist.src.ptr");
+    Value *Val = Builder.CreateLoad(I8Ty, SrcPtr, "hoist.b.val");
+    Value *DstIdx = Builder.CreateAdd(
+        Builder.CreateMul(TJ, ConstantInt::get(I64Ty, K)), TK, "hoist.dst.idx");
+    Value *DstPtr = Builder.CreateGEP(I8Ty, BT_Alloc, DstIdx, "hoist.dst.ptr");
+    Builder.CreateStore(Val, DstPtr);
+
+    Value *TKNext = Builder.CreateAdd(TK, ConstantInt::get(I64Ty, 1));
+    TK->addIncoming(TKNext, KBody);
+    Builder.CreateBr(KHdr);
+
+    // K exit
+    Builder.SetInsertPoint(KExit);
+    Value *TJNext = Builder.CreateAdd(TJ, ConstantInt::get(I64Ty, 1));
+    TJ->addIncoming(TJNext, KExit);
+    Builder.CreateBr(JHdr);
+
+    // J exit -> continue to fork_call
+    Builder.SetInsertPoint(JExit);
+    Builder.CreateBr(ContinueBB);
+
+    // Add free AFTER fork_call returns
+    // Find the instruction after fork_call
+    Instruction *AfterFork = ForkCall->getNextNode();
+    if (AfterFork) {
+      Builder.SetInsertPoint(AfterFork);
+    } else {
+      Builder.SetInsertPoint(ContinueBB->getTerminator());
+    }
+    Builder.CreateCall(FreeFn, {BT_Alloc});
+    errs() << "  Added free after fork_call\n";
+
+    errs() << "VNNI-HOIST: Hoisted transpose generation SUCCESS\n";
+    return true;
+  }
 
   bool runOnFunction(Function &F) override {
     bool Changed = false;
@@ -388,17 +537,27 @@ private:
     errs() << "  L0 (i_outer): depth=" << L->getLoopDepth()
            << " phi=" << (Loops.i_outer ? "found" : "MISSING") << "\n";
 
-    // Extract tile size from innermost loop trip count
-    if (auto *BI = dyn_cast<BranchInst>(Loops.KKLoop->getHeader()->getTerminator())) {
-      if (BI->isConditional()) {
-        if (auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition())) {
-          if (auto *CI = dyn_cast<ConstantInt>(Cmp->getOperand(1))) {
-            Loops.TileSize = CI->getSExtValue();
-            errs() << "  TileSize: " << Loops.TileSize << "\n";
+    // Extract tile sizes from each inner loop's trip count
+    auto extractTripCount = [](Loop *L) -> int64_t {
+      if (auto *BI = dyn_cast<BranchInst>(L->getHeader()->getTerminator())) {
+        if (BI->isConditional()) {
+          if (auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition())) {
+            if (auto *CI = dyn_cast<ConstantInt>(Cmp->getOperand(1))) {
+              return CI->getSExtValue();
+            }
           }
         }
       }
-    }
+      return 0;
+    };
+
+    Loops.TileSizeM = extractTripCount(Loops.IILoop);
+    Loops.TileSizeN = extractTripCount(Loops.JJLoop);
+    Loops.TileSizeK = extractTripCount(Loops.KKLoop);
+    Loops.TileSize = Loops.TileSizeK;  // Keep for compatibility
+    errs() << "  TileSizes: M=" << Loops.TileSizeM
+           << " N=" << Loops.TileSizeN
+           << " K=" << Loops.TileSizeK << "\n";
 
     // Validate and dump
     bool valid = Loops.isValid();
@@ -546,23 +705,175 @@ private:
   }
 
   //===--------------------------------------------------------------------===//
-  // NEW: Generate B transpose at outermost loop preheader
+  // NEW: Generate B transpose - with OpenMP hoisting support
   //===--------------------------------------------------------------------===//
 
   // Generate B_T[j,k] = B[k,j] transpose
   // B is K x N (row-major), B_T is N x K (row-major)
   // After transpose: B_T[j*K + k] is contiguous along k
+  //
+  // For OpenMP: hoists transpose to parent function (before __kmpc_fork_call)
+  // so all threads share the same transposed B
   bool generateBTranspose(Function &F, TiledMatmulLoops &Loops,
                           MatmulOperands &Ops) {
     errs() << "VNNI-NEW: Generating B transpose...\n";
 
+    std::string funcName = F.getName().str();
     LLVMContext &Ctx = F.getContext();
     Module *M = F.getParent();
 
-    // Use aligned_alloc for 64-byte alignment (required for AVX-512 loads)
+    int64_t K = Loops.K;
+    int64_t N = Loops.N;
+    int64_t AllocSize = ((N * K + 63) / 64) * 64;
+
     Type *I64Ty = Type::getInt64Ty(Ctx);
+    Type *I8Ty = Type::getInt8Ty(Ctx);
+    Type *PtrTy = PointerType::get(Ctx, 0);
+
+    // Check if this is an OpenMP outlined function
+    if (isOutlinedFunction(funcName)) {
+      std::string parentName = getParentFuncName(funcName);
+      errs() << "  OpenMP outlined function detected, parent: " << parentName << "\n";
+
+      // Find parent function
+      Function *ParentF = M->getFunction(parentName);
+      if (!ParentF) {
+        errs() << "  WARNING: Parent function not found, falling back to local transpose\n";
+        // Fall through to local transpose
+      } else {
+        // Find __kmpc_fork_call in parent
+        CallInst *ForkCall = nullptr;
+        for (auto &BB : *ParentF) {
+          for (auto &I : BB) {
+            if (auto *CI = dyn_cast<CallInst>(&I)) {
+              if (auto *Callee = CI->getCalledFunction()) {
+                if (Callee->getName() == "__kmpc_fork_call") {
+                  ForkCall = CI;
+                  break;
+                }
+              }
+            }
+          }
+          if (ForkCall) break;
+        }
+
+        if (ForkCall) {
+          errs() << "  Found fork_call in parent, hoisting transpose\n";
+
+          // Create global variable for B_T pointer
+          std::string globalName = "vnni_B_T_" + parentName;
+          GlobalVariable *BT_Global = M->getNamedGlobal(globalName);
+          if (!BT_Global) {
+            BT_Global = new GlobalVariable(
+                *M, PtrTy, false, GlobalValue::InternalLinkage,
+                ConstantPointerNull::get(cast<PointerType>(PtrTy)), globalName);
+            errs() << "  Created global: " << globalName << "\n";
+          }
+
+          // Generate transpose in parent function before fork_call
+          IRBuilder<> ParentBuilder(ForkCall);
+
+          FunctionCallee AlignedAllocFn = M->getOrInsertFunction(
+              "aligned_alloc", PtrTy, I64Ty, I64Ty);
+          FunctionCallee FreeFn = M->getOrInsertFunction(
+              "free", Type::getVoidTy(Ctx), PtrTy);
+
+          Value *Align = ConstantInt::get(I64Ty, 64);
+          Value *Size = ConstantInt::get(I64Ty, AllocSize);
+          Value *BT_Alloc = ParentBuilder.CreateCall(AlignedAllocFn, {Align, Size}, "B_T_hoisted");
+          errs() << "  Allocated " << AllocSize << " bytes in parent\n";
+
+          // Store to global
+          ParentBuilder.CreateStore(BT_Alloc, BT_Global);
+
+          // Need to get BaseB from parent's perspective - find B argument
+          // B is typically arg 1 in parent (after A)
+          // For memref: (ptr, ptr, offset, size, stride) x 3 args = 15 total
+          // B starts at arg 5 (0-indexed)
+          Value *ParentBaseB = nullptr;
+          if (ParentF->arg_size() >= 10) {
+            ParentBaseB = ParentF->getArg(5);  // Second memref's base pointer
+          }
+
+          if (ParentBaseB) {
+            // Generate transpose loops in parent
+            BasicBlock *OrigBB = ForkCall->getParent();
+            BasicBlock *ContinueBB = OrigBB->splitBasicBlock(ForkCall, "fork_call_bb");
+            OrigBB->getTerminator()->eraseFromParent();
+
+            BasicBlock *JHdr = BasicBlock::Create(Ctx, "hoist.j.hdr", ParentF, ContinueBB);
+            BasicBlock *KHdr = BasicBlock::Create(Ctx, "hoist.k.hdr", ParentF, ContinueBB);
+            BasicBlock *KBody = BasicBlock::Create(Ctx, "hoist.k.body", ParentF, ContinueBB);
+            BasicBlock *KExit = BasicBlock::Create(Ctx, "hoist.k.exit", ParentF, ContinueBB);
+            BasicBlock *JExit = BasicBlock::Create(Ctx, "hoist.j.exit", ParentF, ContinueBB);
+
+            ParentBuilder.SetInsertPoint(OrigBB);
+            ParentBuilder.CreateBr(JHdr);
+
+            ParentBuilder.SetInsertPoint(JHdr);
+            PHINode *TJ = ParentBuilder.CreatePHI(I64Ty, 2, "hoist.tj");
+            TJ->addIncoming(ConstantInt::get(I64Ty, 0), OrigBB);
+            Value *JCond = ParentBuilder.CreateICmpSLT(TJ, ConstantInt::get(I64Ty, N));
+            ParentBuilder.CreateCondBr(JCond, KHdr, JExit);
+
+            ParentBuilder.SetInsertPoint(KHdr);
+            PHINode *TK = ParentBuilder.CreatePHI(I64Ty, 2, "hoist.tk");
+            TK->addIncoming(ConstantInt::get(I64Ty, 0), JHdr);
+            Value *KCond = ParentBuilder.CreateICmpSLT(TK, ConstantInt::get(I64Ty, K));
+            ParentBuilder.CreateCondBr(KCond, KBody, KExit);
+
+            ParentBuilder.SetInsertPoint(KBody);
+            Value *SrcIdx = ParentBuilder.CreateAdd(
+                ParentBuilder.CreateMul(TK, ConstantInt::get(I64Ty, N)), TJ);
+            Value *SrcPtr = ParentBuilder.CreateGEP(I8Ty, ParentBaseB, SrcIdx);
+            Value *Val = ParentBuilder.CreateLoad(I8Ty, SrcPtr);
+            Value *DstIdx = ParentBuilder.CreateAdd(
+                ParentBuilder.CreateMul(TJ, ConstantInt::get(I64Ty, K)), TK);
+            Value *DstPtr = ParentBuilder.CreateGEP(I8Ty, BT_Alloc, DstIdx);
+            ParentBuilder.CreateStore(Val, DstPtr);
+            Value *TKNext = ParentBuilder.CreateAdd(TK, ConstantInt::get(I64Ty, 1));
+            TK->addIncoming(TKNext, KBody);
+            ParentBuilder.CreateBr(KHdr);
+
+            ParentBuilder.SetInsertPoint(KExit);
+            Value *TJNext = ParentBuilder.CreateAdd(TJ, ConstantInt::get(I64Ty, 1));
+            TJ->addIncoming(TJNext, KExit);
+            ParentBuilder.CreateBr(JHdr);
+
+            ParentBuilder.SetInsertPoint(JExit);
+            ParentBuilder.CreateBr(ContinueBB);
+
+            // Add free after fork_call
+            Instruction *AfterFork = ForkCall->getNextNode();
+            if (AfterFork) {
+              ParentBuilder.SetInsertPoint(AfterFork);
+            } else {
+              ParentBuilder.SetInsertPoint(ContinueBB->getTerminator());
+            }
+            ParentBuilder.CreateCall(FreeFn, {BT_Alloc});
+
+            errs() << "  Hoisted transpose to parent function\n";
+          }
+
+          // In outlined function: load B_T from global
+          BasicBlock *Preheader = Loops.IOuterLoop->getLoopPreheader();
+          if (Preheader) {
+            IRBuilder<> Builder(Preheader->getTerminator());
+            Ops.BaseB_T = Builder.CreateLoad(PtrTy, BT_Global, "B_T_loaded");
+            errs() << "  Loaded B_T from global in outlined function\n";
+            errs() << "VNNI-NEW: B transpose hoisting SUCCESS\n";
+            return true;
+          }
+        }
+      }
+    }
+
+    // Fall back to local transpose (for non-OpenMP or if hoisting failed)
+    errs() << "  Using local transpose (non-OpenMP path)\n";
+    errs() << "  Transpose size: " << N << " x " << K << " = " << AllocSize << " bytes (aligned)\n";
+
     FunctionCallee AlignedAllocFn = M->getOrInsertFunction(
-        "aligned_alloc", PointerType::get(Ctx, 0), I64Ty, I64Ty);
+        "aligned_alloc", PtrTy, I64Ty, I64Ty);
 
     BasicBlock *Preheader = Loops.IOuterLoop->getLoopPreheader();
     if (!Preheader) {
@@ -571,12 +882,6 @@ private:
     }
 
     IRBuilder<> Builder(Preheader->getTerminator());
-    Type *I8Ty = Type::getInt8Ty(Ctx);
-
-    int64_t K = Loops.K;
-    int64_t N = Loops.N;
-    int64_t AllocSize = ((N * K + 63) / 64) * 64;  // Round up to 64-byte multiple
-    errs() << "  Transpose size: " << N << " x " << K << " = " << AllocSize << " bytes (aligned)\n";
 
     Value *Align = ConstantInt::get(I64Ty, 64);
     Value *Size = ConstantInt::get(I64Ty, AllocSize);
@@ -691,7 +996,9 @@ private:
 
     int64_t K = Loops.K;
     int64_t N = Loops.N;
-    int64_t TileSize = Loops.TileSize;
+    int64_t TileSizeM = Loops.TileSizeM;
+    int64_t TileSizeN = Loops.TileSizeN;
+    int64_t TileSizeK = Loops.TileSizeK;
     const int64_t VNNI_STEP = 64;
     const int64_t I_STEP = 4;
 
@@ -700,12 +1007,13 @@ private:
       return false;
     }
 
-    errs() << "  Creating ii/jj/k loops: ii=0.." << TileSize << " step " << I_STEP
-           << ", jj=0.." << TileSize << ", k=0.." << K << " step " << VNNI_STEP << "\n";
+    errs() << "  Creating ii/jj/k loops: ii=0.." << TileSizeM << " step " << I_STEP
+           << ", jj=0.." << TileSizeN << ", k=0.." << K << " step " << VNNI_STEP << "\n";
 
     Value *KVal = ConstantInt::get(I64Ty, K);
     Value *NVal = ConstantInt::get(I64Ty, N);
-    Value *TileSizeVal = ConstantInt::get(I64Ty, TileSize);
+    Value *TileSizeMVal = ConstantInt::get(I64Ty, TileSizeM);
+    Value *TileSizeNVal = ConstantInt::get(I64Ty, TileSizeN);
     Value *ZeroI64 = ConstantInt::get(I64Ty, 0);
     Value *ZeroVec = ConstantVector::getSplat(ElementCount::getFixed(16), ConstantInt::get(I32Ty, 0));
 
@@ -731,18 +1039,18 @@ private:
 
     IRBuilder<> Builder(Ctx);
 
-    // === II HEADER: ii loop (0..TileSize step 4) ===
+    // === II HEADER: ii loop (0..TileSizeM step 4) ===
     Builder.SetInsertPoint(IIHeader);
     PHINode *IIPhi = Builder.CreatePHI(I64Ty, 2, "ii");
     IIPhi->addIncoming(ZeroI64, KOuterPreheader);
-    Value *IICond = Builder.CreateICmpSLT(IIPhi, TileSizeVal, "ii.cond");
+    Value *IICond = Builder.CreateICmpSLT(IIPhi, TileSizeMVal, "ii.cond");
     Builder.CreateCondBr(IICond, JJHeader, KOuterExit);
 
-    // === JJ HEADER: jj loop (0..TileSize) ===
+    // === JJ HEADER: jj loop (0..TileSizeN) ===
     Builder.SetInsertPoint(JJHeader);
     PHINode *JJPhi = Builder.CreatePHI(I64Ty, 2, "jj");
     JJPhi->addIncoming(ZeroI64, IIHeader);
-    Value *JJCond = Builder.CreateICmpSLT(JJPhi, TileSizeVal, "jj.cond");
+    Value *JJCond = Builder.CreateICmpSLT(JJPhi, TileSizeNVal, "jj.cond");
     Builder.CreateCondBr(JJCond, VNNIPre, IILatch);
 
     // === VNNI PREHEADER: compute indices with valid ii/jj ===

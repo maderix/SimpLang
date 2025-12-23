@@ -162,28 +162,32 @@ LogicalResult applyMatmulTilingPattern(func::FuncOp func,
       // 2. Those ops would end up inside omp.wsloop, violating its constraint
       // 3. omp.wsloop MUST contain exactly one op (omp.loop_nest)
       //
-      // Instead, we mark loops with attributes and a late-stage pass
-      // (after buffer management) will convert them to OpenMP.
-      //
-      // For matmul, the iterator types are [parallel, parallel, reduction]:
-      //   - Loop 0 (M tile): PARALLEL - can be parallelized
-      //   - Loop 1 (N tile): PARALLEL - can be parallelized
-      //   - Loop 2 (K tile): REDUCTION - must remain sequential
+      // Apply OpenMP for parallel annotation
+      // For VNNI patterns: use 1D parallelization (only i_outer) to preserve 6-level loop structure
+      // For non-VNNI: use 2D parallelization (i_outer + j_outer collapsed)
+      bool isVNNI = info.patternStartsWith("vnni.");
+
       if (info.hasParallel() && tiledOp->loops.size() >= 2) {
         auto mLoop = dyn_cast<scf::ForOp>(tiledOp->loops[0]);
         auto nLoop = dyn_cast<scf::ForOp>(tiledOp->loops[1]);
 
         if (mLoop && nLoop) {
-          // Mark both M and N loops for parallelization
-          mLoop->setAttr("simp.parallel_loop", rewriter.getUnitAttr());
-          mLoop->setAttr("simp.parallel_dim", rewriter.getI64IntegerAttr(0));
-          nLoop->setAttr("simp.parallel_loop", rewriter.getUnitAttr());
-          nLoop->setAttr("simp.parallel_dim", rewriter.getI64IntegerAttr(1));
-
-          // Mark function for late-stage OpenMP conversion
-          func->setAttr("simp.needs_openmp", rewriter.getUnitAttr());
-
-          llvm::errs() << "[Parallel] Marked M and N tile loops for OpenMP (late-stage)\n";
+          if (isVNNI) {
+            // VNNI: 1D parallelization only (outer i loop)
+            // This preserves j_outer as separate loop for 6-level structure
+            mLoop->setAttr("simp.parallel_loop", rewriter.getUnitAttr());
+            mLoop->setAttr("simp.parallel_dim", rewriter.getI64IntegerAttr(0));
+            func->setAttr("simp.needs_openmp", rewriter.getUnitAttr());
+            llvm::errs() << "[Parallel] VNNI: Marked only M tile loop for OpenMP (1D, preserves 6-level)\n";
+          } else {
+            // Non-VNNI: 2D parallelization (collapsed)
+            mLoop->setAttr("simp.parallel_loop", rewriter.getUnitAttr());
+            mLoop->setAttr("simp.parallel_dim", rewriter.getI64IntegerAttr(0));
+            nLoop->setAttr("simp.parallel_loop", rewriter.getUnitAttr());
+            nLoop->setAttr("simp.parallel_dim", rewriter.getI64IntegerAttr(1));
+            func->setAttr("simp.needs_openmp", rewriter.getUnitAttr());
+            llvm::errs() << "[Parallel] Marked M and N tile loops for OpenMP (2D, late-stage)\n";
+          }
         }
       } else if (info.hasParallel() && tiledOp->loops.size() == 1) {
         auto outerLoop = dyn_cast<scf::ForOp>(tiledOp->loops[0]);
