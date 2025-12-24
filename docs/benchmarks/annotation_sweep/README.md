@@ -19,6 +19,9 @@
 ### Visualization
 ![VNNI Sweep Plot](vnni_sweep_plot.png)
 
+### Optimized Performance (Power-of-2 Sizes Removed)
+![VNNI Sweep Optimized](vnni_sweep_optimized.png)
+
 ### Best Results by Matrix Size
 
 | N | Best Tile | GIOP/s | % Peak | Notes |
@@ -270,7 +273,8 @@ var C = tensor_matmul(A, B);
 ---
 
 ## Files
-- `vnni_sweep_plot.png` - INT8 VNNI square tile visualization
+- `vnni_sweep_plot.png` - INT8 VNNI square tile visualization (all sizes)
+- `vnni_sweep_optimized.png` - INT8 VNNI visualization (power-of-2 removed)
 - `sweep_results.csv` - INT8 VNNI square tile raw data
 - `mnk_sweep_plot.png` - INT8 VNNI M,N,K 3-way heatmap visualization
 - `mnk_sweep_results.csv` - INT8 VNNI M,N,K sweep raw data
