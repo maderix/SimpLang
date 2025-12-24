@@ -12,7 +12,8 @@ import os
 import sys
 
 # Default configuration
-DEFAULT_SIZES = [512, 768, 1024, 1536, 2048, 3072, 4096, 5120, 6144, 7168, 8192, 10240, 12288, 14336, 16384]
+# Includes padded sizes (+64) after power-of-2 to demonstrate cache contention fix
+DEFAULT_SIZES = [512, 768, 1024, 1536, 2048, 2112, 3072, 4096, 4160, 5120, 6144, 7168, 8192, 8256, 10240, 12288, 14336, 16384]
 DEFAULT_TILES = [32, 64, 128, 256]
 DEFAULT_THREADS = 8
 DEFAULT_THROTTLE = 2.0  # seconds between sizes
