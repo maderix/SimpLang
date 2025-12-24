@@ -341,8 +341,20 @@ struct TensorFromArrayOpLowering : public OpConversionPattern<simp::TensorFromAr
       totalElements *= dim;
     }
 
-    // Convert offset from i64 to index type
-    Value offsetIdx = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), offsetI64);
+    // Check if offset is a constant 0 - if so, create plain memref (no strided layout)
+    // This is critical for VNNI optimization which requires plain memrefs
+    bool isZeroOffset = false;
+    if (auto constOp = offsetI64.getDefiningOp<simp::ConstantOp>()) {
+      if (auto intAttr = mlir::dyn_cast<IntegerAttr>(constOp.getValue())) {
+        isZeroOffset = (intAttr.getInt() == 0);
+      }
+    }
+    // Also check for arith.constant (after earlier lowering)
+    if (auto constOp = offsetI64.getDefiningOp<arith::ConstantOp>()) {
+      if (auto intAttr = mlir::dyn_cast<IntegerAttr>(constOp.getValue())) {
+        isZeroOffset = (intAttr.getInt() == 0);
+      }
+    }
 
     // Build static strides for row-major layout
     SmallVector<int64_t, 4> staticStrides;
@@ -352,28 +364,49 @@ struct TensorFromArrayOpLowering : public OpConversionPattern<simp::TensorFromAr
       stride *= targetShape[i];
     }
 
-    // Create strided layout with DYNAMIC offset (ShapedType::kDynamic) but static strides
-    // This is required when we have a runtime-provided offset value
-    auto stridedLayout = StridedLayoutAttr::get(
-        rewriter.getContext(), ShapedType::kDynamic, staticStrides);
-    auto targetMemRefType = MemRefType::get(targetShape, elemType, stridedLayout);
+    if (isZeroOffset) {
+      // Offset is constant 0 - create plain memref (no strided layout)
+      // This produces memref<MxNxT> which is optimal for VNNI and other optimizations
+      auto plainMemRefType = MemRefType::get(targetShape, elemType);
 
-    // For LLVM 21: use OpFoldResult-based builder with static sizes/strides
-    SmallVector<OpFoldResult, 4> ofr_sizes;
-    SmallVector<OpFoldResult, 4> ofr_strides;
-    for (int64_t dim : targetShape) {
-      ofr_sizes.push_back(rewriter.getI64IntegerAttr(dim));
-    }
-    for (int64_t s : staticStrides) {
-      ofr_strides.push_back(rewriter.getI64IntegerAttr(s));
-    }
+      SmallVector<OpFoldResult, 4> ofr_sizes;
+      SmallVector<OpFoldResult, 4> ofr_strides;
+      for (int64_t dim : targetShape) {
+        ofr_sizes.push_back(rewriter.getI64IntegerAttr(dim));
+      }
+      for (int64_t s : staticStrides) {
+        ofr_strides.push_back(rewriter.getI64IntegerAttr(s));
+      }
 
-    // Create reinterpret_cast with dynamic offset but static sizes/strides
-    rewriter.replaceOpWithNewOp<memref::ReinterpretCastOp>(
-        op, targetMemRefType, arrayMemref,
-        /*offset=*/OpFoldResult(offsetIdx),
-        /*sizes=*/ofr_sizes,
-        /*strides=*/ofr_strides);
+      // Use static offset 0
+      rewriter.replaceOpWithNewOp<memref::ReinterpretCastOp>(
+          op, plainMemRefType, arrayMemref,
+          /*offset=*/rewriter.getI64IntegerAttr(0),
+          /*sizes=*/ofr_sizes,
+          /*strides=*/ofr_strides);
+    } else {
+      // Dynamic offset - must use strided layout
+      Value offsetIdx = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), offsetI64);
+
+      auto stridedLayout = StridedLayoutAttr::get(
+          rewriter.getContext(), ShapedType::kDynamic, staticStrides);
+      auto targetMemRefType = MemRefType::get(targetShape, elemType, stridedLayout);
+
+      SmallVector<OpFoldResult, 4> ofr_sizes;
+      SmallVector<OpFoldResult, 4> ofr_strides;
+      for (int64_t dim : targetShape) {
+        ofr_sizes.push_back(rewriter.getI64IntegerAttr(dim));
+      }
+      for (int64_t s : staticStrides) {
+        ofr_strides.push_back(rewriter.getI64IntegerAttr(s));
+      }
+
+      rewriter.replaceOpWithNewOp<memref::ReinterpretCastOp>(
+          op, targetMemRefType, arrayMemref,
+          /*offset=*/OpFoldResult(offsetIdx),
+          /*sizes=*/ofr_sizes,
+          /*strides=*/ofr_strides);
+    }
 
     return success();
   }
@@ -3148,6 +3181,56 @@ struct TensorMatMulNTOpLowering : public OpConversionPattern<simp::TensorMatMulN
   }
 };
 
+/// TensorMatMulOut: Matrix multiplication writing directly to output tensor
+/// A[M,K] × B[K,N] → output[M,N] (in-place, no allocation)
+/// Key difference from TensorMatMulOp: uses provided output instead of allocating
+struct TensorMatMulOutOpLowering : public OpConversionPattern<simp::TensorMatMulOutOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      simp::TensorMatMulOutOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+
+    auto loc = op.getLoc();
+    auto lhs = adaptor.getLhs();      // A[M, K]
+    auto rhs = adaptor.getRhs();      // B[K, N]
+    auto output = adaptor.getOutput(); // C[M, N] - user-provided output tensor
+
+    // Look through unrealized_conversion_cast to get the original plain memref
+    // The type converter wraps plain memrefs from tensor_from_array in casts
+    // We need the original plain memref for correct VNNI/tiling codegen
+    if (auto castOp = output.getDefiningOp<UnrealizedConversionCastOp>()) {
+      if (castOp.getInputs().size() == 1) {
+        Value originalOutput = castOp.getInputs()[0];
+        auto originalType = mlir::dyn_cast<MemRefType>(originalOutput.getType());
+        // If the original is a plain memref (no strided layout), use it directly
+        if (originalType && !mlir::isa<StridedLayoutAttr>(originalType.getLayout())) {
+          output = originalOutput;
+        }
+      }
+    }
+
+    auto outputType = mlir::cast<MemRefType>(output.getType());
+    auto outputShape = outputType.getShape();
+    auto outputElemType = outputType.getElementType();
+
+    // Initialize output to zero (linalg.matmul accumulates into output)
+    Value zero = rewriter.create<arith::ConstantOp>(
+        loc, outputElemType, rewriter.getZeroAttr(outputElemType));
+    rewriter.create<linalg::FillOp>(loc, zero, output);
+
+    // Use linalg.matmul directly with original inputs (i8 or f32)
+    // For i8×i8→i32, linalg.matmul handles the type promotion internally
+    // The annotation pass will then tile this properly for VNNI
+    rewriter.create<linalg::MatmulOp>(
+        loc, ValueRange{lhs, rhs}, ValueRange{output});
+
+    // Return the output (now a plain memref, data written in-place)
+    rewriter.replaceOp(op, output);
+    return success();
+  }
+};
+
 // MatMulQuant: Quantized matrix multiplication with tile-based dequantization
 // Strategy: Keep weights in W4 format, dequantize tiles on-the-fly for vectorization
 // For W[M×K] @ input[K] = output[M], process in tiles of size TILE×K
@@ -3418,6 +3501,7 @@ struct ConvertSimpToMemRefPass
         TensorScatterOpLowering,
         TensorMatMulOpLowering,
         TensorMatMulNTOpLowering,
+        TensorMatMulOutOpLowering,
         TensorDotOpLowering
     >(typeConverter, &getContext());
 

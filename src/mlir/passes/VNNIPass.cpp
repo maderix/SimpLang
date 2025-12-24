@@ -134,6 +134,12 @@ struct TiledMatmulLoops {
   PHINode *jj = nullptr;
   PHINode *kk = nullptr;
 
+  // Scaled row offsets for OMP (when outer loop steps by 1 instead of tile size)
+  // For OMP: i_outer_scaled = (i_outer + lowerbound) * TileSizeM
+  // For non-OMP: these are nullptr and we use i_outer directly (which already steps by tile size)
+  Value *i_outer_scaled = nullptr;
+  Value *j_outer_scaled = nullptr;
+
   // Matrix dimensions (full, not tile)
   int64_t M = 0;  // A rows, C rows
   int64_t N = 0;  // B cols, C cols
@@ -558,6 +564,53 @@ private:
     errs() << "  TileSizes: M=" << Loops.TileSizeM
            << " N=" << Loops.TileSizeN
            << " K=" << Loops.TileSizeK << "\n";
+
+    // Detect OMP loops: PHI steps by 1, then mul by tile size to get row offset
+    // Pattern: %iv = phi [0, ...], [%iv.next, ...]
+    //          %add = add %iv, %lowerbound
+    //          %scaled = mul %add, TileSize  <- this is what we need
+    auto findOMPScaledValue = [](PHINode *Phi, int64_t TileSize) -> Value* {
+      if (!Phi) return nullptr;
+
+      // Look for: phi -> add -> mul pattern
+      for (User *U : Phi->users()) {
+        if (auto *Add = dyn_cast<BinaryOperator>(U)) {
+          if (Add->getOpcode() == Instruction::Add) {
+            for (User *AU : Add->users()) {
+              if (auto *Mul = dyn_cast<BinaryOperator>(AU)) {
+                if (Mul->getOpcode() == Instruction::Mul) {
+                  // Check if one operand is the tile size constant
+                  if (auto *CI = dyn_cast<ConstantInt>(Mul->getOperand(1))) {
+                    if (CI->getSExtValue() == TileSize) {
+                      errs() << "  Found OMP scaled value (mul by " << TileSize << ")\n";
+                      return Mul;
+                    }
+                  }
+                  if (auto *CI = dyn_cast<ConstantInt>(Mul->getOperand(0))) {
+                    if (CI->getSExtValue() == TileSize) {
+                      errs() << "  Found OMP scaled value (mul by " << TileSize << ")\n";
+                      return Mul;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      return nullptr;
+    };
+
+    // Check if i_outer is OMP (steps by 1) and find scaled value
+    Loops.i_outer_scaled = findOMPScaledValue(Loops.i_outer, Loops.TileSizeM);
+    Loops.j_outer_scaled = findOMPScaledValue(Loops.j_outer, Loops.TileSizeN);
+
+    if (Loops.i_outer_scaled) {
+      errs() << "  i_outer: OMP mode (using scaled value)\n";
+    }
+    if (Loops.j_outer_scaled) {
+      errs() << "  j_outer: OMP mode (using scaled value)\n";
+    }
 
     // Validate and dump
     bool valid = Loops.isValid();
@@ -1056,9 +1109,13 @@ private:
     // === VNNI PREHEADER: compute indices with valid ii/jj ===
     Builder.SetInsertPoint(VNNIPre);
 
-    // i_full = i_outer + ii (both valid here!)
-    Value *i_full = Builder.CreateAdd(Loops.i_outer, IIPhi, "i.full");
-    Value *j_full = Builder.CreateAdd(Loops.j_outer, JJPhi, "j.full");
+    // i_full = i_outer_base + ii
+    // For OMP: i_outer_scaled is (omp_iv + lb) * TileM, so i_full = i_outer_scaled + ii
+    // For sequential: i_outer already steps by TileM, so i_full = i_outer + ii
+    Value *i_outer_base = Loops.i_outer_scaled ? Loops.i_outer_scaled : (Value*)Loops.i_outer;
+    Value *j_outer_base = Loops.j_outer_scaled ? Loops.j_outer_scaled : (Value*)Loops.j_outer;
+    Value *i_full = Builder.CreateAdd(i_outer_base, IIPhi, "i.full");
+    Value *j_full = Builder.CreateAdd(j_outer_base, JJPhi, "j.full");
 
     // A row offsets for 4 consecutive rows
     Value *RowOffA0 = Builder.CreateMul(i_full, KVal, "row.a0");

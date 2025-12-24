@@ -2294,6 +2294,62 @@ mlir::Value MLIRCodeGenContext::lowerCall(CallExprAST* call) {
     return builder.create<mlir::simp::TensorMatMulNTOp>(loc, resultType, lhs, rhs);
   }
 
+  // tensor_matmul_out: tensor_matmul_out(lhs, rhs, output) - writes directly to output tensor
+  // A[M,K] × B[K,N] → output[M,N] (in-place, no allocation)
+  if (calleeName == "tensor_matmul_out") {
+    if (args.size() != 3) {
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0304, "tensor_matmul_out requires 3 arguments (lhs, rhs, output), got " + std::to_string(args.size()));
+      return nullptr;
+    }
+
+    mlir::Value lhs = args[0];
+    mlir::Value rhs = args[1];
+    mlir::Value output = args[2];
+    auto lhsType = mlir::dyn_cast<mlir::simp::SimpTensorType>(lhs.getType());
+    auto rhsType = mlir::dyn_cast<mlir::simp::SimpTensorType>(rhs.getType());
+    auto outputType = mlir::dyn_cast<mlir::simp::SimpTensorType>(output.getType());
+
+    if (!lhsType || !rhsType) {
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0403, "tensor_matmul_out requires tensor arguments for lhs and rhs\n");
+      return nullptr;
+    }
+    if (!outputType) {
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0403, "tensor_matmul_out requires tensor argument for output\n");
+      return nullptr;
+    }
+
+    auto lhsShape = lhsType.getShape();
+    auto rhsShape = rhsType.getShape();
+    auto outputShape = outputType.getShape();
+
+    if (lhsShape.size() != 2 || rhsShape.size() != 2 || outputShape.size() != 2) {
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0403, "tensor_matmul_out requires 2D tensors\n");
+      return nullptr;
+    }
+
+    // A[M, K] × B[K, N] → output[M, N]
+    int64_t M = lhsShape[0];
+    int64_t K_lhs = lhsShape[1];
+    int64_t K_rhs = rhsShape[0];
+    int64_t N = rhsShape[1];
+
+    if (K_lhs != K_rhs) {
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0404, "tensor_matmul_out dimension mismatch: lhs K=" + std::to_string(K_lhs) + ", rhs K=" + std::to_string(K_rhs));
+      return nullptr;
+    }
+
+    // Verify output shape matches expected result
+    if (outputShape[0] != M || outputShape[1] != N) {
+      simpEmitCodegenError(::simp::diag::ErrorCode::E0404,
+          "tensor_matmul_out output shape mismatch: expected [" + std::to_string(M) + ", " + std::to_string(N) +
+          "], got [" + std::to_string(outputShape[0]) + ", " + std::to_string(outputShape[1]) + "]");
+      return nullptr;
+    }
+
+    // Return the output tensor (for chaining, and to indicate the result)
+    return builder.create<mlir::simp::TensorMatMulOutOp>(loc, outputType, lhs, rhs, output);
+  }
+
   // tensor_dot: tensor_dot(lhs, rhs)
   if (calleeName == "tensor_dot") {
     if (args.size() != 2) {

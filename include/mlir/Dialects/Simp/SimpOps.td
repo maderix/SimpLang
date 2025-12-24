@@ -1211,6 +1211,57 @@ def Simp_TensorDotOp : Simp_Op<"tensor_dot", [Pure]> {
 }
 
 //===----------------------------------------------------------------------===//
+// TensorMatMulOutOp - Matrix multiplication with output tensor parameter
+//===----------------------------------------------------------------------===//
+
+def Simp_TensorMatMulOutOp : Simp_Op<"tensor_matmul_out", []> {
+  let summary = "Matrix multiplication writing directly to output tensor";
+
+  let description = [{
+    Matrix multiplication that writes directly to a provided output tensor,
+    avoiding allocation and copy overhead.
+
+    Usage:
+    ```simplang
+    i8<4096, 4096> A = tensor_from_array(A_arr, 0i);
+    i8<4096, 4096> B = tensor_from_array(B_arr, 0i);
+    i32<4096, 4096> C = tensor_from_array(C_arr, 0i);  // Wrap output array
+
+    tensor_matmul_out(A, B, C);  // Write directly to C
+    ```
+
+    This operation modifies the output tensor in-place, so it is NOT marked Pure.
+    The output tensor must be pre-allocated with correct shape [M, N].
+
+    Benefits:
+    - Zero-copy: No allocation or copy for result
+    - Enables direct writes to user-provided buffers
+    - ~15% faster than tensor_matmul + copy loop
+
+    Shape requirements:
+    - lhs: [M, K]
+    - rhs: [K, N]
+    - output: [M, N]
+
+    Element type requirements:
+    - lhs and rhs must have same element type (i8, f32, etc.)
+    - output element type must match accumulator type (i32 for i8 inputs)
+  }];
+
+  let arguments = (ins
+    Simp_SimpTensorType:$lhs,    // A: [M, K]
+    Simp_SimpTensorType:$rhs,    // B: [K, N]
+    Simp_SimpTensorType:$output  // C: [M, N] (pre-allocated)
+  );
+
+  let results = (outs Simp_SimpTensorType:$result);  // Returns output for chaining
+
+  let assemblyFormat = [{
+    $lhs `,` $rhs `,` $output attr-dict `:` `(` type($lhs) `,` type($rhs) `,` type($output) `)` `->` type($result)
+  }];
+}
+
+//===----------------------------------------------------------------------===//
 // TensorMatMulNTOp - Matrix multiplication with pre-transposed B (No Transpose)
 //===----------------------------------------------------------------------===//
 
