@@ -1030,11 +1030,33 @@ private:
     Type *I8Ty = Type::getInt8Ty(Ctx);
     Type *I32Ty = Type::getInt32Ty(Ctx);
     Type *I64Ty = Type::getInt64Ty(Ctx);
-    auto *V16I32Ty = FixedVectorType::get(I32Ty, 16);
-    auto *V16I32PtrTy = PointerType::get(V16I32Ty, 0);
 
-    Function *VPDPBUSD = Intrinsic::getOrInsertDeclaration(
-        M, Intrinsic::x86_avx512_vpdpbusd_512);
+    int64_t K = Loops.K;
+    int64_t N = Loops.N;
+    int64_t TileSizeM = Loops.TileSizeM;
+    int64_t TileSizeN = Loops.TileSizeN;
+    int64_t TileSizeK = Loops.TileSizeK;
+    const int64_t I_STEP = 4;
+
+    // Select 512-bit (ZMM) or 256-bit (YMM) based on K dimension
+    bool Use256Bit = (K < 64 && K >= 32);
+    int64_t VNNI_STEP = Use256Bit ? 32 : 64;
+    unsigned NumElements = Use256Bit ? 8 : 16;
+
+    if (K < 32) {
+      errs() << "  SKIP: K=" << K << " < 32 (minimum for VNNI)\n";
+      return false;
+    }
+
+    errs() << "  Using " << (Use256Bit ? "256-bit (YMM)" : "512-bit (ZMM)") << " VNNI\n";
+
+    auto *VecI32Ty = FixedVectorType::get(I32Ty, NumElements);
+    auto *VecI32PtrTy = PointerType::get(VecI32Ty, 0);
+
+    // Select appropriate intrinsic: 256-bit or 512-bit
+    Intrinsic::ID IntrinsicID = Use256Bit ? Intrinsic::x86_avx512_vpdpbusd_256
+                                          : Intrinsic::x86_avx512_vpdpbusd_512;
+    Function *VPDPBUSD = Intrinsic::getOrInsertDeclaration(M, IntrinsicID);
     if (!VPDPBUSD) {
       errs() << "  FAIL: Could not get vpdpbusd intrinsic\n";
       return false;
@@ -1047,19 +1069,6 @@ private:
       return false;
     }
 
-    int64_t K = Loops.K;
-    int64_t N = Loops.N;
-    int64_t TileSizeM = Loops.TileSizeM;
-    int64_t TileSizeN = Loops.TileSizeN;
-    int64_t TileSizeK = Loops.TileSizeK;
-    const int64_t VNNI_STEP = 64;
-    const int64_t I_STEP = 4;
-
-    if (K < VNNI_STEP) {
-      errs() << "  SKIP: K=" << K << " < " << VNNI_STEP << "\n";
-      return false;
-    }
-
     errs() << "  Creating ii/jj/k loops: ii=0.." << TileSizeM << " step " << I_STEP
            << ", jj=0.." << TileSizeN << ", k=0.." << K << " step " << VNNI_STEP << "\n";
 
@@ -1068,7 +1077,7 @@ private:
     Value *TileSizeMVal = ConstantInt::get(I64Ty, TileSizeM);
     Value *TileSizeNVal = ConstantInt::get(I64Ty, TileSizeN);
     Value *ZeroI64 = ConstantInt::get(I64Ty, 0);
-    Value *ZeroVec = ConstantVector::getSplat(ElementCount::getFixed(16), ConstantInt::get(I32Ty, 0));
+    Value *ZeroVec = ConstantVector::getSplat(ElementCount::getFixed(NumElements), ConstantInt::get(I32Ty, 0));
 
     // Create all basic blocks
     BasicBlock *IIHeader = BasicBlock::Create(Ctx, "ii.hdr", &F);
@@ -1139,10 +1148,10 @@ private:
     PHINode *VK = Builder.CreatePHI(I64Ty, 2, "vk");
     VK->addIncoming(ZeroI64, VNNIPre);
 
-    PHINode *Acc0 = Builder.CreatePHI(V16I32Ty, 2, "acc0");
-    PHINode *Acc1 = Builder.CreatePHI(V16I32Ty, 2, "acc1");
-    PHINode *Acc2 = Builder.CreatePHI(V16I32Ty, 2, "acc2");
-    PHINode *Acc3 = Builder.CreatePHI(V16I32Ty, 2, "acc3");
+    PHINode *Acc0 = Builder.CreatePHI(VecI32Ty, 2, "acc0");
+    PHINode *Acc1 = Builder.CreatePHI(VecI32Ty, 2, "acc1");
+    PHINode *Acc2 = Builder.CreatePHI(VecI32Ty, 2, "acc2");
+    PHINode *Acc3 = Builder.CreatePHI(VecI32Ty, 2, "acc3");
     Acc0->addIncoming(ZeroVec, VNNIPre);
     Acc1->addIncoming(ZeroVec, VNNIPre);
     Acc2->addIncoming(ZeroVec, VNNIPre);
@@ -1150,7 +1159,7 @@ private:
 
     PHINode *Bias = nullptr;
     if (Ops.BothSigned) {
-      Bias = Builder.CreatePHI(V16I32Ty, 2, "bias");
+      Bias = Builder.CreatePHI(VecI32Ty, 2, "bias");
       Bias->addIncoming(ZeroVec, VNNIPre);
     }
 
@@ -1160,14 +1169,14 @@ private:
     // === VNNI BODY: load B once, 4 A rows, 4 vpdpbusd ===
     Builder.SetInsertPoint(VNNIBody);
 
-    // Use aligned load only if K is multiple of 64, otherwise use unaligned
-    // K is the row stride for A and B_T, so if K % 64 != 0, addresses won't be 64-byte aligned
-    bool UseAlignedLoad = (K % 64 == 0);
-    Align LoadAlign = UseAlignedLoad ? Align(64) : Align(1);
+    // Use aligned load only if K is multiple of VNNI_STEP, otherwise use unaligned
+    // K is the row stride for A and B_T, so if K % VNNI_STEP != 0, addresses won't be aligned
+    bool UseAlignedLoad = (K % VNNI_STEP == 0);
+    Align LoadAlign = UseAlignedLoad ? Align(VNNI_STEP) : Align(1);
 
     Value *IdxB = Builder.CreateAdd(RowOffB, VK, "idx.b");
     Value *PtrB = Builder.CreateGEP(I8Ty, Ops.BaseB_T, IdxB, "ptr.b");
-    Value *VecB = Builder.CreateAlignedLoad(V16I32Ty, Builder.CreateBitCast(PtrB, V16I32PtrTy), LoadAlign, "vec.b");
+    Value *VecB = Builder.CreateAlignedLoad(VecI32Ty, Builder.CreateBitCast(PtrB, VecI32PtrTy), LoadAlign, "vec.b");
 
     Value *IdxA0 = Builder.CreateAdd(RowOffA0, VK, "idx.a0");
     Value *IdxA1 = Builder.CreateAdd(RowOffA1, VK, "idx.a1");
@@ -1179,21 +1188,21 @@ private:
     Value *PtrA2 = Builder.CreateGEP(I8Ty, Ops.BaseA, IdxA2, "ptr.a2");
     Value *PtrA3 = Builder.CreateGEP(I8Ty, Ops.BaseA, IdxA3, "ptr.a3");
 
-    Value *VecA0 = Builder.CreateAlignedLoad(V16I32Ty, Builder.CreateBitCast(PtrA0, V16I32PtrTy), LoadAlign, "vec.a0");
-    Value *VecA1 = Builder.CreateAlignedLoad(V16I32Ty, Builder.CreateBitCast(PtrA1, V16I32PtrTy), LoadAlign, "vec.a1");
-    Value *VecA2 = Builder.CreateAlignedLoad(V16I32Ty, Builder.CreateBitCast(PtrA2, V16I32PtrTy), LoadAlign, "vec.a2");
-    Value *VecA3 = Builder.CreateAlignedLoad(V16I32Ty, Builder.CreateBitCast(PtrA3, V16I32PtrTy), LoadAlign, "vec.a3");
+    Value *VecA0 = Builder.CreateAlignedLoad(VecI32Ty, Builder.CreateBitCast(PtrA0, VecI32PtrTy), LoadAlign, "vec.a0");
+    Value *VecA1 = Builder.CreateAlignedLoad(VecI32Ty, Builder.CreateBitCast(PtrA1, VecI32PtrTy), LoadAlign, "vec.a1");
+    Value *VecA2 = Builder.CreateAlignedLoad(VecI32Ty, Builder.CreateBitCast(PtrA2, VecI32PtrTy), LoadAlign, "vec.a2");
+    Value *VecA3 = Builder.CreateAlignedLoad(VecI32Ty, Builder.CreateBitCast(PtrA3, VecI32PtrTy), LoadAlign, "vec.a3");
 
     Value *NewBias = Bias;
     if (Ops.BothSigned) {
-      Value *SignFlip = ConstantVector::getSplat(ElementCount::getFixed(16),
+      Value *SignFlip = ConstantVector::getSplat(ElementCount::getFixed(NumElements),
                           ConstantInt::get(I32Ty, 0x80808080));
       VecA0 = Builder.CreateXor(VecA0, SignFlip);
       VecA1 = Builder.CreateXor(VecA1, SignFlip);
       VecA2 = Builder.CreateXor(VecA2, SignFlip);
       VecA3 = Builder.CreateXor(VecA3, SignFlip);
 
-      Value *Ones = ConstantVector::getSplat(ElementCount::getFixed(16),
+      Value *Ones = ConstantVector::getSplat(ElementCount::getFixed(NumElements),
                       ConstantInt::get(I32Ty, 0x01010101));
       NewBias = Builder.CreateCall(VPDPBUSD, {Bias, Ones, VecB});
     }
@@ -1216,10 +1225,14 @@ private:
     // === VNNI EXIT: hreduce and store 4 results ===
     Builder.SetInsertPoint(VNNIExit);
 
+    // Horizontal reduce: sum all elements in vector
+    // For 16 elements: W=8,4,2,1 (4 iterations)
+    // For 8 elements: W=4,2,1 (3 iterations)
     auto hreduce = [&](Value *Vec) -> Value* {
-      for (int W = 8; W >= 1; W /= 2) {
+      int StartW = NumElements / 2;  // 8 for 16 elements, 4 for 8 elements
+      for (int W = StartW; W >= 1; W /= 2) {
         SmallVector<int, 16> Mask;
-        for (int i = 0; i < 16; i++) Mask.push_back((i + W) % 16);
+        for (unsigned i = 0; i < NumElements; i++) Mask.push_back((i + W) % NumElements);
         Vec = Builder.CreateAdd(Vec, Builder.CreateShuffleVector(Vec, Vec, Mask));
       }
       return Builder.CreateExtractElement(Vec, (uint64_t)0);
