@@ -1160,9 +1160,14 @@ private:
     // === VNNI BODY: load B once, 4 A rows, 4 vpdpbusd ===
     Builder.SetInsertPoint(VNNIBody);
 
+    // Use aligned load only if K is multiple of 64, otherwise use unaligned
+    // K is the row stride for A and B_T, so if K % 64 != 0, addresses won't be 64-byte aligned
+    bool UseAlignedLoad = (K % 64 == 0);
+    Align LoadAlign = UseAlignedLoad ? Align(64) : Align(1);
+
     Value *IdxB = Builder.CreateAdd(RowOffB, VK, "idx.b");
     Value *PtrB = Builder.CreateGEP(I8Ty, Ops.BaseB_T, IdxB, "ptr.b");
-    Value *VecB = Builder.CreateLoad(V16I32Ty, Builder.CreateBitCast(PtrB, V16I32PtrTy), "vec.b");
+    Value *VecB = Builder.CreateAlignedLoad(V16I32Ty, Builder.CreateBitCast(PtrB, V16I32PtrTy), LoadAlign, "vec.b");
 
     Value *IdxA0 = Builder.CreateAdd(RowOffA0, VK, "idx.a0");
     Value *IdxA1 = Builder.CreateAdd(RowOffA1, VK, "idx.a1");
@@ -1174,10 +1179,10 @@ private:
     Value *PtrA2 = Builder.CreateGEP(I8Ty, Ops.BaseA, IdxA2, "ptr.a2");
     Value *PtrA3 = Builder.CreateGEP(I8Ty, Ops.BaseA, IdxA3, "ptr.a3");
 
-    Value *VecA0 = Builder.CreateLoad(V16I32Ty, Builder.CreateBitCast(PtrA0, V16I32PtrTy), "vec.a0");
-    Value *VecA1 = Builder.CreateLoad(V16I32Ty, Builder.CreateBitCast(PtrA1, V16I32PtrTy), "vec.a1");
-    Value *VecA2 = Builder.CreateLoad(V16I32Ty, Builder.CreateBitCast(PtrA2, V16I32PtrTy), "vec.a2");
-    Value *VecA3 = Builder.CreateLoad(V16I32Ty, Builder.CreateBitCast(PtrA3, V16I32PtrTy), "vec.a3");
+    Value *VecA0 = Builder.CreateAlignedLoad(V16I32Ty, Builder.CreateBitCast(PtrA0, V16I32PtrTy), LoadAlign, "vec.a0");
+    Value *VecA1 = Builder.CreateAlignedLoad(V16I32Ty, Builder.CreateBitCast(PtrA1, V16I32PtrTy), LoadAlign, "vec.a1");
+    Value *VecA2 = Builder.CreateAlignedLoad(V16I32Ty, Builder.CreateBitCast(PtrA2, V16I32PtrTy), LoadAlign, "vec.a2");
+    Value *VecA3 = Builder.CreateAlignedLoad(V16I32Ty, Builder.CreateBitCast(PtrA3, V16I32PtrTy), LoadAlign, "vec.a3");
 
     Value *NewBias = Bias;
     if (Ops.BothSigned) {
