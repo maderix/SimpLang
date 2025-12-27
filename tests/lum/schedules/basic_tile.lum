@@ -1,0 +1,7 @@
+# Basic tiling test
+# Tiles a matmul operation with explicit loop bindings
+
+schedule TileMatmul(linalg.matmul) {
+    tile [64, 64, 32] => m, n, k
+    check accuracy
+}
