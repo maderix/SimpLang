@@ -1,0 +1,13 @@
+# VNNI-optimized INT8 matmul
+# Uses VNNI vectorization for AVX-512
+
+pattern Int8Matmul {
+    mm: linalg.matmul
+}
+
+schedule VNNIOptimized(Int8Matmul) {
+    tile [32, 32, 64] => m, n, k
+    tile [1, 16, 4] => _, micro_n, micro_k
+    vec [16, 4] vnni
+    check accuracy
+}

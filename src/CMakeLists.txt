@@ -102,3 +102,6 @@ if(USE_MLIR)
         MLIRExecutionEngine  # For makeOptimizingTransformer and initializeLLVMPasses
     )
 endif()
+
+# Lum DSL compiler (Transform Dialect generator)
+add_subdirectory(lum)

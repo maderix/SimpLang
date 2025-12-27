@@ -1,0 +1,15 @@
+# Matmul with bias fusion test
+# Pattern matches matmul -> bias chain, tiles and fuses
+
+pattern MatmulBias {
+    mm: linalg.matmul
+    bias: linalg.generic
+    mm -> bias
+}
+
+schedule OptMatmulBias(MatmulBias) {
+    tile [64, 64, 32] => m, n, k
+    fuse bias into m
+    vec [16]
+    check accuracy
+}
