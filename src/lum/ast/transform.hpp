@@ -100,6 +100,38 @@ public:
     }
 };
 
+// FuseChain transform: fuse_chain [op1, op2, op3] or fuse_chain [...] with custom.op
+// Fuses a chain of element-wise operations together, optionally replacing with custom op
+class FuseChainTransform : public Transform {
+    std::vector<std::string> ops_;  // Handles of ops to fuse
+    std::string replacement_;       // Optional: custom op to replace with
+
+public:
+    FuseChainTransform(const std::vector<std::string>& ops,
+                       const std::string& replacement = "")
+        : ops_(ops), replacement_(replacement) {}
+
+    NodeKind getKind() const override { return NodeKind::FuseChainTransform; }
+
+    const std::vector<std::string>& getOps() const { return ops_; }
+    const std::string& getReplacement() const { return replacement_; }
+    bool hasReplacement() const { return !replacement_.empty(); }
+
+    void dump(std::ostream& os, int level = 0) const override {
+        indent(os, level);
+        os << "FuseChainTransform: [";
+        for (size_t i = 0; i < ops_.size(); ++i) {
+            if (i > 0) os << ", ";
+            os << ops_[i];
+        }
+        os << "]";
+        if (hasReplacement()) {
+            os << " with " << replacement_;
+        }
+        os << "\n";
+    }
+};
+
 // Vec transform: vec [16] or vec [16] vnni
 class VecTransform : public Transform {
     std::vector<int64_t> sizes_;

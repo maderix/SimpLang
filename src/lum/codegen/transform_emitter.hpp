@@ -57,8 +57,12 @@ private:
     // Transform-specific emitters
     void emitTile(const TileTransform& tile);
     void emitFuse(const FuseTransform& fuse);
+    void emitFuseChain(const FuseChainTransform& fuseChain);
     void emitVec(const VecTransform& vec);
     void emitCheck(const CheckTransform& check);
+    void emitUnroll(const UnrollTransform& unroll);
+    void emitInterchange(const InterchangeTransform& interchange);
+    void emitParallel(const ParallelTransform& parallel);
 
     // Handle management
     std::string newSSAName(const std::string& hint = "");

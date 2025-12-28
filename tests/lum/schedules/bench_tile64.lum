@@ -1,0 +1,6 @@
+# Lum schedule for benchmark: 64x64x32 tiling
+# Optimized for L2 cache (256KB) with 32-deep K for register reuse
+
+schedule TileMatmul64(linalg.matmul) {
+    tile [64, 64, 32] => m, n, k
+}

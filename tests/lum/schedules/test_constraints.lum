@@ -1,0 +1,9 @@
+# Test pattern constraints
+pattern Int8Matmul {
+    mm: linalg.matmul where dtype=i8
+}
+
+schedule OptInt8Matmul(Int8Matmul) {
+    tile [64, 64, 64] => m, n, k
+    vec [64] vnni
+}

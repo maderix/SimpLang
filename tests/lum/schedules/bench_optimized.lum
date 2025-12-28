@@ -1,0 +1,7 @@
+# Optimized Lum schedule with hierarchical tiling
+# Matches SimpLang internal: 32x32 outer, then vectorization
+
+schedule OptMatmul(linalg.matmul) {
+    tile [32, 32, 32] => m, n, k
+    unroll k 4
+}

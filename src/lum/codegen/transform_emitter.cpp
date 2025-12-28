@@ -53,9 +53,15 @@ void TransformEmitter::emitSchedule(const ScheduleDecl& schedule,
     ssaCounter_ = 0;
     handles_.clear();
 
+    // Use __transform_main as entry point for mlir-opt --transform-interpreter
+    // The original schedule name is preserved in a comment for documentation
+    std::string entryName = "__transform_main";
+
     // Emit named_sequence header with readonly attribute
     indent();
-    line("transform.named_sequence @" + schedule.getName() +
+    emit("// Schedule: " + schedule.getName() + "\n");
+    indent();
+    line("transform.named_sequence @" + entryName +
          "(%arg0: !transform.any_op {transform.readonly}) {");
     indentLevel_++;
 
@@ -107,7 +113,15 @@ void TransformEmitter::emitPattern(const PatternDecl& pattern) {
         std::string handle = newSSAName(op->getHandle());
         indent();
         emit(handle + " = transform.structured.match ");
-        emit("ops{[\"" + op->getQualifiedName() + "\"]} in %arg0");
+        emit("ops{[\"" + op->getQualifiedName() + "\"]}");
+
+        emit(" in %arg0");
+
+        // Add dtype filter as attribute if constraint exists
+        if (op->hasConstraint() && op->getConstraint().hasDtype()) {
+            const std::string& dtype = op->getConstraint().dtype;
+            emit(" {lum.dtype = \"" + dtype + "\"}");
+        }
         emit(" : (!transform.any_op) -> !transform.any_op\n");
         registerHandle(op->getHandle(), handle);
     }
@@ -124,11 +138,23 @@ void TransformEmitter::emitTransform(const Transform& transform) {
         case NodeKind::FuseTransform:
             emitFuse(static_cast<const FuseTransform&>(transform));
             break;
+        case NodeKind::FuseChainTransform:
+            emitFuseChain(static_cast<const FuseChainTransform&>(transform));
+            break;
         case NodeKind::VecTransform:
             emitVec(static_cast<const VecTransform&>(transform));
             break;
         case NodeKind::CheckTransform:
             emitCheck(static_cast<const CheckTransform&>(transform));
+            break;
+        case NodeKind::UnrollTransform:
+            emitUnroll(static_cast<const UnrollTransform&>(transform));
+            break;
+        case NodeKind::InterchangeTransform:
+            emitInterchange(static_cast<const InterchangeTransform&>(transform));
+            break;
+        case NodeKind::ParallelTransform:
+            emitParallel(static_cast<const ParallelTransform&>(transform));
             break;
         default:
             errors_.push_back("Unsupported transform type");
@@ -233,6 +259,75 @@ void TransformEmitter::emitFuse(const FuseTransform& fuse) {
     rebindHandle(producers[0], fusedHandle);
 }
 
+void TransformEmitter::emitFuseChain(const FuseChainTransform& fuseChain) {
+    const auto& ops = fuseChain.getOps();
+
+    if (ops.size() < 2) {
+        errors_.push_back("fuse_chain requires at least 2 operations");
+        return;
+    }
+
+    if (fuseChain.hasReplacement()) {
+        // Kernel fusion: replace matched ops with custom op
+        // Collect the last (consumer) handle to replace
+        std::string consumerSSA = getHandle(ops.back());
+        if (consumerSSA.empty()) {
+            errors_.push_back("Unknown handle '" + ops.back() + "' in fuse_chain");
+            return;
+        }
+
+        std::string replacedHandle = newSSAName("replaced");
+        const std::string& replacement = fuseChain.getReplacement();
+
+        // Emit transform.structured.replace with region containing the custom op
+        indent();
+        emit("// Kernel fusion: replacing pattern with " + replacement + "\n");
+        indent();
+        emit(replacedHandle + " = transform.structured.replace " + consumerSSA + " {\n");
+        indentLevel_++;
+        indent();
+        emit("^bb0:\n");
+        indentLevel_++;
+        indent();
+        // Emit the custom op call
+        emit("\"" + replacement + "\"() : () -> ()\n");
+        indentLevel_--;
+        indentLevel_--;
+        indent();
+        emit("} : (!transform.any_op) -> !transform.any_op\n");
+
+        // Mark all ops as consumed
+        for (const auto& op : ops) {
+            consumeHandle(op, "fuse_chain");
+        }
+
+        // Register the replaced result
+        registerHandle("replaced", replacedHandle);
+    } else {
+        // Loop fusion: tile consumer and fuse producers
+        std::string consumerSSA = getHandle(ops.back());
+        if (consumerSSA.empty()) {
+            errors_.push_back("Unknown consumer handle '" + ops.back() + "' in fuse_chain");
+            return;
+        }
+
+        std::string fusedHandle = newSSAName("fused");
+
+        indent();
+        emit(fusedHandle + ", %loop = transform.structured.fuse " + consumerSSA);
+        emit(" [1]");
+        emit(" : (!transform.any_op) -> (!transform.any_op, !transform.any_op)\n");
+
+        // Mark all ops as consumed
+        for (const auto& op : ops) {
+            consumeHandle(op, "fuse_chain");
+        }
+
+        // Register the fused result
+        registerHandle("fused_chain", fusedHandle);
+    }
+}
+
 void TransformEmitter::emitVec(const VecTransform& vec) {
     // Determine target handle
     std::string targetLum;
@@ -274,12 +369,92 @@ void TransformEmitter::emitCheck(const CheckTransform& check) {
     // Check is a verification directive, emit as comment for now
     indent();
     emit("// check " + check.getCheckType() + " (verification point)\n");
+}
 
-    // In a full implementation, this would:
-    // 1. Clone the current IR
-    // 2. Generate test inputs
-    // 3. Execute both versions
-    // 4. Compare results
+void TransformEmitter::emitUnroll(const UnrollTransform& unroll) {
+    // Get loop handle
+    std::string loopSSA = getHandle(unroll.getLoop());
+    if (loopSSA.empty()) {
+        errors_.push_back("Unknown loop handle '" + unroll.getLoop() + "' for unroll");
+        return;
+    }
+
+    // Emit loop unroll
+    // Format: transform.loop.unroll %loop { factor = N } : !transform.any_op
+    indent();
+    emit("transform.loop.unroll " + loopSSA + " { factor = ");
+    emit(std::to_string(unroll.getFactor()));
+    emit(" } : !transform.any_op\n");
+
+    // Loop unroll consumes the handle
+    consumeHandle(unroll.getLoop(), "unroll");
+}
+
+void TransformEmitter::emitInterchange(const InterchangeTransform& interchange) {
+    // Interchange works on a structured op - find the tiled op handle
+    // The tiled handle is typically "tiled" or bound to the original op name
+    std::string targetLum;
+    std::string targetSSA;
+
+    // First try to find a handle that looks like a structured op (not a loop)
+    for (const auto& entry : handles_) {
+        // Skip loop handles (they have "#" in SSA name from tile)
+        if (entry.second.ssaName.find("#") == std::string::npos) {
+            targetLum = entry.first;
+            targetSSA = entry.second.ssaName;
+            break;
+        }
+    }
+
+    if (targetSSA.empty()) {
+        errors_.push_back("No structured op handle available for interchange");
+        return;
+    }
+
+    const auto& order = interchange.getOrder();
+
+    // Generate result handle
+    std::string resultHandle = newSSAName("interchanged");
+
+    // Emit structured interchange with permutation
+    // Format: %result = transform.structured.interchange %op
+    //         iterator_interchange = [2, 0, 1] : (!transform.any_op) -> !transform.any_op
+    indent();
+    emit(resultHandle + " = transform.structured.interchange " + targetSSA);
+    emit(" iterator_interchange = [");
+
+    for (size_t i = 0; i < order.size(); ++i) {
+        if (i > 0) emit(", ");
+        emit(std::to_string(i));
+    }
+    emit("] : (!transform.any_op) -> !transform.any_op\n");
+
+    // Interchange consumes and produces new handle
+    consumeHandle(targetLum, "interchange");
+    rebindHandle(targetLum, resultHandle);
+}
+
+void TransformEmitter::emitParallel(const ParallelTransform& parallel) {
+    // Get loop handle - this is the scf.for loop to parallelize
+    std::string loopSSA = getHandle(parallel.getLoop());
+    if (loopSSA.empty()) {
+        errors_.push_back("Unknown loop handle '" + parallel.getLoop() + "' for parallel");
+        return;
+    }
+
+    // Generate result handle for coalesced loop (single loop that can be parallelized)
+    std::string resultHandle = newSSAName("coalesced");
+
+    // Use loop.coalesce to prepare the loop for parallel execution
+    // The coalesced loop can then be mapped to parallel execution
+    // Format: %coalesced = transform.loop.coalesce %loop : (!transform.any_op) -> !transform.any_op
+    indent();
+    emit(resultHandle + " = transform.loop.coalesce " + loopSSA);
+    emit(" : (!transform.any_op) -> !transform.any_op\n");
+
+    // Parallel consumes the loop handle and produces new one
+    consumeHandle(parallel.getLoop(), "parallel");
+    registerHandle(parallel.getLoop() + "_par", resultHandle);
 }
 
 // Handle management
@@ -301,6 +476,14 @@ void TransformEmitter::registerHandle(const std::string& lumName,
 std::string TransformEmitter::getHandle(const std::string& lumName) {
     auto it = handles_.find(lumName);
     if (it == handles_.end()) return "";
+
+    // Check if handle was consumed (use-after-consume error)
+    if (it->second.consumed) {
+        errors_.push_back("Use-after-consume error: handle '" + lumName +
+                         "' was already consumed by '" + it->second.consumedBy + "'");
+        return "";
+    }
+
     return it->second.ssaName;
 }
 

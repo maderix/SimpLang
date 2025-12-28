@@ -75,6 +75,16 @@
 // MLIR Verification
 #include "mlir/IR/Verifier.h"
 
+// Transform Dialect for Lum schedules
+#include "mlir/Dialect/Transform/IR/TransformDialect.h"
+#include "mlir/Dialect/Transform/IR/TransformOps.h"
+#include "mlir/Dialect/Transform/Transforms/TransformInterpreterUtils.h"
+#include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
+#include "mlir/Dialect/Linalg/TransformOps/DialectExtension.h"
+#include "mlir/Dialect/Linalg/Transforms/TilingInterfaceImpl.h"
+#include "mlir/Dialect/SCF/TransformOps/SCFTransformOps.h"
+#include "mlir/Parser/Parser.h"
+
 // LLVM
 #include "llvm/IR/Module.h"
 #include "llvm/IR/DIBuilder.h"
@@ -147,6 +157,94 @@ bool MLIRCompilationPipeline::runPasses() {
       if (!EC) {
         module.print(out);
         llvm::outs() << "Phase 1 dump: " << dumpPath << "\n";
+      }
+    }
+  }
+
+  // Phase 1.5: Apply Lum schedule (Transform Dialect) if provided
+  // This replaces the internal tiling/optimization in Phase 2
+  if (!scheduleFile.empty()) {
+    mlir::simp::PhaseScope phaseScope(iceHandler, "Phase 1.5 (Lum Transform)");
+    llvm::outs() << "[Lum] Schedule file provided: " << scheduleFile << "\n";
+
+    // Determine if we need to compile .lum to .mlir
+    std::string transformFile = scheduleFile;
+    bool needsCompilation = llvm::StringRef(scheduleFile).ends_with(".lum");
+
+    if (needsCompilation) {
+      // Generate temporary .mlir file path
+      transformFile = scheduleFile + ".mlir";
+
+      // Call lum compiler to generate transform MLIR
+      std::string lumCmd = "lum " + scheduleFile + " --emit-transform > " + transformFile;
+      llvm::outs() << "[Lum] Compiling: " << lumCmd << "\n";
+      int ret = std::system(lumCmd.c_str());
+      if (ret != 0) {
+        llvm::errs() << "[Lum] Error: Failed to compile schedule file\n";
+        return false;
+      }
+    }
+
+    // Register Transform Dialect and required extensions for linalg/scf transforms
+    mlir::DialectRegistry registry;
+    registry.insert<mlir::transform::TransformDialect>();
+    mlir::linalg::registerTransformDialectExtension(registry);
+    mlir::linalg::registerTilingInterfaceExternalModels(registry);
+    mlir::scf::registerTransformDialectExtension(registry);
+    module.getContext()->appendDialectRegistry(registry);
+
+    // Parse the transform module
+    mlir::OwningOpRef<mlir::ModuleOp> transformModule;
+    if (failed(mlir::transform::detail::parseTransformModuleFromFile(
+            module.getContext(), transformFile, transformModule))) {
+      llvm::errs() << "[Lum] Error: Failed to parse transform file: " << transformFile << "\n";
+      return false;
+    }
+
+    llvm::outs() << "[Lum] Transform module parsed successfully\n";
+
+    // Find the transform entry point (named @__transform_main)
+    mlir::transform::TransformOpInterface entryPoint =
+        mlir::transform::detail::findTransformEntryPoint(
+            module.getOperation(), transformModule.get());
+
+    if (!entryPoint) {
+      llvm::errs() << "[Lum] Error: No transform entry point found (@__transform_main)\n";
+      llvm::errs() << "[Lum] Available sequences in transform module:\n";
+      transformModule->walk([](mlir::Operation* op) {
+        if (auto named = llvm::dyn_cast<mlir::transform::NamedSequenceOp>(op)) {
+          llvm::errs() << "  - @" << named.getSymName() << "\n";
+        }
+      });
+      return false;
+    }
+
+    llvm::outs() << "[Lum] Applying transform sequence: @" << entryPoint.getOperation()->getName() << "\n";
+
+    // Apply the transforms
+    mlir::transform::TransformOptions options;
+    if (failed(mlir::transform::applyTransformNamedSequence(
+            module.getOperation(),
+            entryPoint.getOperation(),
+            transformModule.get(),
+            options))) {
+      llvm::errs() << "[Lum] Error: Transform application failed\n";
+      iceHandler.emitICE();
+      return false;
+    }
+
+    llvm::outs() << "[Lum] Transforms applied successfully\n";
+
+    // Disable internal tiling since Lum handled it
+    enableTiling = false;
+
+    if (dumpIntermediateIR && !outputPath.empty()) {
+      std::string dumpPath = outputPath + "_phase1_5_lum_transformed.mlir";
+      std::error_code EC;
+      llvm::raw_fd_ostream out(dumpPath, EC);
+      if (!EC) {
+        module.print(out);
+        llvm::outs() << "[Lum] Phase 1.5 dump: " << dumpPath << "\n";
       }
     }
   }
