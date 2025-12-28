@@ -1,0 +1,14 @@
+# Test fuse_chain transform for element-wise operations
+pattern GeluChain {
+    mul1: linalg.generic
+    erf: linalg.generic
+    mul2: linalg.generic
+    add: linalg.generic
+    mul1 -> erf
+    erf -> mul2
+    mul2 -> add
+}
+
+schedule OptGelu(GeluChain) {
+    fuse_chain [mul1, erf, mul2, add]
+}

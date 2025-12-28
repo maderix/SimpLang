@@ -4,7 +4,7 @@
   <img src="docs/animation_cropped.gif" alt="SimpLang Banner" width="600"/>
 </p>
 
-## **1 Introduction**
+## **1 Introduction**
 
 SimpLang is a domain-specific language and compiler infrastructure designed to investigate a unified representation for numerical computation and machine-learning workloads. The project evaluates whether high-level mathematical expressions can be lowered through a structured, multi-stage compilation strategy to generate performant code for CPUs and ARM-based edge devices.
 
@@ -18,11 +18,11 @@ SimpLang is an intentionally exploratory implementation. It includes fully optim
   <img src="assets/llama_demo.gif" alt="LLaMA 110M Demo" width="800"/>
 </p>
 
-# **2 Execution Characteristics**
+# **2 Execution Characteristics**
 
 SimpLang has been evaluated on representative machine-learning and numerical workloads. Experimental results illustrate the effectiveness of a multi-level IR approach in achieving competitive performance relative to hand-optimized or production libraries.
 
-### **2.1 Transformer Inference on CPU**
+### **2.1 Transformer Inference on CPU**
 
 A 110M-parameter LLaMA model executes at **42.95 tokens/s** on x86 hardware. The model is implemented entirely in SimpLang and lowered through the MLIR backend, illustrating that high-level tensor operations such as `tensor_matmul`, `rmsnorm`, `softmax`, and `silu` can be compiled into efficient vectorized kernels.
 
@@ -32,7 +32,7 @@ Quantization is supported through **4-bit (W4)** weights, providing 4× memory r
 
 ---
 
-### **2.2 Matrix Multiplication**
+### **2.2 Matrix Multiplication**
 
 Matrix multiplication, the central kernel behind most ML workloads, exhibits competitive throughput:
 
@@ -46,7 +46,7 @@ These results arise from explicit tiling (16×16×16), shape-aware lowering via 
 
 ---
 
-### **2.3 ARM Cross-Compilation**
+### **2.3 ARM Cross-Compilation**
 
 Cross-compilation to ARM uses the same high-level SimpLang program with a target switch (`--target aarch64`). On Raspberry Pi 5, results show substantial improvements over NumPy:
 
@@ -60,13 +60,13 @@ Transformer inference achieves **13.49 tokens/s** with tuned 8×8×8 tiling for 
 
 ---
 
-# **3 Dual-Backend Architecture**
+# **3 Dual-Backend Architecture**
 
 SimpLang adopts two compilation paths, unified by a single high-level source language but optimized for different classes of workloads.
 
 ---
 
-## **3.1 LLVM Backend**
+## **3.1 LLVM Backend**
 
 The LLVM backend is oriented toward general numerical computation and traditional scalar/vector loops.
 
@@ -81,7 +81,7 @@ This backend underlies the baseline performance of SimpLang and served as the in
 
 ---
 
-## **3.2 MLIR Backend**
+## **3.2 MLIR Backend**
 
 The MLIR backend is specialized for tensor-centric ML workloads. It introduces a custom Simp dialect representing high-level tensor operations and ML primitives such as:
 
@@ -112,7 +112,7 @@ For ML workloads (e.g., attention mechanisms, feed-forward networks, convolution
 
 ---
 
-# **4 Programming Interface**
+# **4 Programming Interface**
 
 SimpLang adopts a minimal, math-oriented syntax. Programs define a single entry function `kernel_main`, and variables use inferred types unless explicitly annotated.
 
@@ -120,7 +120,7 @@ Below we summarize representative examples within the MLIR paper style.
 
 ---
 
-## **4.1 Scalar Example**
+## **4.1 Scalar Example**
 
 ```simplang
 fn kernel_main() {
@@ -139,7 +139,7 @@ This lowers to SSA form in LLVM IR, subsequently optimized by the LLVM pipeline.
 
 ---
 
-## **4.2 Vectorizable Loop**
+## **4.2 Vectorizable Loop**
 
 ```simplang
 fn vector_add(var data f32[], var n i64) {
@@ -156,7 +156,7 @@ The LLVM vectorizer transforms this loop into SIMD operations (e.g., AVX2), with
 
 ---
 
-## **4.3 Tensor Example (MLIR Backend)**
+## **4.3 Tensor Example (MLIR Backend)**
 
 ```simplang
 fn matmul_example() {
@@ -173,7 +173,7 @@ The lowering sequence constructs a tiled and vectorized Linalg→SCF loop nest.
 
 ---
 
-## **4.4 Transformer Block**
+## **4.4 Transformer Block**
 
 A simplified transformer block is expressible directly in SimpLang:
 
@@ -187,7 +187,7 @@ The complete model (as used in evaluation) follows this pattern and lowers exclu
 
 ---
 
-# **5 Cross-Compilation to ARM**
+# **5 Cross-Compilation to ARM**
 
 Cross-compilation requires only changing the target on the MLIR command line:
 
@@ -205,13 +205,13 @@ The generated code employs ARM NEON instructions (e.g., `fmla v1.4s, v2.4s, v3.4
 
 ---
 
-# **6 Compilation Pipeline**
+# **6 Compilation Pipeline**
 
 SimpLang exposes two independent but conceptually parallel pipelines.
 
 ---
 
-## **6.1 LLVM Pipeline**
+## **6.1 LLVM Pipeline**
 
 1. **Lexing** → tokenization
 2. **Parsing** → abstract syntax tree (AST)
@@ -222,7 +222,7 @@ SimpLang exposes two independent but conceptually parallel pipelines.
 
 ---
 
-## **6.2 MLIR Pipeline**
+## **6.2 MLIR Pipeline**
 
 1. **Front-end** parses SimpLang into high-level ops
 2. **Simp Dialect** captures tensor-level semantics
@@ -237,9 +237,79 @@ Intermediate representations can be inspected at any stage via `--dump-mlir-pass
 
 ---
 
-# **7 Debugging and Inspection**
+# **7 Lum DSL (Experimental)**
 
-### **7.1 LLVM Interactive Debugger**
+Lum is an experimental domain-specific language for declarative optimization scheduling. It generates MLIR Transform Dialect code, enabling external control over tiling, fusion, and other transformations without modifying the compiler.
+
+### **7.1 Overview**
+
+Lum provides a minimal syntax for specifying optimization schedules:
+
+```lum
+# Define a pattern to match
+pattern MatmulBias {
+    mm: linalg.matmul
+    bias: linalg.generic
+    mm -> bias
+}
+
+# Define optimization schedule
+schedule OptMatmul(MatmulBias) {
+    tile [64, 64, 32] => m, n, k
+    fuse bias into m
+    unroll k 4
+}
+```
+
+### **7.2 Supported Transforms**
+
+| Transform | Syntax | Description |
+|-----------|--------|-------------|
+| `tile` | `tile [M,N,K] => m,n,k` | Tile loops with specified sizes |
+| `fuse` | `fuse A into L` | Fuse producer into consumer loop |
+| `fuse_chain` | `fuse_chain [a,b,c]` | Chain multiple operations |
+| `unroll` | `unroll k N` | Unroll loop by factor N |
+| `interchange` | `interchange [i,j,k]` | Reorder loop dimensions |
+| `parallel` | `parallel m` | Mark loop for parallelization |
+| `vec` | `vec [N] vnni` | Vectorize with optional VNNI |
+
+### **7.3 Usage**
+
+Lum integrates directly with the SimpLang compilation pipeline:
+
+```bash
+# Generate transform module from Lum schedule
+./build_mlir/src/lum/lum schedule.lum --emit-transform > schedule.mlir
+
+# Compile with Lum schedule (transforms applied automatically)
+./build_mlir/src/simplang kernel.sl --emit-mlir --schedule schedule.mlir -o kernel.o
+```
+
+When `--schedule` is provided:
+1. SimpLang internal tiling is disabled
+2. Lum transforms are applied after Phase 1 (Simp → Linalg lowering)
+3. Remaining optimization phases (vectorization, etc.) continue normally
+
+### **7.4 Performance Notes**
+
+Lum is designed for experimentation and custom scheduling. For default workloads, SimpLang's internal hierarchical tiling typically achieves better performance due to integrated optimizations:
+
+| Configuration | 512×512 matmul |
+|---------------|----------------|
+| SimpLang Internal | 62.25 GFLOPS |
+| Lum [32,32,32] + unroll | 44.85 GFLOPS |
+
+Lum is valuable for:
+- Experimenting with different tile sizes without recompiling
+- Custom fusion patterns for specific kernels
+- Research into scheduling strategies
+- Prototyping new optimization sequences
+
+---
+
+# **8 Debugging and Inspection**
+
+### **8.1  LLVM Interactive Debugger**
 
 SimpLang integrates a debugger analogous to GDB for the LLVM backend. It supports:
 
@@ -249,7 +319,7 @@ SimpLang integrates a debugger analogous to GDB for the LLVM backend. It support
 * Memory tracking and leak detection
 * Inspection of SIMD register state
 
-### **7.2 MLIR Debugging**
+### **8.2 MLIR Debugging**
 
 Inspection is performed via IR dumps:
 
@@ -261,13 +331,13 @@ Developers can search for `linalg.matmul`, `scf.for`, or `llvm.fma` to trace low
 
 ---
 
-# **8 System Architecture**
+# **9 System Architecture**
 
-### **8.1 Host/Kernels**
+### **9.1 Host/Kernels**
 
 SimpLang kernels compile into `.so` libraries with a C ABI. A C++ host program loads them dynamically and invokes `kernel_main()`. This boundary isolates compute kernels from application code and supports rapid iteration.
 
-### **8.2 Memory Representation**
+### **9.2 Memory Representation**
 
 Aligned allocations ensure compatibility with SIMD load/store semantics. MLIR-generated code uses **memref descriptors**, enabling:
 
@@ -275,15 +345,15 @@ Aligned allocations ensure compatibility with SIMD load/store semantics. MLIR-ge
 * Multidimensional views
 * Strided accesses
 
-### **8.3 Type and Shape System**
+### **9.3 Type and Shape System**
 
 Types default to `f32`. Integer literals use the `i` suffix. Tensor operations employ static shapes; shape inference validates dimensions and emits informative errors.
 
 ---
 
-# **9 Current Implementation and Roadmap**
+# **10 Current Implementation and Roadmap**
 
-### **9.1 Supported Today**
+### **10.1 Supported Today**
 
 * LLVM backend with full language coverage
 * MLIR backend with tensor and ML primitives
@@ -293,7 +363,7 @@ Types default to `f32`. Integer literals use the `i` suffix. Tensor operations e
 * Competitive matrix multiplication
 * Docker/Dev-container workflows
 
-### **9.2 Short-Term Development**
+### **10.2 Short-Term Development**
 
 * int4/int8 native kernels
 * AVX-512 VNNI / ARM DP4A support
@@ -302,7 +372,7 @@ Types default to `f32`. Integer literals use the `i` suffix. Tensor operations e
 * Enhanced error diagnostics
 * Multi-threading for ML workloads
 
-### **9.3 Long-Term Objectives**
+### **10.3 Long-Term Objectives**
 
 * GPU lowering via MLIR GPU dialects
 * Apple AMX support
@@ -314,7 +384,7 @@ Types default to `f32`. Integer literals use the `i` suffix. Tensor operations e
 
 ---
 
-# **10 Contributing**
+# **11 Contributing**
 
 The project welcomes contributions in:
 
@@ -328,6 +398,6 @@ Pull requests should include test cases and performance evaluations where releva
 
 ---
 
-# **11 License**
+# **12 License**
 
 SimpLang is released under the MIT License.

@@ -123,7 +123,7 @@ endif()
 add_subdirectory(tests)      # Tests directory
 add_subdirectory(tests/benchmark)  # Benchmarks
 add_subdirectory(simptensor) # SimpTensor library tests
-add_subdirectory(mobilenet_poc) # MobileNet POC demonstration
+# add_subdirectory(mobilenet_poc) # MobileNet POC demonstration (disabled)
 
 # Update build_all dependencies
 add_dependencies(build_all 

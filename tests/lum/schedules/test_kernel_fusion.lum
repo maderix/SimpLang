@@ -1,0 +1,13 @@
+# Test kernel fusion - replace pattern with custom op
+pattern Gelu {
+    mul1: linalg.generic
+    erf: linalg.generic
+    mul2: linalg.generic
+    add: linalg.generic
+    mul1 -> erf -> mul2 -> add
+}
+
+schedule OptGeluKernel(Gelu) {
+    # Replace entire pattern with custom fused GELU op
+    fuse_chain [mul1, erf, mul2, add] with simp.gelu
+}

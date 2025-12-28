@@ -1,0 +1,7 @@
+# Test use-after-consume error detection
+# This schedule has an error: unrolling k loop twice consumes the handle
+schedule UseAfterConsumeTest(linalg.matmul) {
+    tile [64, 64, 32] => m, n, k
+    unroll k 4
+    unroll k 2
+}

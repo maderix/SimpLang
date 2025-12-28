@@ -95,6 +95,15 @@ int yycolumn = 1;
  /* Data types */
 "vnni"          { return TVNNI; }
 "simd"          { return TSIMD; }
+"where"         { return TWHERE; }
+"i8"            { return TI8; }
+"i16"           { return TI16; }
+"i32"           { return TI32; }
+"i64"           { return TI64; }
+"f16"           { return TF16; }
+"f32"           { return TF32; }
+"f64"           { return TF64; }
+"dtype"         { return TDTYPE; }
 
  /* Operators */
 "->"            { return TARROW; }

@@ -104,6 +104,10 @@ add_mlir_dialect_library(simp_dialect
   MLIRSCFToOpenMP                 # SCF to OpenMP conversion
   MLIROpenMPToLLVM                # OpenMP to LLVM conversion
   MLIROpenMPToLLVMIRTranslation   # OpenMP LLVM IR translation
+  MLIRTransformDialect            # Transform Dialect for Lum schedules
+  MLIRTransformDialectTransforms  # Transform interpreter
+  MLIRLinalgTransformOps          # Linalg transform ops (tile, fuse, etc.)
+  MLIRSCFTransformOps             # SCF transform ops (unroll, coalesce, etc.)
   MLIRReconcileUnrealizedCasts
   MLIRTargetLLVMIRExport
   MLIRLLVMToLLVMIRTranslation

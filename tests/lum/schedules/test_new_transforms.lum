@@ -1,0 +1,7 @@
+# Test schedule with unroll, interchange, and parallel transforms
+schedule TestNewTransforms(linalg.matmul) {
+    tile [64, 64, 32] => m, n, k
+    unroll k 4
+    interchange [m, k, n]
+    parallel m
+}

@@ -44,7 +44,8 @@ lum::Program* programRoot = nullptr;
 %token TLET TIF TELSE TFOR TIN TDERIVE
 %token TCHECK TACCURACY TVALID TPERF TMEMORY TTRACE TBREAK TASSERT TSNAPSHOT TDIFF TINTO TWITH
 %token TFUSE_CHAIN TFUSE_HORIZONTAL TFUSE_REDUCTION TFUSE_ELEMENTWISE
-%token TVNNI TSIMD
+%token TVNNI TSIMD TWHERE TDTYPE
+%token TI8 TI16 TI32 TI64 TF16 TF32 TF64
 
 %token TARROW TBIND
 %token TCEQ TCNE TCLE TCGE TAND TOR TMOD
@@ -61,12 +62,17 @@ lum::Program* programRoot = nullptr;
 %type <node> pattern_decl
 %type <node> schedule_decl
 %type <node> op_pattern
-%type <node> dataflow_edge
+%type <string> dtype_spec
+%type <list> dataflow_chain
 %type <node> transform_stmt
 %type <node> tile_stmt
 %type <node> fuse_stmt
+%type <node> fuse_chain_stmt
 %type <node> vec_stmt
 %type <node> check_stmt
+%type <node> unroll_stmt
+%type <node> interchange_stmt
+%type <node> parallel_stmt
 
 %type <list> pattern_stmts pattern_body
 %type <list> dataflow_stmts
@@ -147,6 +153,24 @@ op_pattern
         delete $1;
         delete $3;
     }
+    | TIDENTIFIER TCOLON op_type TWHERE TDTYPE TASSIGN dtype_spec {
+        lum::OpConstraint constraint;
+        constraint.dtype = *$7;
+        $$ = new lum::OpPattern(*$1, *$3, constraint);
+        delete $1;
+        delete $3;
+        delete $7;
+    }
+    ;
+
+dtype_spec
+    : TI8 { $$ = new std::string("i8"); }
+    | TI16 { $$ = new std::string("i16"); }
+    | TI32 { $$ = new std::string("i32"); }
+    | TI64 { $$ = new std::string("i64"); }
+    | TF16 { $$ = new std::string("f16"); }
+    | TF32 { $$ = new std::string("f32"); }
+    | TF64 { $$ = new std::string("f64"); }
     ;
 
 op_type
@@ -159,23 +183,36 @@ op_type
     ;
 
 dataflow_stmts
-    : dataflow_edge {
-        auto* list = new std::vector<lum::DataflowEdge*>();
-        list->push_back(static_cast<lum::DataflowEdge*>($1));
-        $$ = list;
+    : dataflow_chain {
+        $$ = $1;
     }
-    | dataflow_stmts dataflow_edge {
+    | dataflow_stmts dataflow_chain {
         auto* list = static_cast<std::vector<lum::DataflowEdge*>*>($1);
-        list->push_back(static_cast<lum::DataflowEdge*>($2));
+        auto* newEdges = static_cast<std::vector<lum::DataflowEdge*>*>($2);
+        for (auto* edge : *newEdges) {
+            list->push_back(edge);
+        }
+        delete newEdges;
         $$ = list;
     }
     ;
 
-dataflow_edge
+/* Chained arrows: a -> b -> c creates edges (a,b) and (b,c) */
+dataflow_chain
     : TIDENTIFIER TARROW TIDENTIFIER {
-        $$ = new lum::DataflowEdge(*$1, *$3);
+        auto* list = new std::vector<lum::DataflowEdge*>();
+        list->push_back(new lum::DataflowEdge(*$1, *$3));
         delete $1;
         delete $3;
+        $$ = list;
+    }
+    | dataflow_chain TARROW TIDENTIFIER {
+        auto* list = static_cast<std::vector<lum::DataflowEdge*>*>($1);
+        // Get the last edge's destination as the new source
+        std::string lastDest = list->back()->getTo();
+        list->push_back(new lum::DataflowEdge(lastDest, *$3));
+        delete $3;
+        $$ = list;
     }
     ;
 
@@ -219,8 +256,12 @@ schedule_stmts
 transform_stmt
     : tile_stmt { $$ = $1; }
     | fuse_stmt { $$ = $1; }
+    | fuse_chain_stmt { $$ = $1; }
     | vec_stmt { $$ = $1; }
     | check_stmt { $$ = $1; }
+    | unroll_stmt { $$ = $1; }
+    | interchange_stmt { $$ = $1; }
+    | parallel_stmt { $$ = $1; }
     ;
 
 /* Tile statement */
@@ -268,6 +309,21 @@ fuse_stmt
     }
     ;
 
+/* FuseChain statement: fuse_chain [op1, op2, op3] or fuse_chain [...] with custom.op */
+fuse_chain_stmt
+    : TFUSE_CHAIN TLBRACKET ident_list TRBRACKET {
+        auto* ops = static_cast<std::vector<std::string>*>($3);
+        $$ = new lum::FuseChainTransform(*ops);
+        delete ops;
+    }
+    | TFUSE_CHAIN TLBRACKET ident_list TRBRACKET TWITH op_type {
+        auto* ops = static_cast<std::vector<std::string>*>($3);
+        $$ = new lum::FuseChainTransform(*ops, *$6);
+        delete ops;
+        delete $6;
+    }
+    ;
+
 /* Vec statement */
 vec_stmt
     : TVEC TLBRACKET int_list TRBRACKET {
@@ -303,6 +359,35 @@ check_stmt
     }
     | TCHECK TMEMORY {
         $$ = new lum::CheckTransform("memory");
+    }
+    ;
+
+/* Unroll statement: unroll k 4 */
+unroll_stmt
+    : TUNROLL TIDENTIFIER TINTEGER {
+        $$ = new lum::UnrollTransform(*$2, $3);
+        delete $2;
+    }
+    ;
+
+/* Interchange statement: interchange [i, j, k] */
+interchange_stmt
+    : TINTERCHANGE TLBRACKET ident_list TRBRACKET {
+        auto* order = static_cast<std::vector<std::string>*>($3);
+        $$ = new lum::InterchangeTransform(*order);
+        delete order;
+    }
+    ;
+
+/* Parallel statement: parallel m or parallel m simd */
+parallel_stmt
+    : TPARALLEL TIDENTIFIER {
+        $$ = new lum::ParallelTransform(*$2, false);
+        delete $2;
+    }
+    | TPARALLEL TIDENTIFIER TSIMD {
+        $$ = new lum::ParallelTransform(*$2, true);
+        delete $2;
     }
     ;
 

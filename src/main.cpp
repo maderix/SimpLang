@@ -63,6 +63,7 @@ int main(int argc, char** argv) {
     std::string outputPath;
     std::string logLevel = "INFO";  // Default log level
     std::string targetArch = "";  // Target architecture (empty = native)
+    std::string scheduleFile = "";  // Lum schedule file for Transform Dialect
 
     // Helper function to print help
     auto printHelp = [&]() {
@@ -101,6 +102,7 @@ int main(int argc, char** argv) {
         std::cout << "  --llvm-vectorize   Use LLVM vectorization + VNNI (better for INT8/INT4)" << std::endl;
         std::cout << "  --no-opt           Disable LLVM O3 optimization (faster compilation)" << std::endl;
         std::cout << "  --verbose-errors   Show raw MLIR diagnostics for internal errors" << std::endl;
+        std::cout << "  --schedule <file>  Use Lum schedule file for optimization (disables internal tiling)" << std::endl;
         std::cout << std::endl;
 #endif
 
@@ -203,6 +205,13 @@ int main(int argc, char** argv) {
         }
         else if (strcmp(argv[i], "--verbose-errors") == 0) {
             verboseErrors = true;
+        }
+        else if (strcmp(argv[i], "--schedule") == 0 && i + 1 < argc) {
+            scheduleFile = argv[++i];
+            // Lum schedule overrides internal tiling
+            enableTiling = false;
+            LOG_INFO("Using Lum schedule: " + scheduleFile);
+            LOG_INFO("Internal tiling disabled (Lum schedule takes precedence)");
         }
 #endif
     }
@@ -354,6 +363,13 @@ int main(int argc, char** argv) {
         pipeline.setDumpIntermediateIR(dumpMLIRPasses);
         pipeline.setOutputPath(outputPath);
         pipeline.setVerboseErrors(verboseErrors);
+
+        // Configure Lum schedule file if provided
+        if (!scheduleFile.empty()) {
+            pipeline.setScheduleFile(scheduleFile);
+            LOG_INFO("Lum schedule file configured: " + scheduleFile);
+        }
+
         if (dumpMLIRPasses) {
             LOG_INFO("MLIR intermediate IR dumping enabled");
         }

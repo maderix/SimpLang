@@ -114,6 +114,10 @@ public:
   /// Enable/disable verbose error output (shows raw MLIR errors)
   void setVerboseErrors(bool enable) { verboseErrors = enable; }
 
+  /// Set Lum schedule file for Transform Dialect optimization
+  /// When set, the schedule will be applied after Phase 1 (Simp → Linalg)
+  void setScheduleFile(const std::string& path) { scheduleFile = path; }
+
   /// Variable debug info structure
   struct VarDebugInfo {
     std::string name;
@@ -172,6 +176,9 @@ private:
 
   /// Variable debug info for functions (from codegen)
   std::map<std::string, std::vector<VarDebugInfo>> functionVariables;
+
+  /// Lum schedule file path (empty = no schedule)
+  std::string scheduleFile;
 
   //===--------------------------------------------------------------------===//
   // Private Helpers: Pipeline Builders

@@ -36,6 +36,7 @@ enum class NodeKind {
     // Transforms
     TileTransform,
     FuseTransform,
+    FuseChainTransform,
     VecTransform,
     UnrollTransform,
     InterchangeTransform,

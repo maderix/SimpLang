@@ -11,15 +11,25 @@
 
 namespace lum {
 
-// Represents a matched operation: mm: linalg.matmul
+// Constraint on a matched operation
+struct OpConstraint {
+    std::string dtype;  // e.g., "i8", "f32"
+    // Future: shape constraints, attribute constraints, etc.
+
+    bool hasDtype() const { return !dtype.empty(); }
+};
+
+// Represents a matched operation: mm: linalg.matmul [where dtype=i8]
 class OpPattern : public Node {
     std::string handle_;    // The name to bind (e.g., "mm")
     std::string dialect_;   // Dialect name (e.g., "linalg")
     std::string opName_;    // Operation name (e.g., "matmul")
+    OpConstraint constraint_;  // Optional constraints
 
 public:
-    OpPattern(const std::string& handle, const std::string& qualifiedOp)
-        : handle_(handle) {
+    OpPattern(const std::string& handle, const std::string& qualifiedOp,
+              const OpConstraint& constraint = OpConstraint{})
+        : handle_(handle), constraint_(constraint) {
         // Parse "dialect.op" format
         size_t dot = qualifiedOp.find('.');
         if (dot != std::string::npos) {
@@ -37,6 +47,8 @@ public:
     const std::string& getHandle() const { return handle_; }
     const std::string& getDialect() const { return dialect_; }
     const std::string& getOpName() const { return opName_; }
+    const OpConstraint& getConstraint() const { return constraint_; }
+    bool hasConstraint() const { return constraint_.hasDtype(); }
 
     // Returns qualified name like "linalg.matmul"
     std::string getQualifiedName() const {
@@ -46,7 +58,14 @@ public:
 
     void dump(std::ostream& os, int level = 0) const override {
         indent(os, level);
-        os << "OpPattern: " << handle_ << " : " << getQualifiedName() << "\n";
+        os << "OpPattern: " << handle_ << " : " << getQualifiedName();
+        if (hasConstraint()) {
+            os << " where";
+            if (constraint_.hasDtype()) {
+                os << " dtype=" << constraint_.dtype;
+            }
+        }
+        os << "\n";
     }
 };
 
